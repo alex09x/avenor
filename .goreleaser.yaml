@@ -1,0 +1,28 @@
+version: 2
+
+project_name: avenor
+
+builds:
+  - main: ./cmd/avenor
+    id: avenor
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - arm64
+      - amd64
+    binary: avenor
+
+archives:
+  - format: binary
+    name_template: "{{ .Binary }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  disable: true
+
+release:
+  draft: false
+  prerelease: false
