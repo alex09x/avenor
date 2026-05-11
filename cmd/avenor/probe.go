@@ -1,0 +1,94 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/sdougbrown/avenor/internal/runtime/opencodeacp"
+)
+
+func runProbe(args []string) int {
+	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
+	dir := fs.String("dir", ".", "working directory for the probe")
+	out := fs.String("out", "", "path to write the probe transcript")
+	prompt := fs.String("prompt", "", "override the default probe prompt (Stage 1 discovery)")
+	timeout := fs.Duration("timeout", 5*time.Minute, "probe timeout")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *out == "" {
+		fmt.Fprintln(os.Stderr, "avenor probe: --out is required")
+		return 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+
+	probePrompt := opencodeacp.ProbePrompt
+	if *prompt != "" {
+		probePrompt = *prompt
+	}
+	transcript, err := opencodeacp.RunProbeWithPrompt(ctx, *dir, probePrompt)
+	if writeErr := writeTranscript(*out, transcript); writeErr != nil {
+		fmt.Fprintf(os.Stderr, "avenor probe: write transcript: %v\n", writeErr)
+		return 1
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "avenor probe: %v\n", err)
+		return 1
+	}
+
+	stopReason := finalStopReason(transcript)
+	return exitCodeForStopReason(stopReason)
+}
+
+func writeTranscript(path string, transcript []events.Event) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	for _, event := range transcript {
+		if err := encoder.Encode(event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func finalStopReason(transcript []events.Event) string {
+	for i := len(transcript) - 1; i >= 0; i-- {
+		if transcript[i].Event != "session.end" {
+			continue
+		}
+		stopReason, _ := transcript[i].Fields["stop_reason"].(string)
+		return stopReason
+	}
+	return ""
+}
+
+func exitCodeForStopReason(stopReason string) int {
+	switch stopReason {
+	case "end_turn":
+		return 0
+	case "refusal":
+		return 2
+	case "max_tokens":
+		return 3
+	case "max_turn_requests":
+		return 4
+	case "cancelled":
+		return 130
+	case "timeout":
+		return 124
+	default:
+		return 1
+	}
+}

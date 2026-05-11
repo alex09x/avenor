@@ -1,0 +1,157 @@
+package opencodeacp
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/sdougbrown/avenor/internal/events"
+)
+
+var sessionUpdateEvents = map[string]string{
+	"agent_message_chunk": "agent.message_chunk",
+	"agent_thought_chunk": "agent.thought_chunk",
+	"tool_call":           "tool.call",
+	"tool_call_update":    "tool.call_update",
+	"user_message_chunk":  "user.message_chunk",
+	"plan":                "session.plan",
+}
+
+var knownProbeEvents = map[string]bool{
+	"agent.message_chunk": true,
+	"agent.thought_chunk": true,
+	"tool.call":           true,
+	"tool.call_update":    true,
+	"user.message_chunk":  true,
+	"session.plan":        true,
+	"permission.request":  true,
+	"session.end":         true,
+}
+
+type rpcEnvelope struct {
+	JSONRPC string          `json:"jsonrpc,omitempty"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
+
+type rpcError struct {
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data,omitempty"`
+}
+
+func mapSessionUpdate(params json.RawMessage) (events.Event, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(params, &payload); err != nil {
+		return events.Event{}, err
+	}
+
+	update, ok := payload["update"].(map[string]any)
+	if !ok {
+		return events.Event{}, errors.New("session/update missing update object")
+	}
+
+	kind, ok := update["sessionUpdate"].(string)
+	if !ok {
+		return events.Event{}, errors.New("session/update missing sessionUpdate discriminator")
+	}
+
+	eventName, ok := sessionUpdateEvents[kind]
+	if !ok {
+		return events.Event{}, fmt.Errorf("unknown session update kind %q", kind)
+	}
+
+	sessionID, _ := payload["sessionId"].(string)
+	fields := map[string]any{}
+	for k, v := range update {
+		if k != "sessionUpdate" {
+			fields[k] = v
+		}
+	}
+	fields["session_update"] = kind
+
+	return events.Event{
+		Event:     eventName,
+		SessionID: sessionID,
+		Fields:    fields,
+	}, nil
+}
+
+func mapPromptResponse(sessionID string, result json.RawMessage) (events.Event, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(result, &payload); err != nil {
+		return events.Event{}, err
+	}
+
+	stopReason, _ := payload["stopReason"].(string)
+	if stopReason == "" {
+		stopReason, _ = payload["stop_reason"].(string)
+	}
+	if stopReason == "" {
+		return events.Event{}, errors.New("session/prompt response missing stopReason")
+	}
+
+	fields := map[string]any{}
+	for k, v := range payload {
+		if k != "stopReason" && k != "stop_reason" {
+			fields[k] = v
+		}
+	}
+	fields["stop_reason"] = stopReason
+
+	return events.Event{
+		Event:     "session.end",
+		SessionID: sessionID,
+		Fields:    fields,
+	}, nil
+}
+
+func mapPermissionRequest(params json.RawMessage) events.Event {
+	var payload map[string]any
+	_ = json.Unmarshal(params, &payload)
+
+	sessionID, _ := payload["sessionId"].(string)
+	fields := map[string]any{}
+	for k, v := range payload {
+		if k != "sessionId" {
+			fields[k] = v
+		}
+	}
+
+	return events.Event{
+		Event:     "permission.request",
+		SessionID: sessionID,
+		Fields:    fields,
+	}
+}
+
+// ParseTranscriptEvent maps either a raw ACP JSON-RPC line or an already
+// normalized Avenor event line into an Event.
+func ParseTranscriptEvent(line []byte) (events.Event, error) {
+	var normalized events.Event
+	if err := json.Unmarshal(line, &normalized); err == nil && normalized.Event != "" {
+		if !knownProbeEvents[normalized.Event] {
+			return events.Event{}, fmt.Errorf("unknown event %q", normalized.Event)
+		}
+		return normalized, nil
+	}
+
+	var msg rpcEnvelope
+	if err := json.Unmarshal(line, &msg); err != nil {
+		return events.Event{}, err
+	}
+
+	switch {
+	case msg.Method == "session/update":
+		return mapSessionUpdate(msg.Params)
+	case msg.Method == "session/request_permission":
+		return mapPermissionRequest(msg.Params), nil
+	case len(msg.Result) > 0:
+		return mapPromptResponse("", msg.Result)
+	default:
+		return events.Event{}, errors.New("transcript line is not a recognized ACP event")
+	}
+}
