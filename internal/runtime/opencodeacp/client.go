@@ -21,21 +21,40 @@ import (
 )
 
 type Client struct {
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	stdout    io.ReadCloser
-	stderr    bytes.Buffer
-	dir       string
-	events    chan events.Event
-	done      chan struct{}
-	readErr   error
-	nextID    atomic.Uint64
-	sendMu    sync.Mutex
-	pendingMu sync.Mutex
-	pending   map[string]chan rpcEnvelope
+	cmd                  *exec.Cmd
+	stdin                io.WriteCloser
+	stdout               io.ReadCloser
+	stderr               bytes.Buffer
+	dir                  string
+	autoAnswerPermission bool
+	events               chan events.Event
+	done                 chan struct{}
+	readErr              error
+	nextID               atomic.Uint64
+	sendMu               sync.Mutex
+	pendingMu            sync.Mutex
+	pending              map[string]chan rpcEnvelope
+	permissionMu         sync.Mutex
+	permissions          map[string]rpcEnvelope
+}
+
+type ClientOptions struct {
+	Dir                  string
+	AutoAnswerPermission bool
 }
 
 func NewClient(ctx context.Context, dir string) (*Client, error) {
+	return NewClientWithOptions(ctx, ClientOptions{
+		Dir:                  dir,
+		AutoAnswerPermission: true,
+	})
+}
+
+func NewClientWithOptions(ctx context.Context, opts ClientOptions) (*Client, error) {
+	dir := opts.Dir
+	if dir == "" {
+		dir = "."
+	}
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
@@ -52,13 +71,15 @@ func NewClient(ctx context.Context, dir string) (*Client, error) {
 	}
 
 	client := &Client{
-		cmd:     cmd,
-		stdin:   stdin,
-		stdout:  stdout,
-		dir:     absDir,
-		events:  make(chan events.Event, 128),
-		done:    make(chan struct{}),
-		pending: map[string]chan rpcEnvelope{},
+		cmd:                  cmd,
+		stdin:                stdin,
+		stdout:               stdout,
+		dir:                  absDir,
+		events:               make(chan events.Event, 128),
+		done:                 make(chan struct{}),
+		pending:              map[string]chan rpcEnvelope{},
+		permissions:          map[string]rpcEnvelope{},
+		autoAnswerPermission: opts.AutoAnswerPermission,
 	}
 	cmd.Stderr = &client.stderr
 
@@ -226,12 +247,20 @@ func (c *Client) dispatch(msg rpcEnvelope) {
 func (c *Client) handleRequest(msg rpcEnvelope) {
 	switch msg.Method {
 	case "session/request_permission":
-		c.events <- mapPermissionRequest(msg.Params)
-		_ = c.write(rpcEnvelope{
-			JSONRPC: "2.0",
-			ID:      msg.ID,
-			Result:  mustRaw(defaultPermissionResponse(msg.Params)),
-		})
+		requestID := rpcIDString(msg.ID)
+		if !c.autoAnswerPermission {
+			c.permissionMu.Lock()
+			c.permissions[requestID] = msg
+			c.permissionMu.Unlock()
+		}
+		c.events <- mapPermissionRequestWithID(msg.Params, requestID)
+		if c.autoAnswerPermission {
+			_ = c.write(rpcEnvelope{
+				JSONRPC: "2.0",
+				ID:      msg.ID,
+				Result:  mustRaw(defaultPermissionResponse(msg.Params)),
+			})
+		}
 	default:
 		_ = c.write(rpcEnvelope{
 			JSONRPC: "2.0",
@@ -242,6 +271,39 @@ func (c *Client) handleRequest(msg rpcEnvelope) {
 			},
 		})
 	}
+}
+
+func rpcIDString(id json.RawMessage) string {
+	var value any
+	if err := json.Unmarshal(id, &value); err != nil {
+		return string(id)
+	}
+	switch v := value.(type) {
+	case string:
+		return v
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+func (c *Client) answerPermission(requestID string, result any) error {
+	c.permissionMu.Lock()
+	msg, ok := c.permissions[requestID]
+	if ok {
+		delete(c.permissions, requestID)
+	}
+	c.permissionMu.Unlock()
+	if !ok {
+		return fmt.Errorf("permission request %q not found", requestID)
+	}
+
+	return c.write(rpcEnvelope{
+		JSONRPC: "2.0",
+		ID:      msg.ID,
+		Result:  mustRaw(result),
+	})
 }
 
 func defaultPermissionResponse(params json.RawMessage) map[string]any {

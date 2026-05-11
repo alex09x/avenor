@@ -18,13 +18,34 @@ type Provider interface {
 }
 
 // StartOptions holds options for starting a new session.
-type StartOptions struct{}
+type StartOptions struct {
+	Agent     string
+	Label     string
+	Dir       string
+	ServerURL string
+	Model     string
+}
 
 // Session represents an active ACP session.
-type Session struct{}
+type Session struct {
+	SessionID string
+	Backend   string
+	Dir       string
+}
 
 // PermissionResponse is the response to a permission request.
-type PermissionResponse struct{}
+type PermissionResponse struct {
+	Outcome  string `json:"outcome"`
+	OptionID string `json:"option_id,omitempty"`
+	Message  string `json:"message,omitempty"`
+}
 
 // Capabilities describes what a runtime backend supports.
-type Capabilities struct{}
+type Capabilities struct {
+	Backend             string
+	Permissions         bool
+	Resume              bool
+	ExternalServerURL   bool
+	SubprocessDiscovery bool
+	ModelSelection      bool
+}

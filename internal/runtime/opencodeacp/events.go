@@ -110,6 +110,10 @@ func mapPromptResponse(sessionID string, result json.RawMessage) (events.Event, 
 }
 
 func mapPermissionRequest(params json.RawMessage) events.Event {
+	return mapPermissionRequestWithID(params, "")
+}
+
+func mapPermissionRequestWithID(params json.RawMessage, requestID string) events.Event {
 	var payload map[string]any
 	_ = json.Unmarshal(params, &payload)
 
@@ -119,6 +123,9 @@ func mapPermissionRequest(params json.RawMessage) events.Event {
 		if k != "sessionId" {
 			fields[k] = v
 		}
+	}
+	if requestID != "" {
+		fields["request_id"] = requestID
 	}
 
 	return events.Event{
