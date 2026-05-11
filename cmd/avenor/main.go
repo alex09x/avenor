@@ -7,7 +7,9 @@ import (
 	"github.com/sdougbrown/avenor/internal/cli"
 )
 
-const Version = "0.0.1"
+// Version is the release tag, injected at build time via -ldflags. Unreleased
+// builds default to "dev" so they don't masquerade as a real version.
+var Version = "dev"
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "probe" {

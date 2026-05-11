@@ -12,6 +12,8 @@ builds:
       - arm64
       - amd64
     binary: avenor
+    ldflags:
+      - -s -w -X main.Version={{ .Version }}
 
 archives:
   - format: binary
