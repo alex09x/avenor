@@ -42,6 +42,13 @@ func Classify(event map[string]any) string {
 		return TagMilestone
 	case "permission.request":
 		return TagMilestone
+	case "agent.status":
+		switch stringField(event, "phase") {
+		case "done", "waiting":
+			return TagMilestone
+		default:
+			return TagActivity
+		}
 	case "tool.call", "tool.call_update":
 		return classifyTool(event)
 	case "agent.message_chunk", "agent.thought_chunk", "user.message_chunk":

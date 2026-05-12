@@ -109,6 +109,28 @@ func TestClassify(t *testing.T) {
 			want: TagFinding,
 		},
 
+		// --- agent.status cases ---
+		{
+			name: "agent.status phase=done is MILESTONE",
+			raw:  `{"event":"agent.status","session_id":"s1","phase":"done","source":"avenor"}`,
+			want: TagMilestone,
+		},
+		{
+			name: "agent.status phase=waiting is MILESTONE",
+			raw:  `{"event":"agent.status","session_id":"s1","phase":"waiting","label":"Allow exec?","source":"avenor"}`,
+			want: TagMilestone,
+		},
+		{
+			name: "agent.status phase=thinking is ACTIVITY",
+			raw:  `{"event":"agent.status","session_id":"s1","phase":"thinking","source":"avenor"}`,
+			want: TagActivity,
+		},
+		{
+			name: "agent.status phase=working is ACTIVITY",
+			raw:  `{"event":"agent.status","session_id":"s1","phase":"working","label":"go test ./...","source":"avenor"}`,
+			want: TagActivity,
+		},
+
 		// --- ACTIVITY cases ---
 		{
 			name: "session.plan is ACTIVITY",

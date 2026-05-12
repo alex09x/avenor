@@ -24,6 +24,8 @@ Consumers should switch on `event` and read domain fields directly from the same
 
 `session.plan`: Backend plan update. This is accepted by the parser even when trivial probes do not emit it.
 
+`agent.status`: Synthesized by Avenor (not passed through from the backend) to signal agent phase transitions. Fields: `phase` (one of `thinking`, `working`, `waiting`, `done`), `label` (optional human-readable description of current activity), `source` (`"avenor"` for all synthesized events). Emitted before the ACP event that triggered the transition. `waiting` and `done` phases classify as MILESTONE; `thinking` and `working` classify as ACTIVITY.
+
 `permission.request`: Backend asks the client to choose a permission option. Avenor emits `request_id`, plus best-effort `tool`, `question`, and `options` fields when available. With `--permission-handler file:<path>`, this event is emitted after `<path>.req` is written.
 
 `session.end`: Terminal record for the prompt. The final event stream line for a completed Avenor run is always `session.end` and includes `stop_reason`.

@@ -212,6 +212,18 @@ func waitForSession(
 	var finalStopReason string
 	promptReturned := false
 	var permissionDone <-chan error
+	tracker := newStatusTracker(sessionID)
+
+	writeStatus := func(ev events.Event, ok bool) bool {
+		if !ok {
+			return true
+		}
+		if err := writer.Write(ev); err != nil {
+			fmt.Fprintf(stderr, "avenor: write event: %v\n", err)
+			return false
+		}
+		return true
+	}
 
 	for {
 		select {
@@ -221,6 +233,9 @@ func waitForSession(
 					return 1
 				}
 				return runtime.ExitCodeForStopReason(finalStopReason)
+			}
+			if !writeStatus(tracker.Observe(event)) {
+				return 1
 			}
 			if event.Event == "permission.request" && fileHandler != nil {
 				if permissionDone != nil {
@@ -260,6 +275,9 @@ func waitForSession(
 			permissionDone = nil
 			if err != nil {
 				fmt.Fprintf(stderr, "avenor: permission handler: %v\n", err)
+				return 1
+			}
+			if !writeStatus(tracker.PermissionAnswered()) {
 				return 1
 			}
 		case <-ctx.Done():

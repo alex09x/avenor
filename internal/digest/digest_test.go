@@ -38,6 +38,16 @@ func TestDigestLine(t *testing.T) {
 			want: "EVENT user.message_chunk ses_1 ",
 		},
 		{
+			name: "agent.status with label",
+			raw:  `{"event":"agent.status","session_id":"ses_1","phase":"working","label":"go test ./...","source":"avenor"}`,
+			want: "EVENT agent.status ses_1 working | go test ./...",
+		},
+		{
+			name: "agent.status without label",
+			raw:  `{"event":"agent.status","session_id":"ses_1","phase":"thinking","source":"avenor"}`,
+			want: "EVENT agent.status ses_1 thinking",
+		},
+		{
 			name: "tool kind title status",
 			raw:  `{"event":"tool.call","session_id":"ses_1","kind":"shell","title":"go test","status":"running"}`,
 			want: "EVENT tool.call ses_1 shell:go test [running]",
