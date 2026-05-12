@@ -7,7 +7,7 @@ Avenor is a small, single-binary ACP (Agent Client Protocol) client for coordina
 Download the latest binary for your platform from [GitHub Releases](https://github.com/sdougbrown/avenor/releases):
 
 ```bash
-curl -fsSL https://github.com/sdougbrown/avenor/releases/download/v0.2.0/avenor_darwin_arm64 -o avenor
+curl -fsSL https://github.com/sdougbrown/avenor/releases/latest/download/avenor_darwin_arm64 -o avenor
 chmod +x avenor
 ./avenor --version
 ```
