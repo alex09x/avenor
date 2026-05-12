@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.7.0 — 2026-05-11
+
+### Added
+
+- `avenor run --sentinel-file <path>`: write a completion sentinel file after every run
+  (clean, timeout, signal, or error), matching the output format of `dispatch-avenor.sh`.
+  - Sentinel format by exit code:
+    - `0` → `DONE\nSESSION=...\nSTOP_REASON=...\n` (default stop_reason: `end_turn`)
+    - `124` → `TIMEOUT\nSESSION=...\nSTOP_REASON=...\n` (default: `timeout`)
+    - `130` → `KILLED\nSESSION=...\nSTOP_REASON=...\nEXIT_CODE=130\n` (default: `cancelled`)
+    - other → `FAILED\nSESSION=...\nSTOP_REASON=...\nEXIT_CODE=N\n` (default: `exit_N`)
+  - Session metadata is extracted from the last `session.end` event in the event log.
+  - Sentinel is written via atomic tmp+rename to avoid partial-file races on the watcher side.
+- When `--sentinel-file` is set and `--permission-handler` is not explicitly provided,
+  `avenor run` auto-derives the permission handler base from the sentinel path:
+  `<base>.done` → `<base>.perm`; any other suffix → `<sentinel>.perm`.
+  This mirrors the `derive_permission_base` function in `dispatch-avenor.sh`.
+  An explicit `--permission-handler` always wins — derivation is skipped.
+- Pre-run cleanup when `--sentinel-file` is active: removes the existing sentinel and the
+  permission request files (`<perm-base>.req`, `<perm-base>.req.response`) before each run,
+  matching the shim's pre-run setup. Callers without `--sentinel-file` see no change.
+
+### Notes
+
+- This release deprecates `dispatch-avenor.sh` consumer-side. Callers can now pass
+  `--sentinel-file <path>` directly to `avenor run` instead of routing through the shim.
+  Consumer cutover (deleting `dispatch-avenor.sh` from `.botfiles`) is a follow-on step.
+- Callers that do not pass `--sentinel-file` see zero behavior change.
+
 ## v0.6.0 — 2026-05-11
 
 ### Added

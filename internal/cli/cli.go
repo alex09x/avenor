@@ -66,6 +66,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	serverURL := fs.String("server-url", "", "long-lived ACP server endpoint")
 	onEvent := fs.String("on-event", "", "path to write NDJSON events")
 	permissionHandler := fs.String("permission-handler", "", "permission handler, supports file:<path>")
+	sentinelFile := fs.String("sentinel-file", "", "path to write a completion sentinel (also derives permission base unless --permission-handler is set)")
 	timeout := fs.Duration("timeout", 0, "overall session timeout")
 	model := fs.String("model", "", "backend-specific model id")
 	backend := fs.String("backend", defaultBackend, "runtime backend")
@@ -86,6 +87,31 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		return 1
 	}
 
+	// Derive permission handler base from sentinel when --permission-handler is
+	// not set and --sentinel-file is set. The caller's explicit --permission-handler
+	// always wins.
+	var effectivePermHandler string
+	var derivedPermBase string
+	if *sentinelFile != "" && *permissionHandler == "" {
+		derivedPermBase = derivePermBase(*sentinelFile)
+		effectivePermHandler = "file:" + derivedPermBase
+	} else {
+		effectivePermHandler = *permissionHandler
+	}
+
+	// Pre-run cleanup: truncate event log and remove stale sentinel/perm files.
+	// Only when --sentinel-file is active to avoid changing behavior for callers
+	// that don't use it. The event log is recreated below via newEventWriter.
+	// Use the effective permission base (derived or explicit) for cleanup.
+	if *sentinelFile != "" {
+		var cleanupPermBase string
+		const filePrefix = "file:"
+		if strings.HasPrefix(effectivePermHandler, filePrefix) {
+			cleanupPermBase = strings.TrimPrefix(effectivePermHandler, filePrefix)
+		}
+		cleanupSentinelFiles(*sentinelFile, cleanupPermBase)
+	}
+
 	prompt, err := os.ReadFile(*promptFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "avenor: read prompt file: %v\n", err)
@@ -100,12 +126,21 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	defer writer.Close()
 
 	var fileHandler *permission.FileHandler
-	if *permissionHandler != "" {
-		fileHandler, err = parsePermissionHandler(*permissionHandler)
+	if effectivePermHandler != "" {
+		fileHandler, err = parsePermissionHandler(effectivePermHandler)
 		if err != nil {
 			fmt.Fprintf(stderr, "avenor: %v\n", err)
 			return 1
 		}
+	}
+
+	// Helper to write sentinel and return the provided exit code. Used at
+	// every return path when --sentinel-file is active.
+	exitWithSentinel := func(code int) int {
+		if *sentinelFile != "" {
+			writeSentinel(*sentinelFile, code, *onEvent, stderr)
+		}
+		return code
 	}
 
 	discovery := DiscoverServer(*serverURL, getenv)
@@ -127,7 +162,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	session, err := startSession(ctx, provider, startOptions, *resume)
 	if err != nil {
 		fmt.Fprintf(stderr, "avenor: start session: %v\n", err)
-		return 1
+		return exitWithSentinel(1)
 	}
 
 	eventCtx, cancelEvents := context.WithCancel(ctx)
@@ -135,7 +170,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	eventCh, err := provider.Events(eventCtx, session.SessionID)
 	if err != nil {
 		fmt.Fprintf(stderr, "avenor: subscribe events: %v\n", err)
-		return 1
+		return exitWithSentinel(1)
 	}
 
 	promptDone := make(chan error, 1)
@@ -150,7 +185,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		timer = t.C
 	}
 
-	return waitForSession(ctx, provider, writer, fileHandler, eventCh, promptDone, session.SessionID, timer, stderr)
+	return exitWithSentinel(waitForSession(ctx, provider, writer, fileHandler, eventCh, promptDone, session.SessionID, timer, stderr))
 }
 
 func startSession(ctx context.Context, provider runtime.Provider, opts runtime.StartOptions, resumeID string) (runtime.Session, error) {
