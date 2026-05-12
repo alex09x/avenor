@@ -1,0 +1,8 @@
+EVENT agent.message_chunk ses_vocab agent says hello with tabs collapsed
+EVENT agent.thought_chunk ses_vocab thinking through it
+EVENT user.message_chunk ses_vocab user asks a question
+EVENT tool.call ses_vocab shell:go test [pending]
+EVENT tool.call_update ses_vocab shell:go test [completed]
+EVENT permission.request ses_vocab Allow shell command?
+EVENT session.plan ses_vocab Implement watch
+EVENT session.end ses_vocab stop_reason=end_turn

@@ -1,0 +1,8 @@
+{"event":"agent.message_chunk","session_id":"ses_vocab","content":{"text":"agent says hello\nwith tabs\tcollapsed","type":"text"}}
+{"event":"agent.thought_chunk","session_id":"ses_vocab","content":{"text":"thinking\r\nthrough it","type":"text"}}
+{"event":"user.message_chunk","session_id":"ses_vocab","content":{"text":"user asks a question","type":"text"}}
+{"event":"tool.call","session_id":"ses_vocab","kind":"shell","title":"go test","status":"pending"}
+{"event":"tool.call_update","session_id":"ses_vocab","kind":"shell","title":"go test","status":"completed"}
+{"event":"permission.request","session_id":"ses_vocab","question":"Allow shell command?","tool":"exec"}
+{"event":"session.plan","session_id":"ses_vocab","label":"Implement watch","title":"Fallback title"}
+{"event":"session.end","session_id":"ses_vocab","stop_reason":"end_turn"}

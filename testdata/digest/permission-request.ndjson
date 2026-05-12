@@ -1,0 +1,3 @@
+{"event":"session.plan","session_id":"ses_perm","label":"Need approval"}
+{"event":"tool.call","session_id":"ses_perm","kind":"edit","title":"protected file","status":"pending"}
+{"event":"permission.request","session_id":"ses_perm","question":"","tool":"apply_patch"}

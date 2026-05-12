@@ -15,6 +15,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "probe" {
 		os.Exit(runProbe(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "watch" {
+		os.Exit(runWatch(os.Args[2:]))
+	}
 
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
 		fmt.Printf("avenor v%s\n", Version)

@@ -1,0 +1,4 @@
+EVENT session.plan ses_happy Run verification
+EVENT tool.call ses_happy shell:go test ./... [pending]
+EVENT tool.call_update ses_happy shell:go test ./... [completed]
+EVENT session.end ses_happy stop_reason=end_turn

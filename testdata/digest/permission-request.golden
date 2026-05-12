@@ -1,0 +1,3 @@
+EVENT session.plan ses_perm Need approval
+EVENT tool.call ses_perm edit:protected file [pending]
+EVENT permission.request ses_perm apply_patch

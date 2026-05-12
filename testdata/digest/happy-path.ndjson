@@ -1,0 +1,4 @@
+{"event":"session.plan","session_id":"ses_happy","title":"Run verification"}
+{"event":"tool.call","session_id":"ses_happy","kind":"shell","title":"go test ./...","status":"pending"}
+{"event":"tool.call_update","session_id":"ses_happy","kind":"shell","title":"go test ./...","status":"completed"}
+{"event":"session.end","session_id":"ses_happy","stop_reason":"end_turn"}
