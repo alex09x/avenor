@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -135,10 +136,18 @@ func writeSentinel(path string, exitCode int, eventLogPath string, stderr io.Wri
 // cleanupSentinelFiles removes pre-existing sentinel and permission request
 // files before a run, matching the shim's pre-run cleanup.
 // Only called when --sentinel-file is set.
-func cleanupSentinelFiles(sentinelPath, permBase string) {
-	os.Remove(sentinelPath)
+// Non-ENOENT errors are logged to stderr; ENOENT is silently ignored.
+func cleanupSentinelFiles(sentinelPath, permBase string, stderr io.Writer) {
+	removeOrLog(sentinelPath, stderr)
 	if permBase != "" {
-		os.Remove(permBase + ".req")
-		os.Remove(permBase + ".req.response")
+		removeOrLog(permBase+".req", stderr)
+		removeOrLog(permBase+".req.response", stderr)
+	}
+}
+
+// removeOrLog calls os.Remove and logs any error that is not ErrNotExist.
+func removeOrLog(path string, stderr io.Writer) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(stderr, "avenor: cleanup %s: %v\n", path, err)
 	}
 }

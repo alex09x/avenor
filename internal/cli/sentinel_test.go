@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,135 +70,86 @@ func TestSentinelContent(t *testing.T) {
 		exitCode   int
 		sessionID  string
 		stopReason string
-		wantPrefix string
-		wantLines  []string
+		want       string
 	}{
 		{
 			name:       "exit 0 clean",
 			exitCode:   0,
 			sessionID:  "ses_abc123",
 			stopReason: "end_turn",
-			wantPrefix: "DONE\n",
-			wantLines: []string{
-				"DONE",
-				"SESSION=ses_abc123",
-				"STOP_REASON=end_turn",
-			},
+			want:       "DONE\nSESSION=ses_abc123\nSTOP_REASON=end_turn\n",
 		},
 		{
 			name:       "exit 0 default stop reason",
 			exitCode:   0,
 			sessionID:  "ses_xyz",
 			stopReason: "",
-			wantLines: []string{
-				"DONE",
-				"SESSION=ses_xyz",
-				"STOP_REASON=end_turn",
-			},
+			want:       "DONE\nSESSION=ses_xyz\nSTOP_REASON=end_turn\n",
 		},
 		{
 			name:       "exit 124 timeout",
 			exitCode:   124,
 			sessionID:  "ses_t",
 			stopReason: "timeout",
-			wantLines: []string{
-				"TIMEOUT",
-				"SESSION=ses_t",
-				"STOP_REASON=timeout",
-			},
+			want:       "TIMEOUT\nSESSION=ses_t\nSTOP_REASON=timeout\n",
 		},
 		{
 			name:       "exit 124 default stop reason",
 			exitCode:   124,
 			sessionID:  "ses_t2",
 			stopReason: "",
-			wantLines: []string{
-				"TIMEOUT",
-				"SESSION=ses_t2",
-				"STOP_REASON=timeout",
-			},
+			want:       "TIMEOUT\nSESSION=ses_t2\nSTOP_REASON=timeout\n",
 		},
 		{
 			name:       "exit 130 sigint",
 			exitCode:   130,
 			sessionID:  "ses_k",
 			stopReason: "cancelled",
-			wantLines: []string{
-				"KILLED",
-				"SESSION=ses_k",
-				"STOP_REASON=cancelled",
-				"EXIT_CODE=130",
-			},
+			want:       "KILLED\nSESSION=ses_k\nSTOP_REASON=cancelled\nEXIT_CODE=130\n",
 		},
 		{
 			name:       "exit 130 default stop reason",
 			exitCode:   130,
 			sessionID:  "ses_k2",
 			stopReason: "",
-			wantLines: []string{
-				"KILLED",
-				"SESSION=ses_k2",
-				"STOP_REASON=cancelled",
-				"EXIT_CODE=130",
-			},
+			want:       "KILLED\nSESSION=ses_k2\nSTOP_REASON=cancelled\nEXIT_CODE=130\n",
 		},
 		{
 			name:       "exit 1 generic failure",
 			exitCode:   1,
 			sessionID:  "ses_f",
 			stopReason: "some_error",
-			wantLines: []string{
-				"FAILED",
-				"SESSION=ses_f",
-				"STOP_REASON=some_error",
-				"EXIT_CODE=1",
-			},
+			want:       "FAILED\nSESSION=ses_f\nSTOP_REASON=some_error\nEXIT_CODE=1\n",
 		},
 		{
 			name:       "exit 1 default stop reason",
 			exitCode:   1,
 			sessionID:  "ses_f2",
 			stopReason: "",
-			wantLines: []string{
-				"FAILED",
-				"SESSION=ses_f2",
-				"STOP_REASON=exit_1",
-				"EXIT_CODE=1",
-			},
+			want:       "FAILED\nSESSION=ses_f2\nSTOP_REASON=exit_1\nEXIT_CODE=1\n",
 		},
 		{
 			name:       "exit 2 refusal",
 			exitCode:   2,
 			sessionID:  "ses_r",
 			stopReason: "refusal",
-			wantLines: []string{
-				"FAILED",
-				"SESSION=ses_r",
-				"STOP_REASON=refusal",
-				"EXIT_CODE=2",
-			},
+			want:       "FAILED\nSESSION=ses_r\nSTOP_REASON=refusal\nEXIT_CODE=2\n",
 		},
 		{
 			name:       "empty session id",
 			exitCode:   0,
 			sessionID:  "",
 			stopReason: "end_turn",
-			wantLines: []string{
-				"DONE",
-				"SESSION=",
-				"STOP_REASON=end_turn",
-			},
+			want:       "DONE\nSESSION=\nSTOP_REASON=end_turn\n",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := sentinelContent(tt.exitCode, tt.sessionID, tt.stopReason)
-			for _, line := range tt.wantLines {
-				if !strings.Contains(got, line+"\n") {
-					t.Errorf("sentinelContent(%d, %q, %q) missing line %q\ngot: %q",
-						tt.exitCode, tt.sessionID, tt.stopReason, line, got)
-				}
+			if got != tt.want {
+				t.Errorf("sentinelContent(%d, %q, %q):\n got: %q\nwant: %q",
+					tt.exitCode, tt.sessionID, tt.stopReason, got, tt.want)
 			}
 		})
 	}
@@ -211,6 +163,7 @@ func TestSessionEndFields(t *testing.T) {
 	tests := []struct {
 		name           string
 		ndjson         string
+		missingFile    bool
 		wantSessionID  string
 		wantStopReason string
 	}{
@@ -255,7 +208,7 @@ func TestSessionEndFields(t *testing.T) {
 		},
 		{
 			name:           "missing file returns empty strings",
-			ndjson:         "", // handled separately below
+			missingFile:    true,
 			wantSessionID:  "",
 			wantStopReason: "",
 		},
@@ -264,8 +217,9 @@ func TestSessionEndFields(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var path string
-			if tt.name == "missing file returns empty strings" {
-				path = "/tmp/avenor-nonexistent-sentinel-test-file-that-does-not-exist.ndjson"
+			if tt.missingFile {
+				// t.TempDir() guarantees the directory exists but the file does not.
+				path = filepath.Join(t.TempDir(), "no-such-file.ndjson")
 			} else {
 				f, err := os.CreateTemp(t.TempDir(), "events-*.ndjson")
 				if err != nil {
@@ -314,11 +268,9 @@ func TestWriteSentinel(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read sentinel: %v", err)
 		}
-		got := string(content)
-		for _, line := range []string{"DONE", "SESSION=ses_write", "STOP_REASON=end_turn"} {
-			if !strings.Contains(got, line+"\n") {
-				t.Errorf("sentinel missing line %q\ngot: %q", line, got)
-			}
+		const want = "DONE\nSESSION=ses_write\nSTOP_REASON=end_turn\n"
+		if got := string(content); got != want {
+			t.Errorf("sentinel content:\n got: %q\nwant: %q", got, want)
 		}
 	})
 
@@ -336,6 +288,24 @@ func TestWriteSentinel(t *testing.T) {
 			if strings.HasSuffix(e.Name(), ".tmp") {
 				t.Errorf("leftover tmp file: %s", e.Name())
 			}
+		}
+	})
+
+	t.Run("missing parent directory logs error and writes no file", func(t *testing.T) {
+		dir := t.TempDir()
+		logPath := filepath.Join(dir, "events.ndjson")
+		// Sentinel path inside a nonexistent subdirectory.
+		sentPath := filepath.Join(dir, "nonexistent-subdir", "run.done")
+		os.WriteFile(logPath, []byte(""), 0o600)
+
+		var stderr bytes.Buffer
+		writeSentinel(sentPath, 0, logPath, &stderr)
+
+		if stderr.Len() == 0 {
+			t.Error("expected error logged to stderr but got none")
+		}
+		if _, err := os.Stat(sentPath); !os.IsNotExist(err) {
+			t.Error("expected no sentinel file to exist after failed write")
 		}
 	})
 }
@@ -360,8 +330,12 @@ func TestCleanupSentinelFiles(t *testing.T) {
 			}
 		}
 
-		cleanupSentinelFiles(sentPath, permBase)
+		var stderr strings.Builder
+		cleanupSentinelFiles(sentPath, permBase, &stderr)
 
+		if stderr.Len() > 0 {
+			t.Errorf("unexpected stderr: %s", stderr.String())
+		}
 		for _, p := range []string{
 			sentPath,
 			permBase + ".req",
@@ -375,8 +349,12 @@ func TestCleanupSentinelFiles(t *testing.T) {
 
 	t.Run("missing files do not error", func(t *testing.T) {
 		dir := t.TempDir()
-		// These paths don't exist; cleanupSentinelFiles should not panic.
-		cleanupSentinelFiles(filepath.Join(dir, "no-sent.done"), filepath.Join(dir, "no-perm"))
+		// These paths don't exist; cleanupSentinelFiles should not panic or log.
+		var stderr strings.Builder
+		cleanupSentinelFiles(filepath.Join(dir, "no-sent.done"), filepath.Join(dir, "no-perm"), &stderr)
+		if stderr.Len() > 0 {
+			t.Errorf("unexpected stderr for missing files: %s", stderr.String())
+		}
 	})
 
 	t.Run("empty permBase skips perm cleanup", func(t *testing.T) {
@@ -384,10 +362,44 @@ func TestCleanupSentinelFiles(t *testing.T) {
 		sentPath := filepath.Join(dir, "run.done")
 		os.WriteFile(sentPath, []byte("old"), 0o600)
 
-		cleanupSentinelFiles(sentPath, "")
+		var stderr strings.Builder
+		cleanupSentinelFiles(sentPath, "", &stderr)
 
 		if _, err := os.Stat(sentPath); !os.IsNotExist(err) {
 			t.Error("expected sentinel to be removed")
+		}
+	})
+
+	t.Run("non-ENOENT remove error is logged to stderr", func(t *testing.T) {
+		if os.Getuid() == 0 {
+			t.Skip("cannot test permission errors as root")
+		}
+		dir := t.TempDir()
+		// Make the directory read-only so Remove fails with permission denied.
+		if err := os.Chmod(dir, 0o555); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		t.Cleanup(func() { os.Chmod(dir, 0o755) })
+
+		sentPath := filepath.Join(dir, "run.done")
+		// The file doesn't need to exist for Remove to return a non-ENOENT error
+		// when the directory is not writable; on macOS/Linux this returns EACCES.
+		// If os.Remove returns ErrNotExist instead (dir listing fails), the test
+		// falls through harmlessly — we check for at least one log entry.
+		var stderr strings.Builder
+		cleanupSentinelFiles(sentPath, "", &stderr)
+
+		// On read-only dir, Remove of a nonexistent file returns ENOENT (no log
+		// needed). But if the file were to exist it'd be EACCES. Create the file
+		// first by temporarily restoring write permission.
+		os.Chmod(dir, 0o755)
+		os.WriteFile(sentPath, []byte("x"), 0o600)
+		os.Chmod(dir, 0o555)
+
+		stderr.Reset()
+		cleanupSentinelFiles(sentPath, "", &stderr)
+		if stderr.Len() == 0 {
+			t.Error("expected non-ENOENT error to be logged to stderr but got none")
 		}
 	})
 }

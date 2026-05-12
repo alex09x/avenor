@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.7.1 — 2026-05-11
+
+### Fixed
+
+- `exitWithSentinel` closure is now defined immediately after `fs.Parse` succeeds,
+  covering all post-parse return paths. Previously, the three early-exit paths for
+  unreadable prompt file, event-log creation failure, and bad permission-handler
+  returned bare `1` without writing a sentinel — stableboy would hang waiting for a
+  signal that never arrived.
+- `cleanupSentinelFiles` now accepts an `io.Writer` for stderr and logs any
+  `os.Remove` error that is not `ErrNotExist`. Previously all removal errors were
+  silently discarded, leaving stale files that could cause subsequent runs to fail
+  silently.
+- `TestSentinelContent`: switched assertions from `strings.Contains` line checks to
+  exact byte equality. Line order in the sentinel is load-bearing (stableboy reads
+  line 1 as the status header); the old checks did not catch reordering.
+- `TestWriteSentinel`: same exact-equality fix for the content assertion.
+- `TestSessionEndFields`: replaced hardcoded `/tmp/...` path for the missing-file
+  case with `filepath.Join(t.TempDir(), "no-such-file.ndjson")` for proper test
+  isolation; replaced brittle name-string dispatch with a `missingFile bool` field.
+- `TestWriteSentinel`: added subtest asserting that a missing parent directory logs
+  an error to stderr and leaves no sentinel file behind.
+
 ## v0.7.0 — 2026-05-11
 
 ### Added

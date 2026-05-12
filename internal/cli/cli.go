@@ -74,27 +74,39 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
+
+	// Helper to write sentinel and return the provided exit code. Used at
+	// every return path when --sentinel-file is active. Defined immediately
+	// after fs.Parse so it is available for all post-parse return paths.
+	// When *onEvent is empty (flag-validation failures), sessionEndFields
+	// will open-fail silently and produce empty strings — the sentinel will
+	// still be written with FAILED/exit_1 so stableboy gets a signal.
+	exitWithSentinel := func(code int) int {
+		if *sentinelFile != "" {
+			writeSentinel(*sentinelFile, code, *onEvent, stderr)
+		}
+		return code
+	}
+
 	if *backend != defaultBackend {
 		fmt.Fprintf(stderr, "avenor: unknown backend %q\n", *backend)
-		return 1
+		return exitWithSentinel(1)
 	}
 	if *promptFile == "" {
 		fmt.Fprintln(stderr, "avenor: --prompt-file is required")
-		return 1
+		return exitWithSentinel(1)
 	}
 	if *onEvent == "" {
 		fmt.Fprintln(stderr, "avenor: --on-event is required")
-		return 1
+		return exitWithSentinel(1)
 	}
 
 	// Derive permission handler base from sentinel when --permission-handler is
 	// not set and --sentinel-file is set. The caller's explicit --permission-handler
 	// always wins.
 	var effectivePermHandler string
-	var derivedPermBase string
 	if *sentinelFile != "" && *permissionHandler == "" {
-		derivedPermBase = derivePermBase(*sentinelFile)
-		effectivePermHandler = "file:" + derivedPermBase
+		effectivePermHandler = "file:" + derivePermBase(*sentinelFile)
 	} else {
 		effectivePermHandler = *permissionHandler
 	}
@@ -109,19 +121,19 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		if strings.HasPrefix(effectivePermHandler, filePrefix) {
 			cleanupPermBase = strings.TrimPrefix(effectivePermHandler, filePrefix)
 		}
-		cleanupSentinelFiles(*sentinelFile, cleanupPermBase)
+		cleanupSentinelFiles(*sentinelFile, cleanupPermBase, stderr)
 	}
 
 	prompt, err := os.ReadFile(*promptFile)
 	if err != nil {
 		fmt.Fprintf(stderr, "avenor: read prompt file: %v\n", err)
-		return 1
+		return exitWithSentinel(1)
 	}
 
 	writer, err := newEventWriter(*onEvent)
 	if err != nil {
 		fmt.Fprintf(stderr, "avenor: open event stream: %v\n", err)
-		return 1
+		return exitWithSentinel(1)
 	}
 	defer writer.Close()
 
@@ -130,17 +142,8 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		fileHandler, err = parsePermissionHandler(effectivePermHandler)
 		if err != nil {
 			fmt.Fprintf(stderr, "avenor: %v\n", err)
-			return 1
+			return exitWithSentinel(1)
 		}
-	}
-
-	// Helper to write sentinel and return the provided exit code. Used at
-	// every return path when --sentinel-file is active.
-	exitWithSentinel := func(code int) int {
-		if *sentinelFile != "" {
-			writeSentinel(*sentinelFile, code, *onEvent, stderr)
-		}
-		return code
 	}
 
 	discovery := DiscoverServer(*serverURL, getenv)
