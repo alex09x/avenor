@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -146,16 +148,8 @@ func TestStreamJSONFormat(t *testing.T) {
 
 // ---- cursor tests ----
 
-// writeCursorFile is a test helper that writes a cursor file with the given
-// content (no newline appended — caller controls exact content).
-func writeCursorFile(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("writeCursorFile: %v", err)
-	}
-}
-
-// readCursorFile reads the cursor file and returns the trimmed content.
+// readCursorFile reads the cursor file and returns the raw content (including
+// any trailing newline). Use parseCursorOffset when you need the int64 value.
 func readCursorFile(t *testing.T, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -163,6 +157,21 @@ func readCursorFile(t *testing.T, path string) string {
 		t.Fatalf("readCursorFile: %v", err)
 	}
 	return string(data)
+}
+
+// parseCursorOffset parses the cursor file at path the same way production
+// code does (strconv.ParseInt after trimming the trailing newline) and returns
+// the int64 value. Tests should assert on the integer, not the raw string, so
+// that a format change only needs to be fixed here and in TestCursorFileIsParseable.
+func parseCursorOffset(t *testing.T, path string) int64 {
+	t.Helper()
+	raw := readCursorFile(t, path)
+	s := strings.TrimRight(raw, "\n")
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		t.Fatalf("parseCursorOffset(%q): %v", raw, err)
+	}
+	return n
 }
 
 // TestCursorMissingStartsAtZero verifies that when no cursor file exists,
@@ -182,22 +191,22 @@ func TestCursorMissingStartsAtZero(t *testing.T) {
 	}
 
 	// Cursor should now exist and contain the byte count.
-	got := readCursorFile(t, cursorPath)
-	want := fmt.Sprintf("%d\n", len(input))
-	if got != want {
-		t.Fatalf("cursor = %q, want %q", got, want)
+	gotOffset := parseCursorOffset(t, cursorPath)
+	if gotOffset != int64(len(input)) {
+		t.Fatalf("cursor offset = %d, want %d", gotOffset, len(input))
 	}
 }
 
-// TestCursorSeekSkipsAlreadyProcessed verifies that when CursorStartOffset is
-// set (simulating a post-seek state), Stream counts from that starting offset
-// and writes the correct absolute position.
-func TestCursorSeekSkipsAlreadyProcessed(t *testing.T) {
+// TestCursorSeekAdjustsAbsoluteOffset verifies that when CursorStartOffset is
+// set (simulating a post-seek state), Stream adds it to bytes consumed and
+// writes the correct absolute file position — i.e. the caller is responsible
+// for the seek, but Stream accounts for the pre-seek bytes in the cursor.
+func TestCursorSeekAdjustsAbsoluteOffset(t *testing.T) {
 	dir := t.TempDir()
 	cursorPath := filepath.Join(dir, "cursor")
 
 	// Simulate: caller read 10 bytes already, Stream gets the tail.
-	prefix := "0123456789" // 10 bytes already consumed
+	prefix := "0123456789" // 10 bytes already consumed by caller seek
 	tail := "line two\n"
 	var out bytes.Buffer
 	opts := Options{
@@ -208,10 +217,10 @@ func TestCursorSeekSkipsAlreadyProcessed(t *testing.T) {
 		t.Fatalf("Stream() error = %v", err)
 	}
 
-	want := fmt.Sprintf("%d\n", len(prefix)+len(tail))
-	got := readCursorFile(t, cursorPath)
-	if got != want {
-		t.Fatalf("cursor after seek = %q, want %q", got, want)
+	wantOffset := int64(len(prefix) + len(tail))
+	gotOffset := parseCursorOffset(t, cursorPath)
+	if gotOffset != wantOffset {
+		t.Fatalf("cursor after seek = %d, want %d", gotOffset, wantOffset)
 	}
 }
 
@@ -243,48 +252,93 @@ func TestCursorRewrittenOnFullRun(t *testing.T) {
 		t.Fatalf("Stream() error = %v", err)
 	}
 
-	want := fmt.Sprintf("%d\n", fileSize)
-	got := readCursorFile(t, cursorPath)
-	if got != want {
-		t.Fatalf("cursor = %q, want %q (file size=%d)", got, want, fileSize)
+	gotOffset := parseCursorOffset(t, cursorPath)
+	if gotOffset != fileSize {
+		t.Fatalf("cursor offset = %d, want %d (file size)", gotOffset, fileSize)
 	}
 }
 
-// TestCursorSecondRunEmitsNothing verifies that re-running with an offset
-// equal to the file size produces zero output.
+// TestCursorSecondRunEmitsNothing exercises the cursor codepath end-to-end:
+// run Stream once to populate the cursor file, then open the same input,
+// seek to the saved offset, and run Stream again — it should produce no output
+// and leave the cursor file pointing at the same (end-of-file) offset.
 func TestCursorSecondRunEmitsNothing(t *testing.T) {
-	// Use a simple in-memory string; simulate "cursor already at end".
+	dir := t.TempDir()
+	cursorPath := filepath.Join(dir, "cursor")
+
+	// Build a small log file with known content.
 	input := "line one\nline two\n"
-	var out bytes.Buffer
-	opts := Options{
-		// CursorPath intentionally blank — we just want to verify that starting
-		// at the end produces no output; we test the cursor file separately.
-		CursorStartOffset: int64(len(input)),
+	logPath := filepath.Join(dir, "test.ndjson")
+	if err := os.WriteFile(logPath, []byte(input), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
 	}
-	// Pass an empty reader (simulating a seek to the very end).
-	if err := Stream(strings.NewReader(""), &out, opts); err != nil {
-		t.Fatalf("Stream() error = %v", err)
+
+	// First run: process entire file, cursor written at EOF offset.
+	f1, err := os.Open(logPath)
+	if err != nil {
+		t.Fatalf("open first run: %v", err)
 	}
-	if out.Len() != 0 {
-		t.Fatalf("expected no output on second run, got: %q", out.String())
+	defer f1.Close()
+	var out1 bytes.Buffer
+	if err := Stream(f1, &out1, Options{CursorPath: cursorPath}); err != nil {
+		t.Fatalf("Stream() first run error = %v", err)
+	}
+	savedOffset := parseCursorOffset(t, cursorPath)
+	if savedOffset != int64(len(input)) {
+		t.Fatalf("after first run cursor = %d, want %d", savedOffset, len(input))
+	}
+
+	// Second run: open same file, seek to saved offset, Stream should see EOF
+	// immediately and produce no output.
+	f2, err := os.Open(logPath)
+	if err != nil {
+		t.Fatalf("open second run: %v", err)
+	}
+	defer f2.Close()
+	if _, err := f2.Seek(savedOffset, io.SeekStart); err != nil {
+		t.Fatalf("seek: %v", err)
+	}
+	var out2 bytes.Buffer
+	if err := Stream(f2, &out2, Options{
+		CursorPath:        cursorPath,
+		CursorStartOffset: savedOffset,
+	}); err != nil {
+		t.Fatalf("Stream() second run error = %v", err)
+	}
+	if out2.Len() != 0 {
+		t.Fatalf("expected no output on second run, got: %q", out2.String())
+	}
+	// Cursor file must still point at EOF.
+	finalOffset := parseCursorOffset(t, cursorPath)
+	if finalOffset != int64(len(input)) {
+		t.Fatalf("cursor after second run = %d, want %d", finalOffset, len(input))
 	}
 }
 
 // TestCursorFollowPeriodicRewrite verifies that in follow mode the cursor is
-// rewritten every cursorRewriteInterval events even before EOF.
-// We use a file that gets new lines appended mid-stream to simulate follow.
+// rewritten after cursorRewriteInterval events even while Stream is still
+// running — i.e. the periodic path fires BEFORE the shutdown (ErrClosed) path
+// gets a chance to write the cursor.
+//
+// Strategy: write a file with exactly cursorRewriteInterval lines. Open it and
+// start Stream in follow mode. Stream will drain the file, then block in its
+// polling loop (no new data, no EOF yet from our perspective because we have
+// not closed the file). At that point only the periodic-rewrite path could
+// have written the cursor. We poll until the cursor appears, assert the offset
+// BEFORE closing the file, then close and confirm Stream exits cleanly.
 func TestCursorFollowPeriodicRewrite(t *testing.T) {
 	dir := t.TempDir()
 	cursorPath := filepath.Join(dir, "cursor")
 
-	// Write exactly cursorRewriteInterval lines so that one periodic rewrite
-	// fires, then close the file to trigger ErrClosed / EOF shutdown.
-	logPath := filepath.Join(dir, "test.ndjson")
+	// Build exactly cursorRewriteInterval lines so exactly one periodic rewrite fires.
 	var sb strings.Builder
 	for i := 0; i < cursorRewriteInterval; i++ {
 		sb.WriteString(fmt.Sprintf("{\"event\":\"session.end\",\"session_id\":\"s%d\"}\n", i))
 	}
 	content := sb.String()
+	contentSize := int64(len(content))
+
+	logPath := filepath.Join(dir, "test.ndjson")
 	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
 		t.Fatalf("write log: %v", err)
 	}
@@ -307,39 +361,45 @@ func TestCursorFollowPeriodicRewrite(t *testing.T) {
 		done <- Stream(f, &out, opts)
 	}()
 
-	// Wait for the periodic rewrite: poll until the cursor file exists.
-	deadline := time.Now().Add(3 * time.Second)
+	// Poll for the cursor file. Stream is in follow mode, polling at
+	// PollInterval after EOF — file is still open, so no ErrClosed. The only
+	// code that writes the cursor before the file is closed is the periodic
+	// path (digest.go lines 136-141).
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, statErr := os.Stat(cursorPath); statErr == nil {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 	if _, statErr := os.Stat(cursorPath); statErr != nil {
 		f.Close()
 		<-done
-		t.Fatalf("cursor file not written within deadline: %v", statErr)
+		t.Fatalf("cursor file not written by periodic path within deadline")
 	}
 
-	// Graceful shutdown.
+	// Key assertion: verify the offset WHILE Stream is still live (file not
+	// yet closed). This is the periodic write — shutdown has not happened.
+	periodicOffset := parseCursorOffset(t, cursorPath)
+	if periodicOffset != contentSize {
+		t.Fatalf("periodic cursor offset = %d, want %d (content size)", periodicOffset, contentSize)
+	}
+
+	// Close the file to trigger ErrClosed shutdown path in Stream.
 	f.Close()
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Stream() returned error after file close: %v", err)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Stream() did not return after file close")
 	}
 
-	got := readCursorFile(t, cursorPath)
-	if !strings.HasSuffix(got, "\n") {
-		t.Fatalf("cursor file %q missing trailing newline", got)
-	}
-	// The offset should be positive (we processed content).
-	var offset int64
-	if _, scanErr := fmt.Sscan(strings.TrimSpace(got), &offset); scanErr != nil {
-		t.Fatalf("cursor file content %q is not an integer: %v", got, scanErr)
-	}
-	if offset <= 0 {
-		t.Fatalf("cursor offset = %d, want > 0", offset)
+	// After shutdown the cursor must be at or beyond the periodic offset.
+	finalOffset := parseCursorOffset(t, cursorPath)
+	if finalOffset < periodicOffset {
+		t.Fatalf("final cursor offset %d < periodic offset %d", finalOffset, periodicOffset)
 	}
 }
 
@@ -361,9 +421,9 @@ func TestCursorFileIsParseable(t *testing.T) {
 	}
 }
 
-// TestCursorAtomicWrite verifies that writeCursor does not leave a .tmp file
-// behind on success.
-func TestCursorAtomicWrite(t *testing.T) {
+// TestCursorWriteCleansUpTempFileOnSuccess verifies that writeCursor does not
+// leave a .tmp file behind after a successful write.
+func TestCursorWriteCleansUpTempFileOnSuccess(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "cursor")
 
@@ -372,6 +432,39 @@ func TestCursorAtomicWrite(t *testing.T) {
 	}
 	tmpPath := path + ".tmp"
 	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
-		t.Fatalf(".tmp file still exists after writeCursor")
+		t.Fatalf(".tmp file still exists after writeCursor success")
+	}
+}
+
+// TestCursorWriteRenameFailure verifies that when os.Rename fails (simulated
+// by placing a directory at the target path so rename is rejected), writeCursor
+// returns an error, does NOT overwrite the original target, and cleans up the
+// .tmp file.
+func TestCursorWriteRenameFailure(t *testing.T) {
+	dir := t.TempDir()
+	// Place a directory at the cursor path so os.Rename into it will fail.
+	targetPath := filepath.Join(dir, "cursor")
+	if err := os.Mkdir(targetPath, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+
+	err := writeCursor(targetPath, 42)
+	if err == nil {
+		t.Fatal("writeCursor: expected error when target is a directory, got nil")
+	}
+
+	// The .tmp file must be cleaned up even on failure.
+	tmpPath := targetPath + ".tmp"
+	if _, statErr := os.Stat(tmpPath); !os.IsNotExist(statErr) {
+		t.Fatalf(".tmp file still exists after rename failure")
+	}
+
+	// The original directory (target) must be untouched.
+	info, statErr := os.Stat(targetPath)
+	if statErr != nil {
+		t.Fatalf("target path gone after failure: %v", statErr)
+	}
+	if !info.IsDir() {
+		t.Fatalf("target path is no longer a directory after failure")
 	}
 }

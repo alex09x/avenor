@@ -27,14 +27,24 @@ func readCursor(path string) (int64, error) {
 	}
 	s := strings.TrimRight(string(data), "\n")
 	n, parseErr := strconv.ParseInt(s, 10, 64)
-	if parseErr != nil || n < 0 {
-		reason := "not a valid decimal integer"
-		if parseErr != nil {
-			reason = parseErr.Error()
-		}
-		return 0, fmt.Errorf("invalid cursor file %s: %s", path, reason)
+	if parseErr != nil {
+		return 0, fmt.Errorf("invalid cursor file %s: %w", path, parseErr)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("invalid cursor file %s: negative offset %d", path, n)
 	}
 	return n, nil
+}
+
+// validateCursorAgainstLog returns an error if the cursor offset is beyond the
+// end of the log file (i.e. the log was rotated or truncated). An offset equal
+// to the file size is valid (cursor points at EOF, nothing new to read).
+func validateCursorAgainstLog(offset int64, info os.FileInfo) error {
+	if offset > info.Size() {
+		return fmt.Errorf("log %s shorter than cursor (offset %d > size %d)",
+			info.Name(), offset, info.Size())
+	}
+	return nil
 }
 
 func runWatch(args []string) int {
@@ -88,10 +98,8 @@ func runWatch(args []string) int {
 			fmt.Fprintf(os.Stderr, "avenor watch: stat %s: %v\n", logPath, statErr)
 			return 2
 		}
-		if offset > info.Size() {
-			fmt.Fprintf(os.Stderr,
-				"avenor watch: log %s shorter than cursor %s (offset %d > size %d)\n",
-				logPath, *sinceCursor, offset, info.Size())
+		if err := validateCursorAgainstLog(offset, info); err != nil {
+			fmt.Fprintf(os.Stderr, "avenor watch: %v (cursor %s)\n", err, *sinceCursor)
 			return 2
 		}
 
