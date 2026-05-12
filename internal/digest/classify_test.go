@@ -3,6 +3,9 @@ package digest
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -174,6 +177,20 @@ func TestClassify(t *testing.T) {
 			raw:  `{"event":"agent.message_chunk","session_id":"s1","content":{"text":"high confidence at 85%","type":"text"}}`,
 			want: TagActivity,
 		},
+
+		// --- regex: multi-match and word-boundary ---
+		{
+			// Finding 1: first match is low (40), second is high (80) — must return FINDING.
+			name: "multi-confidence low-then-high returns FINDING",
+			raw:  `{"event":"agent.thought_chunk","session_id":"s1","content":{"text":"confidence: 40% on retry... confidence: 80% after review","type":"text"}}`,
+			want: TagFinding,
+		},
+		{
+			// Finding 2: "60ms" must not match — the "m" is adjacent to digits.
+			name: "confidence with ms suffix is ACTIVITY (word boundary prevents match)",
+			raw:  `{"event":"agent.message_chunk","session_id":"s1","content":{"text":"confidence: 60ms latency observed","type":"text"}}`,
+			want: TagActivity,
+		},
 	}
 
 	for _, tt := range tests {
@@ -274,9 +291,70 @@ func TestStreamClassifyJSONAddsField(t *testing.T) {
 		if got != wantClassify[i] {
 			t.Fatalf("line %d: classify=%q, want %q", i, got, wantClassify[i])
 		}
-		// Original event field must be intact.
+		// Original "event" field must survive the round-trip.
 		if _, hasEvent := m["event"]; !hasEvent {
 			t.Fatalf("line %d: 'event' field missing after classify injection", i)
 		}
+		// Non-event fields must also survive (session_id is present on both input lines).
+		if sid, ok := m["session_id"].(string); !ok || sid != "s1" {
+			t.Fatalf("line %d: session_id=%q, want %q after classify injection", i, m["session_id"], "s1")
+		}
+	}
+}
+
+// TestStreamClassifyWithCursor verifies that when both Classify and CursorPath
+// are active together, output lines are correctly tagged AND the cursor advances
+// to the expected byte offset (len of input), using the same cursor-assertion
+// pattern as digest_test.go.
+func TestStreamClassifyWithCursor(t *testing.T) {
+	input := strings.Join([]string{
+		// MILESTONE
+		`{"event":"session.end","session_id":"s1","stop_reason":"end_turn"}`,
+		// FINDING: confidence >= 60
+		`{"event":"agent.thought_chunk","session_id":"s1","content":{"text":"confidence: 75%","type":"text"}}`,
+		// ACTIVITY
+		`{"event":"tool.call","session_id":"s1","kind":"shell","title":"go build"}`,
+	}, "\n") + "\n"
+
+	dir := t.TempDir()
+	cursorPath := filepath.Join(dir, "cursor")
+
+	var out bytes.Buffer
+	opts := Options{
+		Classify:          true,
+		CursorPath:        cursorPath,
+		CursorStartOffset: 0,
+	}
+	if err := Stream(strings.NewReader(input), &out, opts); err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+
+	// Assert tags.
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("Stream() emitted %d lines, want 3;\n%s", len(lines), out.String())
+	}
+	wantPrefixes := []string{
+		"MILESTONE EVENT session.end",
+		"FINDING EVENT agent.thought_chunk",
+		"ACTIVITY EVENT tool.call",
+	}
+	for i, wantPfx := range wantPrefixes {
+		if !strings.HasPrefix(lines[i], wantPfx) {
+			t.Errorf("line %d: %q does not start with %q", i, lines[i], wantPfx)
+		}
+	}
+
+	// Assert cursor advanced to len(input).
+	raw, err := os.ReadFile(cursorPath)
+	if err != nil {
+		t.Fatalf("readCursorFile: %v", err)
+	}
+	gotOffset, err := strconv.ParseInt(strings.TrimRight(string(raw), "\n"), 10, 64)
+	if err != nil {
+		t.Fatalf("parseCursorOffset: %v", err)
+	}
+	if gotOffset != int64(len(input)) {
+		t.Fatalf("cursor offset = %d, want %d", gotOffset, int64(len(input)))
 	}
 }

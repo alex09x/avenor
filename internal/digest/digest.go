@@ -79,15 +79,22 @@ func writeCursor(path string, offset int64) error {
 	return nil
 }
 
-func DigestLine(raw []byte) (string, error) {
-	var event map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(raw), &event); err != nil {
-		return "", err
+// DigestLine parses a single raw JSON line and returns the formatted plain-text
+// line, the parsed event map, and any error.
+//
+// When the JSON has no "event" field the line should be skipped: the returned
+// string is empty and event is nil (no error).
+// Callers that only need the string can ignore the map; callers that also need
+// classification (e.g. streamLine) can pass the returned map directly to
+// Classify without re-parsing the bytes.
+func DigestLine(raw []byte) (line string, event map[string]any, err error) {
+	if err = json.Unmarshal(bytes.TrimSpace(raw), &event); err != nil {
+		return "", nil, err
 	}
 
 	name := stringField(event, "event")
 	if name == "" {
-		return "", nil
+		return "", nil, nil
 	}
 
 	sessionID := stringField(event, "session_id")
@@ -95,7 +102,7 @@ func DigestLine(raw []byte) (string, error) {
 		sessionID = stringField(event, "sessionID")
 	}
 
-	return fmt.Sprintf("EVENT %s %s %s", name, sessionID, clean(excerpt(event, name))), nil
+	return fmt.Sprintf("EVENT %s %s %s", name, sessionID, clean(excerpt(event, name))), event, nil
 }
 
 func Stream(in io.Reader, out io.Writer, opts Options) error {
@@ -183,7 +190,7 @@ func streamLine(raw []byte, lineNumber int, out io.Writer, format string, classi
 		return err
 	}
 
-	line, err := DigestLine(raw)
+	line, event, err := DigestLine(raw)
 	if err != nil {
 		logMalformed(lineNumber, err)
 		return nil
@@ -192,12 +199,9 @@ func streamLine(raw []byte, lineNumber int, out io.Writer, format string, classi
 		return nil
 	}
 	if classify {
-		var event map[string]any
-		if jsonErr := json.Unmarshal(bytes.TrimSpace(raw), &event); jsonErr == nil {
-			tag := Classify(event)
-			_, err = fmt.Fprintln(out, tag+" "+line)
-			return err
-		}
+		tag := Classify(event)
+		_, err = fmt.Fprintln(out, tag+" "+line)
+		return err
 	}
 	_, err = fmt.Fprintln(out, line)
 	return err

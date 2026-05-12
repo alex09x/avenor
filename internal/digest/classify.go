@@ -12,9 +12,13 @@ const (
 	TagActivity  = "ACTIVITY"
 )
 
-// confidenceRe matches "confidence: N%" or "confidence: N" where N is a decimal
-// integer, case-insensitively. Capturing group 1 is the numeric string.
-var confidenceRe = regexp.MustCompile(`(?i)confidence:\s*(\d+)%?`)
+// confidenceRe matches "confidence: N%" or "confidence: N" (at a word boundary)
+// where N is a decimal integer, case-insensitively. Capturing group 1 is the
+// numeric string. The trailing `(?:%|\b)` requires either a literal "%" or a
+// word boundary so "confidence: 60ms" does not match (the "m" is a word char
+// adjacent to the digits, not a boundary), while "confidence: 60%" and
+// "confidence: 60 " and bare "60" at end-of-string all still match.
+var confidenceRe = regexp.MustCompile(`(?i)confidence:\s*(\d+)(?:%|\b)`)
 
 // Classify returns a tag (MILESTONE, FINDING, or ACTIVITY) for a parsed event.
 // The event map is what DigestLine has already unmarshaled.
@@ -101,8 +105,10 @@ func classifyChunk(event map[string]any) string {
 		return TagFinding
 	}
 
-	// confidence: N% or confidence: N where N >= 60.
-	if m := confidenceRe.FindStringSubmatch(text); m != nil {
+	// confidence: N% or confidence: N where ANY occurrence has N >= 60.
+	// We loop over all matches so "confidence: 40% ... confidence: 80%" correctly
+	// returns FINDING (the first match is not necessarily the highest value).
+	for _, m := range confidenceRe.FindAllStringSubmatch(text, -1) {
 		if n, err := strconv.Atoi(m[1]); err == nil && n >= 60 {
 			return TagFinding
 		}

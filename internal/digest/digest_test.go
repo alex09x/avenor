@@ -76,7 +76,7 @@ func TestDigestLine(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := DigestLine([]byte(tt.raw))
+			got, _, err := DigestLine([]byte(tt.raw))
 			if err != nil {
 				t.Fatalf("DigestLine() error = %v", err)
 			}
@@ -88,14 +88,14 @@ func TestDigestLine(t *testing.T) {
 }
 
 func TestDigestLineMalformed(t *testing.T) {
-	if _, err := DigestLine([]byte(`{"event":`)); err == nil {
+	if _, _, err := DigestLine([]byte(`{"event":`)); err == nil {
 		t.Fatal("DigestLine() error = nil, want malformed JSON error")
 	}
 }
 
 func TestDigestLineSkipsNonEventJSON(t *testing.T) {
 	raw := `{"type":"text","part":{"text":"hi"}}`
-	got, err := DigestLine([]byte(raw))
+	got, _, err := DigestLine([]byte(raw))
 	if err != nil {
 		t.Fatalf("DigestLine() error = %v", err)
 	}
