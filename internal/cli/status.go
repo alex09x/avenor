@@ -1,6 +1,10 @@
 package cli
 
-import "github.com/sdougbrown/avenor/internal/events"
+import (
+	"time"
+
+	"github.com/sdougbrown/avenor/internal/events"
+)
 
 const (
 	phaseThink = "thinking"
@@ -13,12 +17,13 @@ const (
 // agent.status events on phase transitions.
 type statusTracker struct {
 	sessionID string
+	runID     string
 	phase     string
 	label     string
 }
 
-func newStatusTracker(sessionID string) *statusTracker {
-	return &statusTracker{sessionID: sessionID}
+func newStatusTracker(sessionID, runID string) *statusTracker {
+	return &statusTracker{sessionID: sessionID, runID: runID}
 }
 
 // Observe returns a synthesized agent.status event and true when ev causes a
@@ -73,9 +78,13 @@ func (s *statusTracker) set(phase, label string) (events.Event, bool) {
 	fields := map[string]any{
 		"phase":  phase,
 		"source": "avenor",
+		"ts":     time.Now().UnixMilli(),
 	}
 	if label != "" {
 		fields["label"] = label
+	}
+	if s.runID != "" {
+		fields["run_id"] = s.runID
 	}
 	return events.Event{
 		Event:     "agent.status",

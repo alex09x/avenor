@@ -70,9 +70,15 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	timeout := fs.Duration("timeout", 0, "overall session timeout")
 	model := fs.String("model", "", "backend-specific model id")
 	backend := fs.String("backend", defaultBackend, "runtime backend")
+	runIDFlag := fs.String("run-id", "", "correlation id for this run (generated if not set)")
 
 	if err := fs.Parse(args); err != nil {
 		return 1
+	}
+
+	runID := *runIDFlag
+	if runID == "" {
+		runID = generateRunID()
 	}
 
 	// Helper to write sentinel and return the provided exit code. Used at
@@ -83,7 +89,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	// still be written with FAILED/exit_1 so stableboy gets a signal.
 	exitWithSentinel := func(code int) int {
 		if *sentinelFile != "" {
-			writeSentinel(*sentinelFile, code, *onEvent, stderr)
+			writeSentinel(*sentinelFile, code, *onEvent, runID, stderr)
 		}
 		return code
 	}
@@ -188,7 +194,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		timer = t.C
 	}
 
-	return exitWithSentinel(waitForSession(ctx, provider, writer, fileHandler, eventCh, promptDone, session.SessionID, timer, stderr))
+	return exitWithSentinel(waitForSession(ctx, provider, writer, fileHandler, eventCh, promptDone, session.SessionID, runID, timer, stderr))
 }
 
 func startSession(ctx context.Context, provider runtime.Provider, opts runtime.StartOptions, resumeID string) (runtime.Session, error) {
@@ -206,13 +212,14 @@ func waitForSession(
 	eventCh <-chan events.Event,
 	promptDone <-chan error,
 	sessionID string,
+	runID string,
 	timeout <-chan time.Time,
 	stderr io.Writer,
 ) int {
 	var finalStopReason string
 	promptReturned := false
 	var permissionDone <-chan error
-	tracker := newStatusTracker(sessionID)
+	tracker := newStatusTracker(sessionID, runID)
 
 	writeStatus := func(ev events.Event, ok bool) bool {
 		if !ok {

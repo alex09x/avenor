@@ -110,7 +110,7 @@ func TestStatusTrackerTransitions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tracker := newStatusTracker("ses_1")
+			tracker := newStatusTracker("ses_1", "")
 			var gotPhases []string
 			for _, ev := range tt.sequence {
 				if statusEv, ok := tracker.Observe(ev); ok {
@@ -130,7 +130,7 @@ func TestStatusTrackerTransitions(t *testing.T) {
 }
 
 func TestStatusTrackerLabel(t *testing.T) {
-	tracker := newStatusTracker("ses_1")
+	tracker := newStatusTracker("ses_1", "")
 	ev, ok := tracker.Observe(makeEvent("tool.call", map[string]any{"title": "go test ./..."}))
 	if !ok {
 		t.Fatal("expected status event, got none")
@@ -150,7 +150,7 @@ func TestStatusTrackerLabel(t *testing.T) {
 }
 
 func TestStatusTrackerPermissionLabel(t *testing.T) {
-	tracker := newStatusTracker("ses_1")
+	tracker := newStatusTracker("ses_1", "")
 	// question takes precedence over tool
 	ev, _ := tracker.Observe(makeEvent("permission.request", map[string]any{
 		"question": "Allow exec?",
@@ -161,7 +161,7 @@ func TestStatusTrackerPermissionLabel(t *testing.T) {
 	}
 
 	// empty question falls back to tool
-	tracker2 := newStatusTracker("ses_1")
+	tracker2 := newStatusTracker("ses_1", "")
 	ev2, _ := tracker2.Observe(makeEvent("permission.request", map[string]any{
 		"question": "",
 		"tool":     "write",
@@ -172,7 +172,7 @@ func TestStatusTrackerPermissionLabel(t *testing.T) {
 }
 
 func TestStatusTrackerNoLabelOnThinkOrDone(t *testing.T) {
-	tracker := newStatusTracker("ses_1")
+	tracker := newStatusTracker("ses_1", "")
 	ev, _ := tracker.Observe(makeEvent("agent.thought_chunk", nil))
 	if label := statusField(ev.Fields, "label"); label != "" {
 		t.Fatalf("thinking event should have no label, got %q", label)
@@ -183,8 +183,32 @@ func TestStatusTrackerNoLabelOnThinkOrDone(t *testing.T) {
 	}
 }
 
+func TestStatusTrackerRunIDAndTimestamp(t *testing.T) {
+	const runID = "a1b2c3d4e5f60718"
+	tracker := newStatusTracker("ses_1", runID)
+	ev, ok := tracker.Observe(makeEvent("agent.thought_chunk", nil))
+	if !ok {
+		t.Fatal("expected status event")
+	}
+
+	if got, _ := ev.Fields["run_id"].(string); got != runID {
+		t.Fatalf("run_id = %q, want %q", got, runID)
+	}
+	if ts, ok := ev.Fields["ts"].(int64); !ok || ts <= 0 {
+		t.Fatalf("ts missing or non-positive: %v", ev.Fields["ts"])
+	}
+}
+
+func TestStatusTrackerEmptyRunIDOmitted(t *testing.T) {
+	tracker := newStatusTracker("ses_1", "")
+	ev, _ := tracker.Observe(makeEvent("agent.thought_chunk", nil))
+	if _, hasRunID := ev.Fields["run_id"]; hasRunID {
+		t.Fatal("run_id should be absent when empty")
+	}
+}
+
 func TestStatusTrackerPermissionAnswered(t *testing.T) {
-	tracker := newStatusTracker("ses_1")
+	tracker := newStatusTracker("ses_1", "")
 
 	// PermissionAnswered does nothing if not in waiting state.
 	_, ok := tracker.PermissionAnswered()
