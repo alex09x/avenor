@@ -6,11 +6,36 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/sdougbrown/avenor/internal/digest"
 )
+
+// readCursor reads the byte offset stored in the cursor file at path.
+// If the file does not exist, it returns (0, nil) — start from the beginning.
+// If the file exists but is not parseable, it returns an error.
+func readCursor(path string) (int64, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read cursor file %s: %w", path, err)
+	}
+	s := strings.TrimRight(string(data), "\n")
+	n, parseErr := strconv.ParseInt(s, 10, 64)
+	if parseErr != nil || n < 0 {
+		reason := "not a valid decimal integer"
+		if parseErr != nil {
+			reason = parseErr.Error()
+		}
+		return 0, fmt.Errorf("invalid cursor file %s: %s", path, reason)
+	}
+	return n, nil
+}
 
 func runWatch(args []string) int {
 	fs := flag.NewFlagSet("avenor watch", flag.ContinueOnError)
@@ -19,6 +44,7 @@ func runWatch(args []string) int {
 	follow := fs.Bool("follow", false, "poll and tail the log")
 	format := fs.String("format", "plain", "output format: plain or json")
 	pollInterval := fs.Duration("poll-interval", 250*time.Millisecond, "follow-mode sleep interval")
+	sinceCursor := fs.String("since-cursor", "", "cursor file path: seek to saved offset before reading; rewrite offset on exit")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -36,18 +62,55 @@ func runWatch(args []string) int {
 		return 2
 	}
 
-	file, err := os.Open(fs.Arg(0))
+	logPath := fs.Arg(0)
+
+	file, err := os.Open(logPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "avenor watch: open %s: %v\n", fs.Arg(0), err)
+		fmt.Fprintf(os.Stderr, "avenor watch: open %s: %v\n", logPath, err)
 		return 2
 	}
 	defer file.Close()
 
+	// Handle --since-cursor: read the saved offset, validate it against the
+	// current log size, then seek the file to that position.
+	var cursorStartOffset int64
+	if *sinceCursor != "" {
+		offset, cursorErr := readCursor(*sinceCursor)
+		if cursorErr != nil {
+			fmt.Fprintf(os.Stderr, "avenor watch: %v\n", cursorErr)
+			return 2
+		}
+
+		// Sanity-check: if the log has been rotated/truncated the saved offset
+		// may be beyond the end of the file.
+		info, statErr := file.Stat()
+		if statErr != nil {
+			fmt.Fprintf(os.Stderr, "avenor watch: stat %s: %v\n", logPath, statErr)
+			return 2
+		}
+		if offset > info.Size() {
+			fmt.Fprintf(os.Stderr,
+				"avenor watch: log %s shorter than cursor %s (offset %d > size %d)\n",
+				logPath, *sinceCursor, offset, info.Size())
+			return 2
+		}
+
+		if offset > 0 {
+			if _, seekErr := file.Seek(offset, 0); seekErr != nil {
+				fmt.Fprintf(os.Stderr, "avenor watch: seek %s: %v\n", logPath, seekErr)
+				return 2
+			}
+		}
+		cursorStartOffset = offset
+	}
+
 	out := bufio.NewWriter(os.Stdout)
 	opts := digest.Options{
-		Follow:       *follow,
-		PollInterval: *pollInterval,
-		Format:       *format,
+		Follow:            *follow,
+		PollInterval:      *pollInterval,
+		Format:            *format,
+		CursorPath:        *sinceCursor,
+		CursorStartOffset: cursorStartOffset,
 	}
 
 	if !*follow {

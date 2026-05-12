@@ -18,6 +18,11 @@ const (
 	defaultFormat       = "plain"
 	defaultPollInterval = 250 * time.Millisecond
 	maxExcerptRunes     = 120
+
+	// cursorRewriteInterval is how many events are processed between periodic
+	// cursor rewrites in follow mode, so a crash loses at most this many events
+	// of progress.
+	cursorRewriteInterval = 10
 )
 
 var lineBreakWhitespace = regexp.MustCompile(`[\r\n\t]+`)
@@ -26,6 +31,48 @@ type Options struct {
 	Follow       bool
 	PollInterval time.Duration
 	Format       string
+
+	// CursorPath, when non-empty, causes Stream to atomically rewrite the
+	// cursor file after processing. The caller is responsible for seeking the
+	// underlying reader to the offset recorded in the cursor file before
+	// calling Stream; CursorStartOffset must be set to that same offset so
+	// Stream can compute the absolute file position when writing the cursor.
+	//
+	// Design note: we keep Stream's signature as io.Reader (rather than
+	// *os.File) so tests can pass bytes.Buffer or strings.Reader without
+	// touching the filesystem. The caller in watch.go handles the actual
+	// os.File seek; we track bytes consumed here via a counting wrapper.
+	CursorPath        string
+	CursorStartOffset int64
+}
+
+// countingReader wraps an io.Reader and counts total bytes read.
+type countingReader struct {
+	r     io.Reader
+	total int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.total += int64(n)
+	return n, err
+}
+
+// writeCursor atomically rewrites the cursor file at path with offset.
+// It writes to path+".tmp" then renames into place.
+func writeCursor(path string, offset int64) error {
+	tmp := path + ".tmp"
+	content := fmt.Sprintf("%d\n", offset)
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		// Clean up the temp file if it was partially written.
+		_ = os.Remove(tmp)
+		return fmt.Errorf("write cursor tmp %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename cursor %s -> %s: %w", tmp, path, err)
+	}
+	return nil
 }
 
 func DigestLine(raw []byte) (string, error) {
@@ -53,14 +100,44 @@ func Stream(in io.Reader, out io.Writer, opts Options) error {
 		pollInterval = defaultPollInterval
 	}
 
-	reader := bufio.NewReader(in)
+	// Wrap the reader with a byte counter so we can track our position in the
+	// file and update the cursor without needing a seekable *os.File here.
+	cr := &countingReader{r: in}
+	reader := bufio.NewReader(cr)
+
+	// currentOffset returns the absolute file position (start offset + bytes
+	// consumed so far, minus any buffered-but-not-yet-processed bytes in the
+	// bufio layer). bufio.Reader may have read ahead; subtract the buffered
+	// amount to get the position of the last fully-delivered byte.
+	currentOffset := func() int64 {
+		buffered := int64(reader.Buffered())
+		return opts.CursorStartOffset + cr.total - buffered
+	}
+
+	writeCurrentCursor := func() error {
+		if opts.CursorPath == "" {
+			return nil
+		}
+		return writeCursor(opts.CursorPath, currentOffset())
+	}
+
 	lineNumber := 0
+	eventsSinceCursorWrite := 0
 	for {
 		raw, err := reader.ReadBytes('\n')
 		if len(raw) > 0 {
 			lineNumber++
-			if err := streamLine(raw, lineNumber, out, format); err != nil {
-				return err
+			if streamErr := streamLine(raw, lineNumber, out, format); streamErr != nil {
+				return streamErr
+			}
+			eventsSinceCursorWrite++
+			// In follow mode, rewrite the cursor periodically so a crash only
+			// loses at most cursorRewriteInterval events of progress.
+			if opts.Follow && opts.CursorPath != "" && eventsSinceCursorWrite >= cursorRewriteInterval {
+				if cursorErr := writeCurrentCursor(); cursorErr != nil {
+					return cursorErr
+				}
+				eventsSinceCursorWrite = 0
 			}
 		}
 		if err == nil {
@@ -71,10 +148,12 @@ func Stream(in io.Reader, out io.Writer, opts Options) error {
 				time.Sleep(pollInterval)
 				continue
 			}
-			return nil
+			// Oneshot mode: write cursor on clean EOF.
+			return writeCurrentCursor()
 		}
 		if errors.Is(err, os.ErrClosed) {
-			return nil
+			// Graceful shutdown (file closed by signal handler): write cursor.
+			return writeCurrentCursor()
 		}
 		return err
 	}
