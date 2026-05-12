@@ -82,6 +82,10 @@ func DigestLine(raw []byte) (string, error) {
 	}
 
 	name := stringField(event, "event")
+	if name == "" {
+		return "", nil
+	}
+
 	sessionID := stringField(event, "session_id")
 	if sessionID == "" {
 		sessionID = stringField(event, "sessionID")
@@ -175,6 +179,9 @@ func streamLine(raw []byte, lineNumber int, out io.Writer, format string) error 
 	line, err := DigestLine(raw)
 	if err != nil {
 		logMalformed(lineNumber, err)
+		return nil
+	}
+	if line == "" {
 		return nil
 	}
 	_, err = fmt.Fprintln(out, line)

@@ -93,6 +93,56 @@ func TestDigestLineMalformed(t *testing.T) {
 	}
 }
 
+func TestDigestLineSkipsNonEventJSON(t *testing.T) {
+	raw := `{"type":"text","part":{"text":"hi"}}`
+	got, err := DigestLine([]byte(raw))
+	if err != nil {
+		t.Fatalf("DigestLine() error = %v", err)
+	}
+	if got != "" {
+		t.Fatalf("DigestLine() = %q, want empty string for non-event JSON", got)
+	}
+}
+
+func TestStreamSkipsNonEventLines(t *testing.T) {
+	input := strings.Join([]string{
+		`{"event":"agent.message_chunk","session_id":"ses_1","content":{"text":"hello","type":"text"}}`,
+		`{"type":"text","part":{"text":"legacy noise"}}`,
+		`{"event":"session.end","session_id":"ses_1","stop_reason":"end_turn"}`,
+		`{"sessionID":"ses_legacy"}`,
+	}, "\n") + "\n"
+
+	var out bytes.Buffer
+	if err := Stream(strings.NewReader(input), &out, Options{}); err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+
+	got := out.String()
+
+	// Must contain only the two event lines.
+	if !strings.Contains(got, "EVENT agent.message_chunk ses_1 hello") {
+		t.Fatalf("Stream() missing agent.message_chunk; got:\n%s", got)
+	}
+	if !strings.Contains(got, "EVENT session.end ses_1 stop_reason=end_turn") {
+		t.Fatalf("Stream() missing session.end; got:\n%s", got)
+	}
+
+	// Must not contain blank lines or EVENT   noise.
+	for i, line := range strings.Split(strings.TrimRight(got, "\n"), "\n") {
+		if strings.TrimSpace(line) == "" {
+			t.Fatalf("Stream() emitted blank line at position %d; output:\n%s", i, got)
+		}
+		if line == "EVENT   " || (strings.HasPrefix(line, "EVENT ") && strings.Count(line, " ") == 2) {
+			t.Fatalf("Stream() emitted empty-field EVENT line: %q", line)
+		}
+	}
+	// Exactly two lines expected.
+	lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("Stream() emitted %d lines, want 2; output:\n%s", len(lines), got)
+	}
+}
+
 func TestStreamGolden(t *testing.T) {
 	fixtures := []string{
 		"events-vocabulary",
