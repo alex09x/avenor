@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.6.0 — 2026-05-11
+
+### Added
+
+- `avenor watch --classify`: prefix each plain-format digest line with `MILESTONE`,
+  `FINDING`, or `ACTIVITY` based on event type and content heuristics.
+  - **MILESTONE**: `session.end`, `permission.request`, `tool.call`/`tool.call_update`
+    where `kind==commit`, `kind==task` with `status==completed`, or title/command
+    contains `git commit`.
+  - **FINDING**: message/thought/user chunks containing `[finding]` marker,
+    `reviewer flagged`, `correction needed`, `failed test`, or `confidence: N%`
+    where N ≥ 60.
+  - **ACTIVITY**: everything else (default).
+- `--format json --classify`: injects a top-level `"classify"` field into each
+  emitted JSON object without altering other fields.
+- Classification rules live in `internal/digest/classify.go` as the single source
+  of truth; encoding what was previously prose in `agents/groom.md`.
+
 ## v0.5.0 — 2026-05-11
 
 ### Added

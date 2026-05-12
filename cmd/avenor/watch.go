@@ -52,7 +52,8 @@ func runWatch(args []string) int {
 	fs.SetOutput(os.Stderr)
 
 	follow := fs.Bool("follow", false, "poll and tail the log")
-	format := fs.String("format", "plain", "output format: plain or json")
+	format := fs.String("format", "plain", "output format: plain (EVENT lines) or json (pass-through NDJSON)")
+	classify := fs.Bool("classify", false, "prefix each plain-format digest line with MILESTONE | FINDING | ACTIVITY; in json format, adds a top-level \"classify\" field")
 	pollInterval := fs.Duration("poll-interval", 250*time.Millisecond, "follow-mode sleep interval")
 	sinceCursor := fs.String("since-cursor", "", "cursor file path: seek to saved offset before reading; rewrite offset on exit")
 
@@ -117,6 +118,7 @@ func runWatch(args []string) int {
 		Follow:            *follow,
 		PollInterval:      *pollInterval,
 		Format:            *format,
+		Classify:          *classify,
 		CursorPath:        *sinceCursor,
 		CursorStartOffset: cursorStartOffset,
 	}

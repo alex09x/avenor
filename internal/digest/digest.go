@@ -31,6 +31,10 @@ type Options struct {
 	Follow       bool
 	PollInterval time.Duration
 	Format       string
+	// Classify, when true, prefixes each plain-format line with a tag:
+	// MILESTONE, FINDING, or ACTIVITY. For JSON format, a top-level
+	// "classify" field is injected into each emitted object.
+	Classify bool
 
 	// CursorPath, when non-empty, causes Stream to atomically rewrite the
 	// cursor file after processing. The caller is responsible for seeking the
@@ -131,7 +135,7 @@ func Stream(in io.Reader, out io.Writer, opts Options) error {
 		raw, err := reader.ReadBytes('\n')
 		if len(raw) > 0 {
 			lineNumber++
-			if streamErr := streamLine(raw, lineNumber, out, format); streamErr != nil {
+			if streamErr := streamLine(raw, lineNumber, out, format, opts.Classify); streamErr != nil {
 				return streamErr
 			}
 			eventsSinceCursorWrite++
@@ -163,7 +167,7 @@ func Stream(in io.Reader, out io.Writer, opts Options) error {
 	}
 }
 
-func streamLine(raw []byte, lineNumber int, out io.Writer, format string) error {
+func streamLine(raw []byte, lineNumber int, out io.Writer, format string, classify bool) error {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
@@ -171,6 +175,9 @@ func streamLine(raw []byte, lineNumber int, out io.Writer, format string) error 
 		if err := validateJSON(raw); err != nil {
 			logMalformed(lineNumber, err)
 			return nil
+		}
+		if classify {
+			return writeJSONWithClassify(raw, out)
 		}
 		_, err := out.Write(raw)
 		return err
@@ -184,7 +191,37 @@ func streamLine(raw []byte, lineNumber int, out io.Writer, format string) error 
 	if line == "" {
 		return nil
 	}
+	if classify {
+		var event map[string]any
+		if jsonErr := json.Unmarshal(bytes.TrimSpace(raw), &event); jsonErr == nil {
+			tag := Classify(event)
+			_, err = fmt.Fprintln(out, tag+" "+line)
+			return err
+		}
+	}
 	_, err = fmt.Fprintln(out, line)
+	return err
+}
+
+// writeJSONWithClassify parses raw, injects a top-level "classify" field, then
+// writes the modified object followed by a newline. The original fields are
+// preserved; only "classify" is added (or overwritten if already present).
+func writeJSONWithClassify(raw []byte, out io.Writer) error {
+	var event map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &event); err != nil {
+		// Should not happen — caller already validated; fall back to raw.
+		_, writeErr := out.Write(raw)
+		return writeErr
+	}
+	event["classify"] = Classify(event)
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		// Encoding failure is unexpected; fall back to raw bytes.
+		_, writeErr := out.Write(raw)
+		return writeErr
+	}
+	encoded = append(encoded, '\n')
+	_, err = out.Write(encoded)
 	return err
 }
 
