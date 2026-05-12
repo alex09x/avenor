@@ -38,11 +38,35 @@ func writeReqFile(t *testing.T, dir, name string, optionIDs []string) string {
 	return permBase
 }
 
+// writeReqFileRaw writes a raw JSON body to dir/<name>.req and returns the perm-base.
+func writeReqFileRaw(t *testing.T, dir, name string, body []byte) string {
+	t.Helper()
+	permBase := filepath.Join(dir, name)
+	if err := os.WriteFile(permBase+".req", body, 0o644); err != nil {
+		t.Fatalf("write req: %v", err)
+	}
+	return permBase
+}
+
 // answerRun calls runAnswerTo and captures stderr.
 func answerRun(args []string) (code int, stderr string) {
 	var buf bytes.Buffer
 	code = runAnswerTo(args, &buf)
 	return code, buf.String()
+}
+
+// noTmpFiles asserts no .tmp* files exist in dir.
+func noTmpFiles(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir %s: %v", dir, err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".tmp") {
+			t.Errorf("unexpected tmp file left in dir: %s", e.Name())
+		}
+	}
 }
 
 // ---- table-driven tests ----
@@ -84,21 +108,14 @@ func TestRunAnswer(t *testing.T) {
 			stderrSub: "--option",
 		},
 		{
-			name: "unknown option id exits 2 listing valid ids",
+			// Stronger assertion is in TestRunAnswerUnknownOptionListsValid;
+			// just pin the exit code here.
+			name: "unknown option id exits 2",
 			setup: func(t *testing.T, dir string) []string {
 				permBase := writeReqFile(t, dir, "test.perm", []string{"allow", "deny"})
 				return []string{"--option", "bogus", permBase}
 			},
-			wantCode:  2,
-			stderrSub: "allow",
-		},
-		{
-			name: "valid option exits 0 and writes response",
-			setup: func(t *testing.T, dir string) []string {
-				permBase := writeReqFile(t, dir, "test.perm", []string{"allow", "deny"})
-				return []string{"--option", "allow", permBase}
-			},
-			wantCode: 0,
+			wantCode: 2,
 		},
 		{
 			name: "response exists without --force exits 2",
@@ -112,26 +129,6 @@ func TestRunAnswer(t *testing.T) {
 			},
 			wantCode:  2,
 			stderrSub: "--force",
-		},
-		{
-			name: "response exists with --force exits 0 and overwrites",
-			setup: func(t *testing.T, dir string) []string {
-				permBase := writeReqFile(t, dir, "test.perm", []string{"allow"})
-				responsePath := permBase + ".req.response"
-				if err := os.WriteFile(responsePath, []byte("old content\n"), 0o600); err != nil {
-					t.Fatalf("setup: %v", err)
-				}
-				return []string{"--option", "allow", "--force", permBase}
-			},
-			wantCode: 0,
-		},
-		{
-			name: "cancelled outcome written correctly",
-			setup: func(t *testing.T, dir string) []string {
-				permBase := writeReqFile(t, dir, "test.perm", []string{"allow"})
-				return []string{"--option", "allow", "--outcome", "cancelled", permBase}
-			},
-			wantCode: 0,
 		},
 		{
 			name: "bogus outcome exits 2",
@@ -284,4 +281,161 @@ func TestRunAnswerUnknownOptionListsValid(t *testing.T) {
 			t.Errorf("stderr %q does not mention valid option %q", stderr, id)
 		}
 	}
+}
+
+// ---- edge case tests ----
+
+// TestRunAnswerEmptyOptionsArray: request has "options": []. Any --option value
+// should be rejected with exit 2. Error message must not have a dangling colon.
+func TestRunAnswerEmptyOptionsArray(t *testing.T) {
+	dir := t.TempDir()
+	permBase := writeReqFileRaw(t, dir, "test.perm",
+		[]byte(`{"request_id":"1","question":"Go?","options":[]}`))
+
+	code, stderr := answerRun([]string{"--option", "allow", permBase})
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2; stderr: %s", code, stderr)
+	}
+	// Must not emit "valid options: " with a trailing empty list.
+	if containsStr(stderr, "valid options: \n") || containsStr(stderr, "valid options:  ") {
+		t.Errorf("stderr has dangling 'valid options:' with empty list: %q", stderr)
+	}
+	// Must mention that no options were offered.
+	if !containsStr(stderr, "no options were offered") {
+		t.Errorf("stderr %q should mention no options were offered", stderr)
+	}
+}
+
+// TestRunAnswerOptionsMissingEntirely: request JSON has no "options" field.
+// Same expectation as empty options array.
+func TestRunAnswerOptionsMissingEntirely(t *testing.T) {
+	dir := t.TempDir()
+	permBase := writeReqFileRaw(t, dir, "test.perm",
+		[]byte(`{"request_id":"1","question":"Go?"}`))
+
+	code, stderr := answerRun([]string{"--option", "allow", permBase})
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2; stderr: %s", code, stderr)
+	}
+	if !containsStr(stderr, "no options were offered") {
+		t.Errorf("stderr %q should mention no options were offered", stderr)
+	}
+}
+
+// TestRunAnswerOptionMissingOptionId: option entry has no optionId field.
+// Such entries must be filtered out (not treated as a valid empty-string option).
+func TestRunAnswerOptionMissingOptionId(t *testing.T) {
+	dir := t.TempDir()
+	// One option with no optionId, so the effective valid set is empty.
+	permBase := writeReqFileRaw(t, dir, "test.perm",
+		[]byte(`{"request_id":"1","question":"Go?","options":[{"kind":"allow"}]}`))
+
+	// Attempting to pass --option "" should be rejected (empty string is filtered out).
+	code, stderr := answerRun([]string{"--option", "", permBase})
+	// --option "" triggers the "required" check before we even read the req file.
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2; stderr: %s", code, stderr)
+	}
+
+	// Attempting to pass a non-empty option should also be rejected since
+	// the only entry had an empty optionId (filtered) → effective set is empty.
+	permBase2 := writeReqFileRaw(t, dir, "test2.perm",
+		[]byte(`{"request_id":"1","question":"Go?","options":[{"kind":"allow"}]}`))
+	code2, stderr2 := answerRun([]string{"--option", "allow", permBase2})
+	if code2 != 2 {
+		t.Fatalf("exit code = %d, want 2; stderr: %s", code2, stderr2)
+	}
+	if !containsStr(stderr2, "no options were offered") {
+		t.Errorf("stderr %q should mention no options were offered", stderr2)
+	}
+}
+
+// TestRunAnswerRenameFailureCleansTmp: make the rename fail by pre-creating a
+// directory at the response path (with --force so the existence check passes,
+// then the rename fails because target is a directory). Assert exit 1 and no
+// orphaned .tmp* files.
+func TestRunAnswerRenameFailureCleansTmp(t *testing.T) {
+	dir := t.TempDir()
+	permBase := writeReqFile(t, dir, "test.perm", []string{"allow"})
+	responsePath := permBase + ".req.response"
+
+	// Pre-create a directory at the response path so os.Rename will fail.
+	if err := os.Mkdir(responsePath, 0o755); err != nil {
+		t.Fatalf("setup mkdir: %v", err)
+	}
+
+	code, _ := answerRun([]string{"--option", "allow", "--force", permBase})
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1 (I/O error)", code)
+	}
+
+	// No orphaned .tmp* files should remain.
+	noTmpFiles(t, dir)
+}
+
+// TestRunAnswerMessageSpecialChars: round-trip a message with special characters
+// to verify JSON encoding works and HTML escaping is disabled.
+func TestRunAnswerMessageSpecialChars(t *testing.T) {
+	dir := t.TempDir()
+	permBase := writeReqFile(t, dir, "test.perm", []string{"allow"})
+
+	specialMsg := "newline:\nquote:\"backslash:\\amp:&lt:<gt:>non-ascii:é"
+
+	code, stderr := answerRun([]string{"--option", "allow", "--message", specialMsg, permBase})
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr: %s", code, stderr)
+	}
+
+	data, err := os.ReadFile(permBase + ".req.response")
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+
+	var resp answerResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if resp.Message != specialMsg {
+		t.Errorf("message round-trip failed:\n got:  %q\n want: %q", resp.Message, specialMsg)
+	}
+
+	// With HTML escaping disabled, the raw file must NOT contain the unicode-escape
+	// sequences that the default json.Marshal would emit for <, >, & chars.
+	raw := string(data)
+	for _, escaped := range []string{"\\u003c", "\\u003e", "\\u0026"} {
+		if containsStr(raw, escaped) {
+			t.Errorf("response file contains HTML unicode-escape %q; SetEscapeHTML(false) should prevent this: %s", escaped, raw)
+		}
+	}
+}
+
+// TestRunAnswerNoForceLeavesExistingUntouched: verifies that an existing response
+// is left byte-for-byte intact when --force is not passed, and no tmp files linger.
+func TestRunAnswerNoForceLeavesExistingUntouched(t *testing.T) {
+	dir := t.TempDir()
+	permBase := writeReqFile(t, dir, "test.perm", []string{"allow"})
+	responsePath := permBase + ".req.response"
+
+	// Write a sentinel that is deliberately different from what `answer` would write.
+	sentinel := []byte("SENTINEL_BYTES_DO_NOT_OVERWRITE\n")
+	if err := os.WriteFile(responsePath, sentinel, 0o600); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	code, stderr := answerRun([]string{"--option", "allow", permBase})
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2; stderr: %s", code, stderr)
+	}
+
+	// Response file must be byte-equal to sentinel.
+	got, err := os.ReadFile(responsePath)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if !bytes.Equal(got, sentinel) {
+		t.Errorf("response file was modified; got %q, want sentinel %q", got, sentinel)
+	}
+
+	// No tmp files must exist.
+	noTmpFiles(t, dir)
 }

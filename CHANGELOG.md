@@ -12,6 +12,24 @@
 - Replaces the printf/jq response-write block in `opencode/skills/answer-jockey`
   and `agents/groom.md` (Stage 3 of the avenor-subsume-consumer-prose refactor).
 
+## v0.4.1 — 2026-05-11
+
+### Fixed
+
+- `avenor watch` plain mode now emits nothing for JSON lines lacking an `event` field. Previously it emitted `EVENT   ` noise for legacy text-protocol input that had no event key.
+
+## v0.4.0 — 2026-05-11
+
+### Added
+
+- `avenor watch --since-cursor <path>`: persist byte offset to a cursor file, atomically rewrite the cursor on EOF, rewrite every 10 events in follow mode.
+
+## v0.3.0 — 2026-05-11
+
+### Added
+
+- `avenor watch <log>` subcommand: plain digest format (`EVENT name session_id excerpt`), per-event excerpt mapping (`.content.text` for chunks, `kind:title [status]` for tools, etc.), `--follow` and `--format json` flags.
+
 ## v0.2.0 — 2026-05-11
 
 ### Added

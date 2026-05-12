@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -77,12 +80,14 @@ func runAnswerTo(args []string, errOut io.Writer) int {
 	// Read and parse the request file.
 	reqData, err := os.ReadFile(reqPath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
+			// bad path = usage error
 			fmt.Fprintf(errOut, "avenor answer: request file %s does not exist\n", reqPath)
-		} else {
-			fmt.Fprintf(errOut, "avenor answer: read %s: %v\n", reqPath, err)
+			return 2
 		}
-		return 2
+		// anything else = I/O error
+		fmt.Fprintf(errOut, "avenor answer: read %s: %v\n", reqPath, err)
+		return 1
 	}
 
 	var req answerRequest
@@ -92,52 +97,91 @@ func runAnswerTo(args []string, errOut io.Writer) int {
 	}
 
 	// Validate --option against the offered set.
+	// Filter out any options with empty optionId values.
 	validIDs := make([]string, 0, len(req.Options))
 	found := false
 	for _, opt := range req.Options {
+		if opt.OptionID == "" {
+			continue
+		}
 		validIDs = append(validIDs, opt.OptionID)
 		if opt.OptionID == *optionFlag {
 			found = true
 		}
 	}
 	if !found {
-		fmt.Fprintf(errOut, "avenor answer: option %q is not in the offered set; valid options: %s\n",
-			*optionFlag, strings.Join(validIDs, ", "))
+		if len(validIDs) == 0 {
+			fmt.Fprintf(errOut, "avenor answer: option %q is not in the offered set; no options were offered\n", *optionFlag)
+		} else {
+			fmt.Fprintf(errOut, "avenor answer: option %q is not in the offered set; valid options: %s\n",
+				*optionFlag, strings.Join(validIDs, ", "))
+		}
 		return 2
 	}
 
-	// Check if response already exists.
-	if _, statErr := os.Stat(responsePath); statErr == nil {
-		if !*forceFlag {
-			fmt.Fprintf(errOut, "avenor answer: response already exists at %s; pass --force to overwrite\n", responsePath)
-			return 2
-		}
-	}
-
-	// Build response JSON.
+	// Build response JSON with HTML escaping disabled.
 	resp := answerResponse{
 		Outcome:  *outcomeFlag,
 		OptionID: *optionFlag,
 		Message:  *messageFlag,
 	}
-	data, err := json.Marshal(resp)
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(resp); err != nil {
 		fmt.Fprintf(errOut, "avenor answer: marshal response: %v\n", err)
 		return 1
 	}
-	data = append(data, '\n')
+	// enc.Encode appends a trailing newline; keep it.
+	data := buf.Bytes()
 
-	// Write atomically: tmp file then rename.
-	tmpPath := responsePath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+	// Write atomically via a uniquely-named tmp file, then link/rename.
+	dir := filepath.Dir(responsePath)
+	base := filepath.Base(responsePath)
+	tmpFile, err := os.CreateTemp(dir, base+".tmp.*")
+	if err != nil {
+		fmt.Fprintf(errOut, "avenor answer: create tmp: %v\n", err)
+		return 1
+	}
+	tmpPath := tmpFile.Name()
+
+	// Ensure tmp is removed on any failure path after this point.
+	tmpCleaned := false
+	defer func() {
+		if !tmpCleaned {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
 		fmt.Fprintf(errOut, "avenor answer: write %s: %v\n", tmpPath, err)
 		return 1
 	}
-	if err := os.Rename(tmpPath, responsePath); err != nil {
-		_ = os.Remove(tmpPath)
-		fmt.Fprintf(errOut, "avenor answer: rename to %s: %v\n", responsePath, err)
+	if err := tmpFile.Close(); err != nil {
+		fmt.Fprintf(errOut, "avenor answer: close %s: %v\n", tmpPath, err)
 		return 1
 	}
 
+	if *forceFlag {
+		// Atomic overwrite.
+		if err := os.Rename(tmpPath, responsePath); err != nil {
+			fmt.Fprintf(errOut, "avenor answer: rename to %s: %v\n", responsePath, err)
+			return 1
+		}
+	} else {
+		// Atomic exclusive-create: Link fails if target already exists, eliminating TOCTOU.
+		if err := os.Link(tmpPath, responsePath); err != nil {
+			if os.IsExist(err) {
+				fmt.Fprintf(errOut, "avenor answer: response already exists at %s; pass --force to overwrite\n", responsePath)
+				return 2
+			}
+			fmt.Fprintf(errOut, "avenor answer: link to %s: %v\n", responsePath, err)
+			return 1
+		}
+		_ = os.Remove(tmpPath)
+	}
+
+	tmpCleaned = true
 	return 0
 }
