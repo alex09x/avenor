@@ -1,6 +1,6 @@
 # Avenor
 
-Avenor is a single-binary ACP (Agent Client Protocol) client designed to orchestrate AI agents in structured, event-driven workflows. It acts as a stable intermediary—the chief stable officer—between orchestration harnesses (like `.botfiles`) and ACP-speaking runtimes (like OpenCode).
+Avenor is a small, single-binary ACP (Agent Client Protocol) client for coordinating AI agents in event-driven workflows. It sits between orchestration harnesses, like `.botfiles`, and ACP-speaking runtimes, like OpenCode, so the two can talk without getting in each other's way.
 
 ## Installation
 
@@ -14,12 +14,14 @@ chmod +x avenor
 
 ## Permission handling
 
-Use `--permission-handler file:<path>` when the backend forwards tool approval through ACP `session/request_permission`. Avenor writes the pending request to `<path>.req`, waits for the operator response at `<path>.req.response`, then relays the answer back to the backend. See [docs/permission-handler.md](docs/permission-handler.md) for the request and response JSON shapes.
+Use `--permission-handler file:<path>` when your backend forwards tool approval through ACP `session/request_permission`. Avenor keeps the request in a file-based handshake so operators can review it and send back a response without breaking the flow. See [docs/permission-handler.md](docs/permission-handler.md) for the request and response JSON shapes.
 
 ## Consumer integration
 
-`.botfiles`, the reference consumer harness, auto-derives the permission base from its sentinel path and keeps approval in the orchestration loop: OpenCode `/dispatch-jockey` surfaces permission events to `/answer-jockey`, and Claude Code grooming handles the same `<perm-base>.req` / `.req.response` round-trip. See [sdougbrown/.botfiles](https://github.com/sdougbrown/.botfiles).
+`.botfiles`, the reference consumer harness, uses a sentinel path to derive the permission base and keep approvals connected to the right run. OpenCode `/dispatch-jockey` surfaces permission events to `/answer-jockey`, and Claude Code grooming uses the same `<perm-base>.req` / `.req.response` pair. See [sdougbrown/.botfiles](https://github.com/sdougbrown/.botfiles).
 
 ## Name
 
-*Avenor* is the chief stable officer of a king—a reference to the horse/mule/groom/jockey dispatch vocabulary already in use within agent orchestration frameworks.
+*Avenor* is the chief stable officer of a king, a nod to the horse/mule/groom/jockey vocabulary already used in agent orchestration frameworks.
+
+Someone still has to clean out the stables, but at least the naming makes the chores easier to remember.
