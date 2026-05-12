@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.5.0 — 2026-05-11
+
+### Added
+
+- `avenor answer <perm-base>` subcommand: reads `<perm-base>.req`, validates
+  `--option` against the offered set, and atomically writes
+  `<perm-base>.req.response`. Flags: `--option <id>` (required),
+  `--message <text>` (optional), `--outcome selected|cancelled` (default
+  `selected`), `--force` (overwrite existing response).
+- Replaces the printf/jq response-write block in `opencode/skills/answer-jockey`
+  and `agents/groom.md` (Stage 3 of the avenor-subsume-consumer-prose refactor).
+
 ## v0.2.0 — 2026-05-11
 
 ### Added

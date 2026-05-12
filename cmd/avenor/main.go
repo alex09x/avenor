@@ -12,6 +12,9 @@ import (
 var Version = "dev"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "answer" {
+		os.Exit(runAnswer(os.Args[2:]))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "probe" {
 		os.Exit(runProbe(os.Args[2:]))
 	}

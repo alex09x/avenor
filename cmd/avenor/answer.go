@@ -1,0 +1,143 @@
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+)
+
+// answerOption mirrors the per-entry shape from the options array in a .req file.
+type answerOption struct {
+	OptionID string `json:"optionId"`
+	Kind     string `json:"kind"`
+}
+
+// answerRequest is the subset of a .req file we care about for validation.
+type answerRequest struct {
+	Options []answerOption `json:"options"`
+}
+
+// answerResponse is written to <perm-base>.req.response.
+type answerResponse struct {
+	Outcome  string `json:"outcome"`
+	OptionID string `json:"option_id"`
+	Message  string `json:"message"`
+}
+
+// runAnswer implements the `avenor answer <perm-base>` subcommand.
+// It returns 0 on success, 2 on usage/validation errors, 1 on I/O errors.
+func runAnswer(args []string) int {
+	return runAnswerTo(args, os.Stderr)
+}
+
+// runAnswerTo is the testable entry point that accepts an io.Writer for
+// error output so tests can capture stderr without OS-level redirection.
+func runAnswerTo(args []string, errOut io.Writer) int {
+	fs := flag.NewFlagSet("avenor answer", flag.ContinueOnError)
+	fs.SetOutput(errOut)
+
+	optionFlag := fs.String("option", "", "option id to select (required)")
+	messageFlag := fs.String("message", "", "free-text message to include in the response")
+	outcomeFlag := fs.String("outcome", "selected", "outcome: selected or cancelled")
+	forceFlag := fs.Bool("force", false, "overwrite an existing response file")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	// Validate --outcome before anything else.
+	if *outcomeFlag != "selected" && *outcomeFlag != "cancelled" {
+		fmt.Fprintf(errOut, "avenor answer: --outcome must be \"selected\" or \"cancelled\", got %q\n", *outcomeFlag)
+		return 2
+	}
+
+	// Validate --option is present.
+	if *optionFlag == "" {
+		fmt.Fprintln(errOut, "avenor answer: --option <id> is required")
+		return 2
+	}
+
+	// Validate exactly one positional arg.
+	if fs.NArg() == 0 {
+		fmt.Fprintln(errOut, "avenor answer: <perm-base> is required")
+		return 2
+	}
+	if fs.NArg() > 1 {
+		fmt.Fprintln(errOut, "avenor answer: expected exactly one <perm-base>")
+		return 2
+	}
+
+	permBase := fs.Arg(0)
+	reqPath := permBase + ".req"
+	responsePath := reqPath + ".response"
+
+	// Read and parse the request file.
+	reqData, err := os.ReadFile(reqPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(errOut, "avenor answer: request file %s does not exist\n", reqPath)
+		} else {
+			fmt.Fprintf(errOut, "avenor answer: read %s: %v\n", reqPath, err)
+		}
+		return 2
+	}
+
+	var req answerRequest
+	if err := json.Unmarshal(reqData, &req); err != nil {
+		fmt.Fprintf(errOut, "avenor answer: parse %s: %v\n", reqPath, err)
+		return 2
+	}
+
+	// Validate --option against the offered set.
+	validIDs := make([]string, 0, len(req.Options))
+	found := false
+	for _, opt := range req.Options {
+		validIDs = append(validIDs, opt.OptionID)
+		if opt.OptionID == *optionFlag {
+			found = true
+		}
+	}
+	if !found {
+		fmt.Fprintf(errOut, "avenor answer: option %q is not in the offered set; valid options: %s\n",
+			*optionFlag, strings.Join(validIDs, ", "))
+		return 2
+	}
+
+	// Check if response already exists.
+	if _, statErr := os.Stat(responsePath); statErr == nil {
+		if !*forceFlag {
+			fmt.Fprintf(errOut, "avenor answer: response already exists at %s; pass --force to overwrite\n", responsePath)
+			return 2
+		}
+	}
+
+	// Build response JSON.
+	resp := answerResponse{
+		Outcome:  *outcomeFlag,
+		OptionID: *optionFlag,
+		Message:  *messageFlag,
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		fmt.Fprintf(errOut, "avenor answer: marshal response: %v\n", err)
+		return 1
+	}
+	data = append(data, '\n')
+
+	// Write atomically: tmp file then rename.
+	tmpPath := responsePath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+		fmt.Fprintf(errOut, "avenor answer: write %s: %v\n", tmpPath, err)
+		return 1
+	}
+	if err := os.Rename(tmpPath, responsePath); err != nil {
+		_ = os.Remove(tmpPath)
+		fmt.Fprintf(errOut, "avenor answer: rename to %s: %v\n", responsePath, err)
+		return 1
+	}
+
+	return 0
+}
