@@ -72,11 +72,14 @@ func TestFileHandlerRoundTrip(t *testing.T) {
 
 	emitted := make(chan events.Event, 1)
 	done := make(chan error, 1)
+	resolved := make(chan Resolution, 1)
 	go func() {
-		done <- handler.Handle(context.Background(), provider, event, func(event events.Event) error {
+		res, err := handler.Handle(context.Background(), provider, event, func(event events.Event) error {
 			emitted <- event
 			return nil
 		})
+		resolved <- res
+		done <- err
 	}()
 
 	reqPath := base + ".req"
@@ -118,6 +121,14 @@ func TestFileHandlerRoundTrip(t *testing.T) {
 	}
 	if provider.response.Outcome != "selected" || provider.response.OptionID != "allow" {
 		t.Fatalf("response = %+v", provider.response)
+	}
+	select {
+	case res := <-resolved:
+		if res.RequestID != "42" || res.OptionID != "allow" {
+			t.Fatalf("resolution = %+v", res)
+		}
+	default:
+		t.Fatal("missing resolution")
 	}
 
 	select {

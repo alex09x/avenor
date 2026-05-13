@@ -48,6 +48,11 @@ type FileHandler struct {
 	PollInterval time.Duration
 }
 
+type Resolution struct {
+	RequestID string
+	OptionID  string
+}
+
 func NewFileHandler(basePath string) *FileHandler {
 	return &FileHandler{
 		BasePath:     basePath,
@@ -56,20 +61,20 @@ func NewFileHandler(basePath string) *FileHandler {
 	}
 }
 
-func (h *FileHandler) Handle(ctx context.Context, provider runtime.Provider, event events.Event, emit func(events.Event) error) error {
+func (h *FileHandler) Handle(ctx context.Context, provider runtime.Provider, event events.Event, emit func(events.Event) error) (Resolution, error) {
 	if h == nil {
-		return errors.New("permission file handler is nil")
+		return Resolution{}, errors.New("permission file handler is nil")
 	}
 	if h.BasePath == "" {
-		return errors.New("permission file handler path is required")
+		return Resolution{}, errors.New("permission file handler path is required")
 	}
 	if provider == nil {
-		return errors.New("permission provider is required")
+		return Resolution{}, errors.New("permission provider is required")
 	}
 
 	request := requestFromEvent(event)
 	if request.RequestID == "" {
-		return errors.New("permission.request missing request_id")
+		return Resolution{}, errors.New("permission.request missing request_id")
 	}
 
 	requestPath := h.BasePath + ".req"
@@ -78,24 +83,27 @@ func (h *FileHandler) Handle(ctx context.Context, provider runtime.Provider, eve
 
 	data, err := json.MarshalIndent(request, "", "  ")
 	if err != nil {
-		return err
+		return Resolution{}, err
 	}
 	data = append(data, '\n')
 	if err := writeFileAtomic(requestPath, data, 0o600); err != nil {
-		return err
+		return Resolution{}, err
 	}
 
 	if emit != nil {
 		if err := emit(normalizedPermissionEvent(request)); err != nil {
-			return err
+			return Resolution{}, err
 		}
 	}
 
 	response, err := h.waitForResponse(ctx, responsePath)
 	if err != nil {
-		return err
+		return Resolution{}, err
 	}
-	return provider.AnswerPermission(ctx, event.SessionID, request.RequestID, response)
+	if err := provider.AnswerPermission(ctx, event.SessionID, request.RequestID, response); err != nil {
+		return Resolution{}, err
+	}
+	return Resolution{RequestID: request.RequestID, OptionID: response.OptionID}, nil
 }
 
 func (h *FileHandler) waitForResponse(ctx context.Context, path string) (runtime.PermissionResponse, error) {
