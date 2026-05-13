@@ -316,3 +316,50 @@ func TestStatusTrackerPermissionAnswered(t *testing.T) {
 		t.Fatal("PermissionAnswered() should not emit twice")
 	}
 }
+
+// TestStatusTrackerPermissionAnsweredPreservesLabel verifies that a label set
+// via ObserveMarker before a permission gate is preserved on resume.
+// Regression for the empty-string second arg to s.set in PermissionAnswered.
+func TestStatusTrackerPermissionAnsweredPreservesLabel(t *testing.T) {
+	tracker := newStatusTracker("ses_1", "")
+
+	// Establish a label via ObserveMarker (simulates a [status: waiting | checking auth] marker).
+	tracker.ObserveMarker(phaseWait, "checking auth")
+
+	// Resolve the permission — must carry the label forward.
+	ev, ok := tracker.PermissionAnswered()
+	if !ok {
+		t.Fatal("PermissionAnswered() should emit when in waiting state")
+	}
+	if got := statusField(ev.Fields, "phase"); got != phaseWork {
+		t.Fatalf("phase = %q, want %q", got, phaseWork)
+	}
+	if got := statusField(ev.Fields, "label"); got != "checking auth" {
+		t.Fatalf("label = %q, want %q; label was dropped across PermissionAnswered", got, "checking auth")
+	}
+}
+
+// TestStatusTrackerPermissionAnsweredDoesNotLeakQuestionLabel verifies that
+// the question text set by Observe(permission.request) does NOT leak into the
+// working-phase label emitted by PermissionAnswered. Only labels established
+// via ObserveMarker should be preserved.
+func TestStatusTrackerPermissionAnsweredDoesNotLeakQuestionLabel(t *testing.T) {
+	tracker := newStatusTracker("ses_1", "")
+
+	// Enter waiting via a normal protocol event (question text set as label).
+	tracker.Observe(makeEvent("permission.request", map[string]any{
+		"question": "Allow file write?",
+	}))
+
+	// Resolve — the working-phase event must NOT carry the question as label.
+	ev, ok := tracker.PermissionAnswered()
+	if !ok {
+		t.Fatal("PermissionAnswered() should emit when in waiting state")
+	}
+	if got := statusField(ev.Fields, "phase"); got != phaseWork {
+		t.Fatalf("phase = %q, want %q", got, phaseWork)
+	}
+	if got := statusField(ev.Fields, "label"); got != "" {
+		t.Fatalf("label = %q, want empty; permission question text leaked into working label", got)
+	}
+}

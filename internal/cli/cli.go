@@ -256,6 +256,19 @@ func selectPermissionOption(options []any, approve bool) (string, error) {
 	return "", fmt.Errorf("permission options missing kind %q", want)
 }
 
+// permissionResult carries the outcome of an async permission resolution.
+type permissionResult struct {
+	err       error
+	requestID string
+	optionID  string
+	// source is "avenor" for auto-answer, "file" for file-handler-resolved.
+	// For the file-handler path, requestID/optionID are empty because
+	// permission.FileHandler does not currently surface the chosen option;
+	// permission.response is therefore only emitted for the auto-answer path.
+	// See: TODO(symmetry) — thread chosen option out of FileHandler.Handle.
+	source string
+}
+
 func waitForSession(
 	ctx context.Context,
 	provider runtime.Provider,
@@ -272,7 +285,7 @@ func waitForSession(
 ) int {
 	var finalStopReason string
 	promptReturned := false
-	var permissionDone <-chan error
+	var permissionDone <-chan permissionResult
 	tracker := newStatusTracker(sessionID, runID, runLabel)
 
 	writeStatus := func(ev events.Event, ok bool) bool {
@@ -286,12 +299,45 @@ func waitForSession(
 		return true
 	}
 
+	emitPermissionResponse := func(requestID, optionID, source string) {
+		kind := "reject"
+		if autoApprove {
+			kind = "allow"
+		}
+		fields := map[string]any{
+			"request_id": requestID,
+			"option_id":  optionID,
+			"kind":       kind,
+			"source":     source,
+			"ts":         time.Now().UnixMilli(),
+		}
+		if runID != "" {
+			fields["run_id"] = runID
+		}
+		if runLabel != "" {
+			fields["run_label"] = runLabel
+		}
+		if err := writer.Write(events.Event{
+			Event:     "permission.response",
+			SessionID: sessionID,
+			Fields:    fields,
+		}); err != nil {
+			fmt.Fprintf(stderr, "avenor: write permission.response event: %v\n", err)
+		}
+	}
+
 	for {
 		select {
 		case event, ok := <-eventCh:
 			if !ok {
+				// Nil the channel so it no longer fires on subsequent iterations.
+				eventCh = nil
 				if finalStopReason == "" {
 					return 1
+				}
+				// Wait for any in-flight AnswerPermission goroutine before exiting.
+				if permissionDone != nil {
+					break
 				}
 				return runtime.ExitCodeForStopReason(finalStopReason)
 			}
@@ -317,34 +363,51 @@ func waitForSession(
 						emitErrorEvent(writer, sessionID, runID, "permission", "another permission request is already pending", stderr, runLabel)
 						return 1
 					}
-					done := make(chan error, 1)
+					done := make(chan permissionResult, 1)
 					permissionDone = done
 					go func() {
-						done <- fileHandler.Handle(ctx, provider, event, writer.Write)
+						err := fileHandler.Handle(ctx, provider, event, writer.Write)
+						// requestID/optionID are empty: FileHandler does not surface the
+						// chosen option. permission.response is not emitted for this path.
+						// See permissionResult.source comment above.
+						done <- permissionResult{err: err, source: "file"}
 					}()
 					continue
 				}
-				// No file handler: auto-answer immediately (approve or reject).
+				// No file handler: auto-answer via goroutine so a slow backend call
+				// does not block event draining. Status transition happens in the
+				// permissionDone case below, not here.
 				if err := writer.Write(event); err != nil {
 					fmt.Fprintf(stderr, "avenor: write event: %v\n", err)
 					return 1
 				}
 				requestID, _ := event.Fields["request_id"].(string)
+				if requestID == "" {
+					// Malformed request from backend: no request_id means we cannot
+					// call AnswerPermission. Emit an error and stay in waiting state.
+					emitErrorEvent(writer, sessionID, runID, "permission", "permission.request missing request_id", stderr, runLabel)
+					continue
+				}
+				if permissionDone != nil {
+					emitErrorEvent(writer, sessionID, runID, "permission", "another permission request is already pending", stderr, runLabel)
+					return 1
+				}
 				options, _ := event.Fields["options"].([]any)
 				optionID, err := selectPermissionOption(options, autoApprove)
 				if err != nil {
 					emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("auto-answer permission: %v", err), stderr, runLabel)
 					return 1
 				}
-				if requestID != "" {
+				done := make(chan permissionResult, 1)
+				permissionDone = done
+				go func() {
 					resp := runtime.PermissionResponse{Outcome: "selected", OptionID: optionID}
 					if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
-						emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("auto-answer permission: %v", err), stderr, runLabel)
+						done <- permissionResult{err: err}
+						return
 					}
-				}
-				if !writeStatus(tracker.PermissionAnswered()) {
-					return 1
-				}
+					done <- permissionResult{requestID: requestID, optionID: optionID, source: "avenor"}
+				}()
 				continue
 			}
 			if event.Event == "session.end" {
@@ -354,7 +417,7 @@ func waitForSession(
 				fmt.Fprintf(stderr, "avenor: write event: %v\n", err)
 				return 1
 			}
-			if event.Event == "session.end" && promptReturned {
+			if event.Event == "session.end" && promptReturned && permissionDone == nil {
 				return runtime.ExitCodeForStopReason(finalStopReason)
 			}
 		case err := <-promptDone:
@@ -366,17 +429,28 @@ func waitForSession(
 				emitErrorEvent(writer, sessionID, runID, "prompt", fmt.Sprintf("prompt: %v", err), stderr, runLabel)
 				return 1
 			}
-			if finalStopReason != "" {
+			if finalStopReason != "" && permissionDone == nil {
 				return runtime.ExitCodeForStopReason(finalStopReason)
 			}
-		case err := <-permissionDone:
+		case res := <-permissionDone:
 			permissionDone = nil
-			if err != nil {
-				emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("permission handler: %v", err), stderr, runLabel)
+			if res.err != nil {
+				emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("permission handler: %v", res.err), stderr, runLabel)
 				return 1
+			}
+			// Emit permission.response audit event for auto-answer (source=="avenor").
+			// The file-handler path (source=="file") does not emit it because the
+			// chosen option is not surfaced by FileHandler.Handle.
+			if res.source == "avenor" && res.requestID != "" {
+				emitPermissionResponse(res.requestID, res.optionID, res.source)
 			}
 			if !writeStatus(tracker.PermissionAnswered()) {
 				return 1
+			}
+			// If session.end + promptDone already arrived while we were waiting for
+			// AnswerPermission, exit now that the permission goroutine has resolved.
+			if finalStopReason != "" && promptReturned {
+				return runtime.ExitCodeForStopReason(finalStopReason)
 			}
 		case <-ctx.Done():
 			return cancelAndEnd(provider, writer, sessionID, runID, runLabel, "cancelled", stderr)

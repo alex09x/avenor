@@ -16,11 +16,12 @@ const (
 // statusTracker observes the ACP event stream and emits synthesized
 // agent.status events on phase transitions.
 type statusTracker struct {
-	sessionID string
-	runID     string
-	runLabel  string
-	phase     string
-	label     string
+	sessionID   string
+	runID       string
+	runLabel    string
+	phase       string
+	label       string
+	markerLabel string // set only by ObserveMarker; preserved across permission gates
 }
 
 func newStatusTracker(sessionID, runID string, runLabel ...string) *statusTracker {
@@ -70,11 +71,14 @@ func (s *statusTracker) Observe(ev events.Event) (events.Event, bool) {
 
 // PermissionAnswered returns a synthesized agent.status event transitioning
 // back to working after a permission request is resolved.
+// Only the markerLabel (set via ObserveMarker) is preserved; labels set by
+// Observe(permission.request) from the protocol question/tool text are
+// intentionally dropped so they do not leak into the working-phase label.
 func (s *statusTracker) PermissionAnswered() (events.Event, bool) {
 	if s.phase != phaseWait {
 		return events.Event{}, false
 	}
-	return s.set(phaseWork, "")
+	return s.set(phaseWork, s.markerLabel)
 }
 
 // ObserveMarker handles an explicit [status: phase | label] marker extracted
@@ -83,6 +87,7 @@ func (s *statusTracker) PermissionAnswered() (events.Event, bool) {
 func (s *statusTracker) ObserveMarker(phase, label string) (events.Event, bool) {
 	s.phase = phase
 	s.label = label
+	s.markerLabel = label // preserved across permission gates
 	fields := map[string]any{
 		"phase":  phase,
 		"source": "agent",

@@ -28,6 +28,8 @@ Consumers should switch on `event` and read domain fields directly from the same
 
 `permission.request`: Backend asks the client to choose a permission option. Avenor emits `request_id`, plus best-effort `tool`, `question`, and `options` fields when available. With `--permission-handler file:<path>`, this event is emitted after `<path>.req` is written.
 
+`permission.response`: Synthesized by Avenor after it resolves a permission decision automatically. Fields: `request_id` (string), `option_id` (string — the chosen optionId), `kind` (`"allow"` or `"reject"`), `source` (`"avenor"` for `--auto-approve` path; `"file"` is reserved for file-handler resolution but is not yet emitted because the file handler does not surface the chosen option), `run_id` (when present), `run_label` (when present), `ts` (Unix milliseconds). Classifies as ACTIVITY. Emitted only when `--auto-approve` is active; consumers can use this as an audit trail of what Avenor decided.
+
 `session.end`: Terminal record for the prompt. The final event stream line for a completed Avenor run is always `session.end` and includes `stop_reason`.
 
 ## Terminal Record
