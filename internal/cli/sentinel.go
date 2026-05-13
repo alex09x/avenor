@@ -37,7 +37,7 @@ func derivePermBase(sentinelPath string) string {
 func sentinelContent(exitCode int, sessionID, stopReason, runID string) string {
 	run := ""
 	if runID != "" {
-		run = "RUN=" + runID + "\n"
+		run = "RUN=" + sentinelLineValue(runID) + "\n"
 	}
 	switch exitCode {
 	case 0:
@@ -61,6 +61,12 @@ func sentinelContent(exitCode int, sessionID, stopReason, runID string) string {
 		}
 		return fmt.Sprintf("FAILED\nSESSION=%s\nSTOP_REASON=%s\nEXIT_CODE=%d\n%s", sessionID, stopReason, exitCode, run)
 	}
+}
+
+func sentinelLineValue(value string) string {
+	value = strings.ReplaceAll(value, "\r", " ")
+	value = strings.ReplaceAll(value, "\n", " ")
+	return value
 }
 
 // sessionEndFields scans an NDJSON event log and returns the session_id and

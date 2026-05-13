@@ -18,12 +18,17 @@ const (
 type statusTracker struct {
 	sessionID string
 	runID     string
+	runLabel  string
 	phase     string
 	label     string
 }
 
-func newStatusTracker(sessionID, runID string) *statusTracker {
-	return &statusTracker{sessionID: sessionID, runID: runID}
+func newStatusTracker(sessionID, runID string, runLabel ...string) *statusTracker {
+	tracker := &statusTracker{sessionID: sessionID, runID: runID}
+	if len(runLabel) > 0 {
+		tracker.runLabel = runLabel[0]
+	}
+	return tracker
 }
 
 // Observe returns a synthesized agent.status event and true when ev causes a
@@ -89,6 +94,9 @@ func (s *statusTracker) ObserveMarker(phase, label string) (events.Event, bool) 
 	if s.runID != "" {
 		fields["run_id"] = s.runID
 	}
+	if s.runLabel != "" {
+		fields["run_label"] = s.runLabel
+	}
 	return events.Event{
 		Event:     "agent.status",
 		SessionID: s.sessionID,
@@ -119,6 +127,9 @@ func (s *statusTracker) set(phase, label string) (events.Event, bool) {
 	}
 	if s.runID != "" {
 		fields["run_id"] = s.runID
+	}
+	if s.runLabel != "" {
+		fields["run_label"] = s.runLabel
 	}
 	return events.Event{
 		Event:     "agent.status",

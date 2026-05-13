@@ -29,6 +29,7 @@ func runSingleAttempt(
 	fileHandler *permission.FileHandler,
 	prompt string,
 	runID string,
+	runLabel string,
 	autoApprove bool,
 	timer <-chan time.Time,
 	stderr io.Writer,
@@ -60,7 +61,7 @@ func runSingleAttempt(
 		promptDone <- provider.Prompt(ctx, session.SessionID, prompt)
 	}()
 
-	exitCode := waitForSession(ctx, provider, writer, fileHandler, eventCh, promptDone, session.SessionID, runID, autoApprove, timer, stderr)
+	exitCode := waitForSession(ctx, provider, writer, fileHandler, eventCh, promptDone, session.SessionID, runID, runLabel, autoApprove, timer, stderr)
 	return attemptResult{exitCode: exitCode, sessionID: session.SessionID}
 }
 
@@ -74,9 +75,8 @@ func backoffDelay(attempt int) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-// writeRetryEvent emits an avenor.retry event to the writer. Errors are
-// silently discarded — a missing retry marker is not worth aborting the run.
-func writeRetryEvent(writer *eventWriter, sessionID, runID string, attempt, maxRetries int) {
+// writeRetryEvent emits an avenor.retry event to the writer.
+func writeRetryEvent(writer *eventWriter, sessionID, runID string, attempt, maxRetries int, runLabel ...string) error {
 	fields := map[string]any{
 		"attempt":     attempt,
 		"max_retries": maxRetries,
@@ -85,7 +85,10 @@ func writeRetryEvent(writer *eventWriter, sessionID, runID string, attempt, maxR
 	if runID != "" {
 		fields["run_id"] = runID
 	}
-	_ = writer.Write(events.Event{
+	if len(runLabel) > 0 && runLabel[0] != "" {
+		fields["run_label"] = runLabel[0]
+	}
+	return writer.Write(events.Event{
 		Event:     "avenor.retry",
 		SessionID: sessionID,
 		Fields:    fields,

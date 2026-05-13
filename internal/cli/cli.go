@@ -108,26 +108,14 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		return exitWithSentinel(1)
 	}
 
-	// Derive permission handler base from sentinel when --permission-handler is
-	// not set and --sentinel-file is set. The caller's explicit --permission-handler
-	// always wins.
-	var effectivePermHandler string
-	if *sentinelFile != "" && *permissionHandler == "" {
-		effectivePermHandler = "file:" + derivePermBase(*sentinelFile)
-	} else {
-		effectivePermHandler = *permissionHandler
-	}
+	effectivePermHandler := effectivePermissionHandler(*sentinelFile, *permissionHandler, *autoApprove)
+	cleanupPermBase := permissionCleanupBase(*sentinelFile, *permissionHandler)
 
 	// Pre-run cleanup: truncate event log and remove stale sentinel/perm files.
 	// Only when --sentinel-file is active to avoid changing behavior for callers
 	// that don't use it. The event log is recreated below via newEventWriter.
-	// Use the effective permission base (derived or explicit) for cleanup.
+	// Use the cleanup permission base (derived or explicit) for cleanup.
 	if *sentinelFile != "" {
-		var cleanupPermBase string
-		const filePrefix = "file:"
-		if strings.HasPrefix(effectivePermHandler, filePrefix) {
-			cleanupPermBase = strings.TrimPrefix(effectivePermHandler, filePrefix)
-		}
 		cleanupSentinelFiles(*sentinelFile, cleanupPermBase, stderr)
 	}
 
@@ -181,7 +169,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	resumeID := *resume
 	var result attemptResult
 	for attempt := 1; ; attempt++ {
-		result = runSingleAttempt(ctx, startOptions, resumeID, writer, fileHandler, string(promptText), runID, *autoApprove, timer, stderr)
+		result = runAttempt(ctx, startOptions, resumeID, writer, fileHandler, string(promptText), runID, *label, *autoApprove, timer, stderr)
 		finalSessionID = result.sessionID
 
 		if result.exitCode != 1 || attempt > *maxRetries {
@@ -192,10 +180,17 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			resumeID = result.sessionID
 		}
 
-		writeRetryEvent(writer, result.sessionID, runID, attempt+1, *maxRetries)
+		if err := writeRetryEvent(writer, result.sessionID, runID, attempt+1, *maxRetries, *label); err != nil {
+			fmt.Fprintf(stderr, "avenor: write retry event: %v\n", err)
+			result.exitCode = 1
+			break
+		}
+		if *sentinelFile != "" {
+			cleanupSentinelFiles(*sentinelFile, cleanupPermBase, stderr)
+		}
 
 		select {
-		case <-time.After(backoffDelay(attempt)):
+		case <-retryAfter(backoffDelay(attempt)):
 		case <-timer:
 			return exitWithSentinel(124)
 		case <-ctx.Done():
@@ -213,16 +208,37 @@ func startSession(ctx context.Context, provider runtime.Provider, opts runtime.S
 	return provider.Start(ctx, opts)
 }
 
-// selectPermissionOption picks an option ID from the permission event's
-// options slice, preferring approve-kind options when approve is true and
-// reject-kind options otherwise. Falls back to the first option if no
-// preferred kind is found.
-func selectPermissionOption(options []any, approve bool) string {
+var runAttempt = runSingleAttempt
+var retryAfter = time.After
+
+func effectivePermissionHandler(sentinelPath, permissionHandler string, autoApprove bool) string {
+	if permissionHandler != "" {
+		return permissionHandler
+	}
+	if sentinelPath != "" && !autoApprove {
+		return "file:" + derivePermBase(sentinelPath)
+	}
+	return ""
+}
+
+func permissionCleanupBase(sentinelPath, permissionHandler string) string {
+	const filePrefix = "file:"
+	if strings.HasPrefix(permissionHandler, filePrefix) {
+		return strings.TrimPrefix(permissionHandler, filePrefix)
+	}
+	if sentinelPath != "" && permissionHandler == "" {
+		return derivePermBase(sentinelPath)
+	}
+	return ""
+}
+
+// selectPermissionOption picks an option ID by matching the protocol kind:
+// allow when approve is true, reject otherwise.
+func selectPermissionOption(options []any, approve bool) (string, error) {
 	want := "reject"
 	if approve {
-		want = "approve"
+		want = "allow"
 	}
-	fallback := ""
 	for _, opt := range options {
 		m, ok := opt.(map[string]any)
 		if !ok {
@@ -230,14 +246,14 @@ func selectPermissionOption(options []any, approve bool) string {
 		}
 		optID, _ := m["optionId"].(string)
 		kind := strings.ToLower(fmt.Sprint(m["kind"]))
-		if fallback == "" && optID != "" {
-			fallback = optID
-		}
-		if strings.HasPrefix(kind, want) {
-			return optID
+		if kind == want {
+			if optID == "" {
+				return "", fmt.Errorf("permission option with kind %q missing optionId", want)
+			}
+			return optID, nil
 		}
 	}
-	return fallback
+	return "", fmt.Errorf("permission options missing kind %q", want)
 }
 
 func waitForSession(
@@ -249,6 +265,7 @@ func waitForSession(
 	promptDone <-chan error,
 	sessionID string,
 	runID string,
+	runLabel string,
 	autoApprove bool,
 	timeout <-chan time.Time,
 	stderr io.Writer,
@@ -256,7 +273,7 @@ func waitForSession(
 	var finalStopReason string
 	promptReturned := false
 	var permissionDone <-chan error
-	tracker := newStatusTracker(sessionID, runID)
+	tracker := newStatusTracker(sessionID, runID, runLabel)
 
 	writeStatus := func(ev events.Event, ok bool) bool {
 		if !ok {
@@ -297,7 +314,7 @@ func waitForSession(
 			if event.Event == "permission.request" {
 				if fileHandler != nil {
 					if permissionDone != nil {
-						emitErrorEvent(writer, sessionID, runID, "permission", "another permission request is already pending", stderr)
+						emitErrorEvent(writer, sessionID, runID, "permission", "another permission request is already pending", stderr, runLabel)
 						return 1
 					}
 					done := make(chan error, 1)
@@ -308,18 +325,27 @@ func waitForSession(
 					continue
 				}
 				// No file handler: auto-answer immediately (approve or reject).
+				if err := writer.Write(event); err != nil {
+					fmt.Fprintf(stderr, "avenor: write event: %v\n", err)
+					return 1
+				}
 				requestID, _ := event.Fields["request_id"].(string)
 				options, _ := event.Fields["options"].([]any)
-				optionID := selectPermissionOption(options, autoApprove)
+				optionID, err := selectPermissionOption(options, autoApprove)
+				if err != nil {
+					emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("auto-answer permission: %v", err), stderr, runLabel)
+					return 1
+				}
 				if requestID != "" {
 					resp := runtime.PermissionResponse{Outcome: "selected", OptionID: optionID}
 					if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
-						emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("auto-answer permission: %v", err), stderr)
+						emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("auto-answer permission: %v", err), stderr, runLabel)
 					}
 				}
 				if !writeStatus(tracker.PermissionAnswered()) {
 					return 1
 				}
+				continue
 			}
 			if event.Event == "session.end" {
 				finalStopReason, _ = event.Fields["stop_reason"].(string)
@@ -335,9 +361,9 @@ func waitForSession(
 			promptReturned = true
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
-					return cancelAndEnd(provider, writer, sessionID, runID, "cancelled", stderr)
+					return cancelAndEnd(provider, writer, sessionID, runID, runLabel, "cancelled", stderr)
 				}
-				emitErrorEvent(writer, sessionID, runID, "prompt", fmt.Sprintf("prompt: %v", err), stderr)
+				emitErrorEvent(writer, sessionID, runID, "prompt", fmt.Sprintf("prompt: %v", err), stderr, runLabel)
 				return 1
 			}
 			if finalStopReason != "" {
@@ -346,25 +372,25 @@ func waitForSession(
 		case err := <-permissionDone:
 			permissionDone = nil
 			if err != nil {
-				emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("permission handler: %v", err), stderr)
+				emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("permission handler: %v", err), stderr, runLabel)
 				return 1
 			}
 			if !writeStatus(tracker.PermissionAnswered()) {
 				return 1
 			}
 		case <-ctx.Done():
-			return cancelAndEnd(provider, writer, sessionID, runID, "cancelled", stderr)
+			return cancelAndEnd(provider, writer, sessionID, runID, runLabel, "cancelled", stderr)
 		case <-timeout:
-			return cancelAndEnd(provider, writer, sessionID, runID, "timeout", stderr)
+			return cancelAndEnd(provider, writer, sessionID, runID, runLabel, "timeout", stderr)
 		}
 	}
 }
 
-func cancelAndEnd(provider runtime.Provider, writer *eventWriter, sessionID, runID, stopReason string, stderr io.Writer) int {
+func cancelAndEnd(provider runtime.Provider, writer *eventWriter, sessionID, runID, runLabel, stopReason string, stderr io.Writer) int {
 	cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := provider.Cancel(cancelCtx, sessionID); err != nil {
-		emitErrorEvent(writer, sessionID, runID, "cancel", fmt.Sprintf("cancel session: %v", err), stderr)
+		emitErrorEvent(writer, sessionID, runID, "cancel", fmt.Sprintf("cancel session: %v", err), stderr, runLabel)
 	}
 	if err := writer.Write(events.Event{
 		Event:     "session.end",
