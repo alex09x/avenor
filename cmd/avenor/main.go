@@ -24,6 +24,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "stable" {
 		os.Exit(runStable(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "control" {
+		os.Exit(runControl(os.Args[2:]))
+	}
 
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
 		fmt.Printf("avenor v%s\n", Version)
