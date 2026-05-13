@@ -183,6 +183,90 @@ func TestStatusTrackerNoLabelOnThinkOrDone(t *testing.T) {
 	}
 }
 
+func TestStatusTrackerObserveMarker(t *testing.T) {
+	tracker := newStatusTracker("ses_1", "run123")
+
+	ev, ok := tracker.ObserveMarker("working", "Parsing source files")
+	if !ok {
+		t.Fatal("ObserveMarker() ok = false, want true")
+	}
+	if ev.Event != "agent.status" {
+		t.Fatalf("event = %q, want %q", ev.Event, "agent.status")
+	}
+	if got := statusField(ev.Fields, "phase"); got != "working" {
+		t.Errorf("phase = %q, want %q", got, "working")
+	}
+	if got := statusField(ev.Fields, "label"); got != "Parsing source files" {
+		t.Errorf("label = %q, want %q", got, "Parsing source files")
+	}
+	if got := statusField(ev.Fields, "source"); got != "agent" {
+		t.Errorf("source = %q, want %q", got, "agent")
+	}
+	if got := statusField(ev.Fields, "run_id"); got != "run123" {
+		t.Errorf("run_id = %q, want %q", got, "run123")
+	}
+
+	// Tracker state should reflect the marker phase.
+	if tracker.phase != "working" {
+		t.Errorf("tracker.phase = %q, want %q", tracker.phase, "working")
+	}
+}
+
+func TestStatusTrackerObserveMarkerSuppressesSynth(t *testing.T) {
+	// An ObserveMarker call should update state so the subsequent synthesized
+	// Observe for the same kind of event is a no-op (same phase, no label change).
+	tracker := newStatusTracker("ses_1", "")
+	tracker.ObserveMarker("working", "step one")
+
+	// Same phase, same label → no synthesized event.
+	_, ok := tracker.Observe(makeEvent("tool.call", map[string]any{"title": "step one"}))
+	if ok {
+		t.Error("Observe() should not emit when phase and label unchanged after ObserveMarker")
+	}
+}
+
+func TestChunkText(t *testing.T) {
+	tests := []struct {
+		name string
+		ev   events.Event
+		want string
+	}{
+		{
+			name: "text content",
+			ev: makeEvent("agent.message_chunk", map[string]any{
+				"content": map[string]any{"text": "hello world", "type": "text"},
+			}),
+			want: "hello world",
+		},
+		{
+			name: "missing content",
+			ev:   makeEvent("agent.message_chunk", nil),
+			want: "",
+		},
+		{
+			name: "array content",
+			ev: makeEvent("agent.message_chunk", map[string]any{
+				"content": []any{map[string]any{"text": "ignored"}},
+			}),
+			want: "",
+		},
+		{
+			name: "empty text",
+			ev: makeEvent("agent.message_chunk", map[string]any{
+				"content": map[string]any{"text": "", "type": "text"},
+			}),
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := chunkText(tt.ev); got != tt.want {
+				t.Fatalf("chunkText() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestStatusTrackerRunIDAndTimestamp(t *testing.T) {
 	const runID = "a1b2c3d4e5f60718"
 	tracker := newStatusTracker("ses_1", runID)

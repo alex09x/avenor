@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sdougbrown/avenor/internal/digest"
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/runtime"
@@ -241,8 +242,21 @@ func waitForSession(
 				}
 				return runtime.ExitCodeForStopReason(finalStopReason)
 			}
-			if !writeStatus(tracker.Observe(event)) {
-				return 1
+			markerHandled := false
+			if event.Event == "agent.message_chunk" || event.Event == "agent.thought_chunk" {
+				if text := chunkText(event); text != "" {
+					if phase, label, ok := digest.ExtractStatusMarker(text); ok {
+						if !writeStatus(tracker.ObserveMarker(phase, label)) {
+							return 1
+						}
+						markerHandled = true
+					}
+				}
+			}
+			if !markerHandled {
+				if !writeStatus(tracker.Observe(event)) {
+					return 1
+				}
 			}
 			if event.Event == "permission.request" && fileHandler != nil {
 				if permissionDone != nil {

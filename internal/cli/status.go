@@ -72,6 +72,40 @@ func (s *statusTracker) PermissionAnswered() (events.Event, bool) {
 	return s.set(phaseWork, "")
 }
 
+// ObserveMarker handles an explicit [status: phase | label] marker extracted
+// from agent output. It updates tracker state and returns an agent.status
+// event with source="agent" instead of "avenor".
+func (s *statusTracker) ObserveMarker(phase, label string) (events.Event, bool) {
+	s.phase = phase
+	s.label = label
+	fields := map[string]any{
+		"phase":  phase,
+		"source": "agent",
+		"ts":     time.Now().UnixMilli(),
+	}
+	if label != "" {
+		fields["label"] = label
+	}
+	if s.runID != "" {
+		fields["run_id"] = s.runID
+	}
+	return events.Event{
+		Event:     "agent.status",
+		SessionID: s.sessionID,
+		Fields:    fields,
+	}, true
+}
+
+// chunkText extracts the plain text from an agent or user message chunk event.
+func chunkText(ev events.Event) string {
+	content, ok := ev.Fields["content"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	text, _ := content["text"].(string)
+	return text
+}
+
 func (s *statusTracker) set(phase, label string) (events.Event, bool) {
 	s.phase = phase
 	s.label = label
