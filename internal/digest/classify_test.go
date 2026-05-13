@@ -109,6 +109,18 @@ func TestClassify(t *testing.T) {
 			want: TagFinding,
 		},
 
+		// --- avenor synthetic event cases ---
+		{
+			name: "avenor.retry is MILESTONE",
+			raw:  `{"event":"avenor.retry","session_id":"s1","attempt":2,"max_retries":3}`,
+			want: TagMilestone,
+		},
+		{
+			name: "avenor.error is MILESTONE",
+			raw:  `{"event":"avenor.error","session_id":"s1","source":"permission","message":"handler timed out"}`,
+			want: TagMilestone,
+		},
+
 		// --- agent.status cases ---
 		{
 			name: "agent.status phase=done is MILESTONE",

@@ -17,7 +17,6 @@ import (
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/opencodeacp"
 )
 
 const defaultBackend = "opencode-acp"
@@ -72,6 +71,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	model := fs.String("model", "", "backend-specific model id")
 	backend := fs.String("backend", defaultBackend, "runtime backend")
 	runIDFlag := fs.String("run-id", "", "correlation id for this run (generated if not set)")
+	maxRetries := fs.Int("max-retries", 0, "maximum retry attempts on transient failure (0 = no retry)")
 
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -161,32 +161,9 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		ServerURL: discovery.URL,
 		Model:     *model,
 	}
-	provider := opencodeacp.NewWithOptions(startOptions)
-	if closer, ok := provider.(interface{ Close() error }); ok {
-		defer closer.Close()
-	}
 
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stopSignals()
-
-	session, err := startSession(ctx, provider, startOptions, *resume)
-	if err != nil {
-		fmt.Fprintf(stderr, "avenor: start session: %v\n", err)
-		return exitWithSentinel(1)
-	}
-
-	eventCtx, cancelEvents := context.WithCancel(ctx)
-	defer cancelEvents()
-	eventCh, err := provider.Events(eventCtx, session.SessionID)
-	if err != nil {
-		fmt.Fprintf(stderr, "avenor: subscribe events: %v\n", err)
-		return exitWithSentinel(1)
-	}
-
-	promptDone := make(chan error, 1)
-	go func() {
-		promptDone <- provider.Prompt(ctx, session.SessionID, string(prompt))
-	}()
 
 	var timer <-chan time.Time
 	if *timeout > 0 {
@@ -195,7 +172,31 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		timer = t.C
 	}
 
-	return exitWithSentinel(waitForSession(ctx, provider, writer, fileHandler, eventCh, promptDone, session.SessionID, runID, timer, stderr))
+	resumeID := *resume
+	var result attemptResult
+	for attempt := 1; ; attempt++ {
+		result = runSingleAttempt(ctx, startOptions, resumeID, writer, fileHandler, string(prompt), runID, timer, stderr)
+
+		if result.exitCode != 1 || attempt > *maxRetries {
+			break
+		}
+
+		if result.sessionID != "" {
+			resumeID = result.sessionID
+		}
+
+		writeRetryEvent(writer, result.sessionID, runID, attempt+1, *maxRetries)
+
+		select {
+		case <-time.After(backoffDelay(attempt)):
+		case <-timer:
+			return exitWithSentinel(124)
+		case <-ctx.Done():
+			return exitWithSentinel(130)
+		}
+	}
+
+	return exitWithSentinel(result.exitCode)
 }
 
 func startSession(ctx context.Context, provider runtime.Provider, opts runtime.StartOptions, resumeID string) (runtime.Session, error) {
@@ -260,7 +261,7 @@ func waitForSession(
 			}
 			if event.Event == "permission.request" && fileHandler != nil {
 				if permissionDone != nil {
-					fmt.Fprintln(stderr, "avenor: another permission request is already pending")
+					emitErrorEvent(writer, sessionID, runID, "permission", "another permission request is already pending", stderr)
 					return 1
 				}
 				done := make(chan error, 1)
@@ -284,9 +285,9 @@ func waitForSession(
 			promptReturned = true
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
-					return cancelAndEnd(provider, writer, sessionID, "cancelled", stderr)
+					return cancelAndEnd(provider, writer, sessionID, runID, "cancelled", stderr)
 				}
-				fmt.Fprintf(stderr, "avenor: prompt: %v\n", err)
+				emitErrorEvent(writer, sessionID, runID, "prompt", fmt.Sprintf("prompt: %v", err), stderr)
 				return 1
 			}
 			if finalStopReason != "" {
@@ -295,25 +296,25 @@ func waitForSession(
 		case err := <-permissionDone:
 			permissionDone = nil
 			if err != nil {
-				fmt.Fprintf(stderr, "avenor: permission handler: %v\n", err)
+				emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("permission handler: %v", err), stderr)
 				return 1
 			}
 			if !writeStatus(tracker.PermissionAnswered()) {
 				return 1
 			}
 		case <-ctx.Done():
-			return cancelAndEnd(provider, writer, sessionID, "cancelled", stderr)
+			return cancelAndEnd(provider, writer, sessionID, runID, "cancelled", stderr)
 		case <-timeout:
-			return cancelAndEnd(provider, writer, sessionID, "timeout", stderr)
+			return cancelAndEnd(provider, writer, sessionID, runID, "timeout", stderr)
 		}
 	}
 }
 
-func cancelAndEnd(provider runtime.Provider, writer *eventWriter, sessionID string, stopReason string, stderr io.Writer) int {
+func cancelAndEnd(provider runtime.Provider, writer *eventWriter, sessionID, runID, stopReason string, stderr io.Writer) int {
 	cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := provider.Cancel(cancelCtx, sessionID); err != nil {
-		fmt.Fprintf(stderr, "avenor: cancel session: %v\n", err)
+		emitErrorEvent(writer, sessionID, runID, "cancel", fmt.Sprintf("cancel session: %v", err), stderr)
 	}
 	if err := writer.Write(events.Event{
 		Event:     "session.end",

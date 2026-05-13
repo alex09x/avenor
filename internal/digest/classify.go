@@ -42,6 +42,8 @@ func Classify(event map[string]any) string {
 		return TagMilestone
 	case "permission.request":
 		return TagMilestone
+	case "avenor.retry", "avenor.error":
+		return TagMilestone
 	case "agent.status":
 		switch stringField(event, "phase") {
 		case "done", "waiting":
