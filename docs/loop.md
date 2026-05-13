@@ -191,8 +191,10 @@ summarise or inject prior session content.
 
 ### Prompt templates
 
-Phase prompts support a small set of template variables (Go `text/template`
-syntax):
+Phase prompts support template variables (Go `text/template` syntax). Avenor
+provides the values; the prompt author decides how to use them.
+
+#### Run context
 
 | Variable | Value |
 |---|---|
@@ -202,10 +204,34 @@ syntax):
 | `{{.MaxIterations}}` | Value of `max_iterations` |
 | `{{.WorkDir}}` | Working directory |
 
+#### Delta context
+
+These variables are populated only when running inside a git repository and
+only from iteration 2 onwards (empty string on the first iteration).
+
+| Variable | Value |
+|---|---|
+| `{{.PrevPhaseCommit}}` | The git commit SHA at the end of the previous phase |
+| `{{.DiffStat}}` | Output of `git diff --stat <prev-commit>..HEAD` |
+| `{{.ChangedFiles}}` | Newline-separated list of files changed since `PrevPhaseCommit` |
+
+Avenor snapshots `git rev-parse HEAD` immediately after each phase session
+ends and stores it as the reference point for the next phase. The reference
+moves forward with each phase — it always reflects what the immediately
+preceding phase left behind, not the start of the loop.
+
+Delta variables are provided as informational context. Avenor does not use
+them to restrict what the agent can see or do. The prompt author decides the
+scoping strategy: they might instruct the agent to focus on changed files,
+to use the diff as a starting point but scan the whole codebase for
+knock-ons, or to ignore the delta entirely. A review prompt that narrows
+purely to changed files risks missing knock-on effects in unmodified code;
+that tradeoff belongs to the prompt, not to Avenor.
+
 ```json
 {
-  "name": "fix",
-  "prompt": "Iteration {{.Iteration}} of {{.MaxIterations}}. Read REVIEW_FINDINGS.md and address each item."
+  "name": "review",
+  "prompt": "Review the branch for issues.\n\n{{if .ChangedFiles}}Since the last iteration the following files changed:\n{{.ChangedFiles}}\nReview these changes carefully, and also check whether they introduce knock-on effects elsewhere.{{else}}This is the first review pass. Cover the entire branch.{{end}}"
 }
 ```
 
@@ -378,7 +404,7 @@ All other flags (`--agent`, `--dir`, `--model`, `--timeout`, `--max-retries`,
 
 | File | Purpose |
 |---|---|
-| `internal/cli/loop.go` | `LoopConfig`, `Phase` structs; JSON loading; template rendering; `runLoop` orchestrator |
+| `internal/cli/loop.go` | `LoopConfig`, `Phase` structs; JSON loading; template rendering; git snapshot helper; `runLoop` orchestrator |
 | `internal/digest/loopmarker.go` | `ExtractLoopMarker(text string) (directive, label string, ok bool)` |
 
 ### Files to modify
