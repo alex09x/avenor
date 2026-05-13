@@ -180,14 +180,46 @@ from the event stream is sufficient.
 
 ## Phase Execution Model
 
-Each phase is one call to `runSingleAttempt` with a fresh provider (matching
-the existing retry model). No session is resumed between phases — accumulated
-context risk outweighs the benefit for typical loop workloads.
+Each phase is one call to `runSingleAttempt` with a fresh provider. By
+default sessions are independent: the phase prompt is the sole input, and
+context flows through agent-managed artefacts (files the agent writes and
+subsequent agents read).
 
-Sessions are independent. The phase prompt is the sole input. Context flows
-through agent-managed artefacts (files the agent writes and subsequent agents
-read), which is both simpler and more reliable than Avenor trying to
-summarise or inject prior session content.
+### `resume_from_previous`
+
+An optional per-phase boolean flag:
+
+```json
+{ "name": "verify", "prompt": "...", "resume_from_previous": true }
+```
+
+When set, the loop runner passes the previous phase's session ID as the
+resume ID, using the same `provider.Resume` path as `--resume` today. The
+phase agent starts with full visibility into the preceding phase's message
+history — its reasoning, tool calls, and output — without needing to
+re-read files or reconstruct context from handoff artefacts.
+
+**Default is `false` (fresh session).** Fresh is the right default because
+context accumulates: by iteration 3 of a 4-phase loop a naively resumed
+session carries 7+ phases of history, most of which is noise relative to
+the current task. `resume_from_previous` opts in for phases where the
+reasoning handoff genuinely matters.
+
+Accumulation is bounded by design. Each phase that sets
+`resume_from_previous: true` extends only its immediate predecessor's
+session, not a chain running back to the start of the loop. Phase N resumes
+phase N-1; if phase N+1 also sets the flag it resumes phase N (which
+already incorporated N-1). The context window grows, but only one phase at
+a time, and the prompt author controls which phases participate.
+
+**When to use it:** tightly coupled adjacent phases where agent-managed
+files are a lossy handoff — for example a `review → verify` pair where the
+verify agent benefits from the full reasoning behind each finding, not just
+the summary written to `REVIEW_FINDINGS.md`. Phases with naturally
+self-contained prompts (build, test, fix) rarely need it.
+
+`resume_from_previous` is silently ignored on the first loop iteration and
+on all pre-phases (there is no preceding phase session to resume from).
 
 ### Prompt templates
 
@@ -404,7 +436,7 @@ All other flags (`--agent`, `--dir`, `--model`, `--timeout`, `--max-retries`,
 
 | File | Purpose |
 |---|---|
-| `internal/cli/loop.go` | `LoopConfig`, `Phase` structs; JSON loading; template rendering; git snapshot helper; `runLoop` orchestrator |
+| `internal/cli/loop.go` | `LoopConfig`, `Phase` structs (including `ResumeFromPrevious bool`); JSON loading; template rendering; git snapshot helper; `runLoop` orchestrator |
 | `internal/digest/loopmarker.go` | `ExtractLoopMarker(text string) (directive, label string, ok bool)` |
 
 ### Files to modify
