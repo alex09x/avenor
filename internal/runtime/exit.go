@@ -20,3 +20,25 @@ func ExitCodeForStopReason(stopReason string) int {
 		return 1
 	}
 }
+
+// StopReasonForExitCode is the inverse of ExitCodeForStopReason. Returns an
+// empty string for exit code 1 (generic failure) since there is no canonical
+// stop reason for that case.
+func StopReasonForExitCode(exitCode int) string {
+	switch exitCode {
+	case 0:
+		return "end_turn"
+	case 2:
+		return "refusal"
+	case 3:
+		return "max_tokens"
+	case 4:
+		return "max_turn_requests"
+	case 124:
+		return "timeout"
+	case 130:
+		return "cancelled"
+	default:
+		return ""
+	}
+}

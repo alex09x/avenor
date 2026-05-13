@@ -70,6 +70,7 @@ func TestSentinelContent(t *testing.T) {
 		exitCode   int
 		sessionID  string
 		stopReason string
+		runID      string
 		want       string
 	}{
 		{
@@ -78,6 +79,22 @@ func TestSentinelContent(t *testing.T) {
 			sessionID:  "ses_abc123",
 			stopReason: "end_turn",
 			want:       "DONE\nSESSION=ses_abc123\nSTOP_REASON=end_turn\n",
+		},
+		{
+			name:       "exit 0 with run id",
+			exitCode:   0,
+			sessionID:  "ses_abc123",
+			stopReason: "end_turn",
+			runID:      "a1b2c3d4e5f60718",
+			want:       "DONE\nSESSION=ses_abc123\nSTOP_REASON=end_turn\nRUN=a1b2c3d4e5f60718\n",
+		},
+		{
+			name:       "run id newlines cannot inject sentinel lines",
+			exitCode:   0,
+			sessionID:  "ses_abc123",
+			stopReason: "end_turn",
+			runID:      "run-1\nFAILED\rEXIT_CODE=1",
+			want:       "DONE\nSESSION=ses_abc123\nSTOP_REASON=end_turn\nRUN=run-1 FAILED EXIT_CODE=1\n",
 		},
 		{
 			name:       "exit 0 default stop reason",
@@ -94,6 +111,14 @@ func TestSentinelContent(t *testing.T) {
 			want:       "TIMEOUT\nSESSION=ses_t\nSTOP_REASON=timeout\n",
 		},
 		{
+			name:       "exit 124 timeout with run id",
+			exitCode:   124,
+			sessionID:  "ses_t",
+			stopReason: "timeout",
+			runID:      "deadbeefcafe0001",
+			want:       "TIMEOUT\nSESSION=ses_t\nSTOP_REASON=timeout\nRUN=deadbeefcafe0001\n",
+		},
+		{
 			name:       "exit 124 default stop reason",
 			exitCode:   124,
 			sessionID:  "ses_t2",
@@ -108,6 +133,14 @@ func TestSentinelContent(t *testing.T) {
 			want:       "KILLED\nSESSION=ses_k\nSTOP_REASON=cancelled\nEXIT_CODE=130\n",
 		},
 		{
+			name:       "exit 130 sigint with run id",
+			exitCode:   130,
+			sessionID:  "ses_k",
+			stopReason: "cancelled",
+			runID:      "deadbeefcafe0002",
+			want:       "KILLED\nSESSION=ses_k\nSTOP_REASON=cancelled\nEXIT_CODE=130\nRUN=deadbeefcafe0002\n",
+		},
+		{
 			name:       "exit 130 default stop reason",
 			exitCode:   130,
 			sessionID:  "ses_k2",
@@ -120,6 +153,14 @@ func TestSentinelContent(t *testing.T) {
 			sessionID:  "ses_f",
 			stopReason: "some_error",
 			want:       "FAILED\nSESSION=ses_f\nSTOP_REASON=some_error\nEXIT_CODE=1\n",
+		},
+		{
+			name:       "exit 1 failure with run id",
+			exitCode:   1,
+			sessionID:  "ses_f",
+			stopReason: "some_error",
+			runID:      "deadbeefcafe0003",
+			want:       "FAILED\nSESSION=ses_f\nSTOP_REASON=some_error\nEXIT_CODE=1\nRUN=deadbeefcafe0003\n",
 		},
 		{
 			name:       "exit 1 default stop reason",
@@ -146,10 +187,10 @@ func TestSentinelContent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := sentinelContent(tt.exitCode, tt.sessionID, tt.stopReason)
+			got := sentinelContent(tt.exitCode, tt.sessionID, tt.stopReason, tt.runID)
 			if got != tt.want {
-				t.Errorf("sentinelContent(%d, %q, %q):\n got: %q\nwant: %q",
-					tt.exitCode, tt.sessionID, tt.stopReason, got, tt.want)
+				t.Errorf("sentinelContent(%d, %q, %q, %q):\n got: %q\nwant: %q",
+					tt.exitCode, tt.sessionID, tt.stopReason, tt.runID, got, tt.want)
 			}
 		})
 	}
@@ -258,7 +299,7 @@ func TestWriteSentinel(t *testing.T) {
 		}
 
 		var stderr strings.Builder
-		writeSentinel(sentPath, 0, logPath, &stderr)
+		writeSentinel(sentPath, 0, "ses_write", "end_turn", "", &stderr)
 
 		if stderr.Len() > 0 {
 			t.Errorf("unexpected stderr: %s", stderr.String())
@@ -281,7 +322,7 @@ func TestWriteSentinel(t *testing.T) {
 		os.WriteFile(logPath, []byte(""), 0o600)
 
 		var stderr strings.Builder
-		writeSentinel(sentPath, 0, logPath, &stderr)
+		writeSentinel(sentPath, 0, "ses_write", "end_turn", "", &stderr)
 
 		entries, _ := os.ReadDir(dir)
 		for _, e := range entries {
@@ -299,7 +340,7 @@ func TestWriteSentinel(t *testing.T) {
 		os.WriteFile(logPath, []byte(""), 0o600)
 
 		var stderr bytes.Buffer
-		writeSentinel(sentPath, 0, logPath, &stderr)
+		writeSentinel(sentPath, 0, "ses_write", "end_turn", "", &stderr)
 
 		if stderr.Len() == 0 {
 			t.Error("expected error logged to stderr but got none")

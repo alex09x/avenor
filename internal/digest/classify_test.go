@@ -109,6 +109,40 @@ func TestClassify(t *testing.T) {
 			want: TagFinding,
 		},
 
+		// --- avenor synthetic event cases ---
+		{
+			name: "avenor.retry is MILESTONE",
+			raw:  `{"event":"avenor.retry","session_id":"s1","attempt":2,"max_retries":3}`,
+			want: TagMilestone,
+		},
+		{
+			name: "avenor.error is MILESTONE",
+			raw:  `{"event":"avenor.error","session_id":"s1","source":"permission","message":"handler timed out"}`,
+			want: TagMilestone,
+		},
+
+		// --- agent.status cases ---
+		{
+			name: "agent.status phase=done is MILESTONE",
+			raw:  `{"event":"agent.status","session_id":"s1","phase":"done","source":"avenor"}`,
+			want: TagMilestone,
+		},
+		{
+			name: "agent.status phase=waiting is MILESTONE",
+			raw:  `{"event":"agent.status","session_id":"s1","phase":"waiting","label":"Allow exec?","source":"avenor"}`,
+			want: TagMilestone,
+		},
+		{
+			name: "agent.status phase=thinking is ACTIVITY",
+			raw:  `{"event":"agent.status","session_id":"s1","phase":"thinking","source":"avenor"}`,
+			want: TagActivity,
+		},
+		{
+			name: "agent.status phase=working is ACTIVITY",
+			raw:  `{"event":"agent.status","session_id":"s1","phase":"working","label":"go test ./...","source":"avenor"}`,
+			want: TagActivity,
+		},
+
 		// --- ACTIVITY cases ---
 		{
 			name: "session.plan is ACTIVITY",

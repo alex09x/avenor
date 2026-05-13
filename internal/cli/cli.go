@@ -13,10 +13,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sdougbrown/avenor/internal/digest"
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/opencodeacp"
 )
 
 const defaultBackend = "opencode-acp"
@@ -60,30 +60,37 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 
 	agent := fs.String("agent", "", "agent name")
 	label := fs.String("label", "", "free-form label for log correlation")
-	promptFile := fs.String("prompt-file", "", "path to prompt file")
+	promptFile := fs.String("prompt-file", "", "path to prompt file (mutually exclusive with --prompt)")
+	prompt := fs.String("prompt", "", "inline prompt text (mutually exclusive with --prompt-file)")
 	dir := fs.String("dir", ".", "working directory for the agent")
 	resume := fs.String("resume", "", "resume an existing session id")
 	serverURL := fs.String("server-url", "", "long-lived ACP server endpoint")
-	onEvent := fs.String("on-event", "", "path to write NDJSON events")
+	onEvent := fs.String("on-event", "", "path to write NDJSON events (optional; events are discarded if unset)")
 	permissionHandler := fs.String("permission-handler", "", "permission handler, supports file:<path>")
 	sentinelFile := fs.String("sentinel-file", "", "path to write a completion sentinel (also derives permission base unless --permission-handler is set)")
 	timeout := fs.Duration("timeout", 0, "overall session timeout")
 	model := fs.String("model", "", "backend-specific model id")
 	backend := fs.String("backend", defaultBackend, "runtime backend")
+	runIDFlag := fs.String("run-id", "", "correlation id for this run (generated if not set)")
+	maxRetries := fs.Int("max-retries", 0, "maximum retry attempts on transient failure (0 = no retry)")
+	autoApprove := fs.Bool("auto-approve", false, "automatically approve all permission requests")
 
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 
-	// Helper to write sentinel and return the provided exit code. Used at
-	// every return path when --sentinel-file is active. Defined immediately
-	// after fs.Parse so it is available for all post-parse return paths.
-	// When *onEvent is empty (flag-validation failures), sessionEndFields
-	// will open-fail silently and produce empty strings — the sentinel will
-	// still be written with FAILED/exit_1 so stableboy gets a signal.
+	runID := *runIDFlag
+	if runID == "" {
+		runID = generateRunID()
+	}
+
+	// finalSessionID is updated after each attempt so exitWithSentinel always
+	// writes the most recent session ID regardless of which return path fires.
+	var finalSessionID string
+
 	exitWithSentinel := func(code int) int {
 		if *sentinelFile != "" {
-			writeSentinel(*sentinelFile, code, *onEvent, stderr)
+			writeSentinel(*sentinelFile, code, finalSessionID, runtime.StopReasonForExitCode(code), runID, stderr)
 		}
 		return code
 	}
@@ -92,42 +99,36 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "avenor: unknown backend %q\n", *backend)
 		return exitWithSentinel(1)
 	}
-	if *promptFile == "" {
-		fmt.Fprintln(stderr, "avenor: --prompt-file is required")
+	if *prompt != "" && *promptFile != "" {
+		fmt.Fprintln(stderr, "avenor: --prompt and --prompt-file are mutually exclusive")
 		return exitWithSentinel(1)
 	}
-	if *onEvent == "" {
-		fmt.Fprintln(stderr, "avenor: --on-event is required")
+	if *prompt == "" && *promptFile == "" {
+		fmt.Fprintln(stderr, "avenor: --prompt or --prompt-file is required")
 		return exitWithSentinel(1)
 	}
 
-	// Derive permission handler base from sentinel when --permission-handler is
-	// not set and --sentinel-file is set. The caller's explicit --permission-handler
-	// always wins.
-	var effectivePermHandler string
-	if *sentinelFile != "" && *permissionHandler == "" {
-		effectivePermHandler = "file:" + derivePermBase(*sentinelFile)
-	} else {
-		effectivePermHandler = *permissionHandler
-	}
+	effectivePermHandler := effectivePermissionHandler(*sentinelFile, *permissionHandler, *autoApprove)
+	cleanupPermBase := permissionCleanupBase(*sentinelFile, *permissionHandler)
 
 	// Pre-run cleanup: truncate event log and remove stale sentinel/perm files.
 	// Only when --sentinel-file is active to avoid changing behavior for callers
 	// that don't use it. The event log is recreated below via newEventWriter.
-	// Use the effective permission base (derived or explicit) for cleanup.
+	// Use the cleanup permission base (derived or explicit) for cleanup.
 	if *sentinelFile != "" {
-		var cleanupPermBase string
-		const filePrefix = "file:"
-		if strings.HasPrefix(effectivePermHandler, filePrefix) {
-			cleanupPermBase = strings.TrimPrefix(effectivePermHandler, filePrefix)
-		}
 		cleanupSentinelFiles(*sentinelFile, cleanupPermBase, stderr)
 	}
 
-	prompt, err := os.ReadFile(*promptFile)
-	if err != nil {
-		fmt.Fprintf(stderr, "avenor: read prompt file: %v\n", err)
-		return exitWithSentinel(1)
+	var promptText []byte
+	if *prompt != "" {
+		promptText = []byte(*prompt)
+	} else {
+		p, err := os.ReadFile(*promptFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "avenor: read prompt file: %v\n", err)
+			return exitWithSentinel(1)
+		}
+		promptText = p
 	}
 
 	writer, err := newEventWriter(*onEvent)
@@ -154,32 +155,9 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		ServerURL: discovery.URL,
 		Model:     *model,
 	}
-	provider := opencodeacp.NewWithOptions(startOptions)
-	if closer, ok := provider.(interface{ Close() error }); ok {
-		defer closer.Close()
-	}
 
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stopSignals()
-
-	session, err := startSession(ctx, provider, startOptions, *resume)
-	if err != nil {
-		fmt.Fprintf(stderr, "avenor: start session: %v\n", err)
-		return exitWithSentinel(1)
-	}
-
-	eventCtx, cancelEvents := context.WithCancel(ctx)
-	defer cancelEvents()
-	eventCh, err := provider.Events(eventCtx, session.SessionID)
-	if err != nil {
-		fmt.Fprintf(stderr, "avenor: subscribe events: %v\n", err)
-		return exitWithSentinel(1)
-	}
-
-	promptDone := make(chan error, 1)
-	go func() {
-		promptDone <- provider.Prompt(ctx, session.SessionID, string(prompt))
-	}()
 
 	var timer <-chan time.Time
 	if *timeout > 0 {
@@ -188,7 +166,39 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		timer = t.C
 	}
 
-	return exitWithSentinel(waitForSession(ctx, provider, writer, fileHandler, eventCh, promptDone, session.SessionID, timer, stderr))
+	resumeID := *resume
+	var result attemptResult
+	for attempt := 1; ; attempt++ {
+		result = runAttempt(ctx, startOptions, resumeID, writer, fileHandler, string(promptText), runID, *label, *autoApprove, timer, stderr)
+		finalSessionID = result.sessionID
+
+		if result.exitCode != 1 || attempt > *maxRetries {
+			break
+		}
+
+		if result.sessionID != "" {
+			resumeID = result.sessionID
+		}
+
+		if err := writeRetryEvent(writer, result.sessionID, runID, attempt+1, *maxRetries, *label); err != nil {
+			fmt.Fprintf(stderr, "avenor: write retry event: %v\n", err)
+			result.exitCode = 1
+			break
+		}
+		if *sentinelFile != "" {
+			cleanupSentinelFiles(*sentinelFile, cleanupPermBase, stderr)
+		}
+
+		select {
+		case <-retryAfter(backoffDelay(attempt)):
+		case <-timer:
+			return exitWithSentinel(124)
+		case <-ctx.Done():
+			return exitWithSentinel(130)
+		}
+	}
+
+	return exitWithSentinel(result.exitCode)
 }
 
 func startSession(ctx context.Context, provider runtime.Provider, opts runtime.StartOptions, resumeID string) (runtime.Session, error) {
@@ -196,6 +206,67 @@ func startSession(ctx context.Context, provider runtime.Provider, opts runtime.S
 		return provider.Resume(ctx, resumeID)
 	}
 	return provider.Start(ctx, opts)
+}
+
+var runAttempt = runSingleAttempt
+var retryAfter = time.After
+
+func effectivePermissionHandler(sentinelPath, permissionHandler string, autoApprove bool) string {
+	if permissionHandler != "" {
+		return permissionHandler
+	}
+	if sentinelPath != "" && !autoApprove {
+		return "file:" + derivePermBase(sentinelPath)
+	}
+	return ""
+}
+
+func permissionCleanupBase(sentinelPath, permissionHandler string) string {
+	const filePrefix = "file:"
+	if strings.HasPrefix(permissionHandler, filePrefix) {
+		return strings.TrimPrefix(permissionHandler, filePrefix)
+	}
+	if sentinelPath != "" && permissionHandler == "" {
+		return derivePermBase(sentinelPath)
+	}
+	return ""
+}
+
+// selectPermissionOption picks an option ID by matching the protocol kind:
+// allow when approve is true, reject otherwise.
+func selectPermissionOption(options []any, approve bool) (string, error) {
+	want := "reject"
+	if approve {
+		want = "allow"
+	}
+	for _, opt := range options {
+		m, ok := opt.(map[string]any)
+		if !ok {
+			continue
+		}
+		optID, _ := m["optionId"].(string)
+		kind := strings.ToLower(fmt.Sprint(m["kind"]))
+		if kind == want {
+			if optID == "" {
+				return "", fmt.Errorf("permission option with kind %q missing optionId", want)
+			}
+			return optID, nil
+		}
+	}
+	return "", fmt.Errorf("permission options missing kind %q", want)
+}
+
+// permissionResult carries the outcome of an async permission resolution.
+type permissionResult struct {
+	err       error
+	requestID string
+	optionID  string
+	// source is "avenor" for auto-answer, "file" for file-handler-resolved.
+	// For the file-handler path, requestID/optionID are empty because
+	// permission.FileHandler does not currently surface the chosen option;
+	// permission.response is therefore only emitted for the auto-answer path.
+	// See: TODO(symmetry) — thread chosen option out of FileHandler.Handle.
+	source string
 }
 
 func waitForSession(
@@ -206,31 +277,136 @@ func waitForSession(
 	eventCh <-chan events.Event,
 	promptDone <-chan error,
 	sessionID string,
+	runID string,
+	runLabel string,
+	autoApprove bool,
 	timeout <-chan time.Time,
 	stderr io.Writer,
 ) int {
 	var finalStopReason string
 	promptReturned := false
-	var permissionDone <-chan error
+	var permissionDone <-chan permissionResult
+	tracker := newStatusTracker(sessionID, runID, runLabel)
+
+	writeStatus := func(ev events.Event, ok bool) bool {
+		if !ok {
+			return true
+		}
+		if err := writer.Write(ev); err != nil {
+			fmt.Fprintf(stderr, "avenor: write event: %v\n", err)
+			return false
+		}
+		return true
+	}
+
+	emitPermissionResponse := func(requestID, optionID, source string) {
+		kind := "reject"
+		if autoApprove {
+			kind = "allow"
+		}
+		fields := map[string]any{
+			"request_id": requestID,
+			"option_id":  optionID,
+			"kind":       kind,
+			"source":     source,
+			"ts":         time.Now().UnixMilli(),
+		}
+		if runID != "" {
+			fields["run_id"] = runID
+		}
+		if runLabel != "" {
+			fields["run_label"] = runLabel
+		}
+		if err := writer.Write(events.Event{
+			Event:     "permission.response",
+			SessionID: sessionID,
+			Fields:    fields,
+		}); err != nil {
+			fmt.Fprintf(stderr, "avenor: write permission.response event: %v\n", err)
+		}
+	}
 
 	for {
 		select {
 		case event, ok := <-eventCh:
 			if !ok {
+				// Nil the channel so it no longer fires on subsequent iterations.
+				eventCh = nil
 				if finalStopReason == "" {
 					return 1
 				}
+				// Wait for any in-flight AnswerPermission goroutine before exiting.
+				if permissionDone != nil {
+					break
+				}
 				return runtime.ExitCodeForStopReason(finalStopReason)
 			}
-			if event.Event == "permission.request" && fileHandler != nil {
-				if permissionDone != nil {
-					fmt.Fprintln(stderr, "avenor: another permission request is already pending")
+			markerHandled := false
+			if event.Event == "agent.message_chunk" || event.Event == "agent.thought_chunk" {
+				if text := chunkText(event); text != "" {
+					if phase, label, ok := digest.ExtractStatusMarker(text); ok {
+						if !writeStatus(tracker.ObserveMarker(phase, label)) {
+							return 1
+						}
+						markerHandled = true
+					}
+				}
+			}
+			if !markerHandled {
+				if !writeStatus(tracker.Observe(event)) {
 					return 1
 				}
-				done := make(chan error, 1)
+			}
+			if event.Event == "permission.request" {
+				if fileHandler != nil {
+					if permissionDone != nil {
+						emitErrorEvent(writer, sessionID, runID, "permission", "another permission request is already pending", stderr, runLabel)
+						return 1
+					}
+					done := make(chan permissionResult, 1)
+					permissionDone = done
+					go func() {
+						err := fileHandler.Handle(ctx, provider, event, writer.Write)
+						// requestID/optionID are empty: FileHandler does not surface the
+						// chosen option. permission.response is not emitted for this path.
+						// See permissionResult.source comment above.
+						done <- permissionResult{err: err, source: "file"}
+					}()
+					continue
+				}
+				// No file handler: auto-answer via goroutine so a slow backend call
+				// does not block event draining. Status transition happens in the
+				// permissionDone case below, not here.
+				if err := writer.Write(event); err != nil {
+					fmt.Fprintf(stderr, "avenor: write event: %v\n", err)
+					return 1
+				}
+				requestID, _ := event.Fields["request_id"].(string)
+				if requestID == "" {
+					// Malformed request from backend: no request_id means we cannot
+					// call AnswerPermission. Emit an error and stay in waiting state.
+					emitErrorEvent(writer, sessionID, runID, "permission", "permission.request missing request_id", stderr, runLabel)
+					continue
+				}
+				if permissionDone != nil {
+					emitErrorEvent(writer, sessionID, runID, "permission", "another permission request is already pending", stderr, runLabel)
+					return 1
+				}
+				options, _ := event.Fields["options"].([]any)
+				optionID, err := selectPermissionOption(options, autoApprove)
+				if err != nil {
+					emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("auto-answer permission: %v", err), stderr, runLabel)
+					return 1
+				}
+				done := make(chan permissionResult, 1)
 				permissionDone = done
 				go func() {
-					done <- fileHandler.Handle(ctx, provider, event, writer.Write)
+					resp := runtime.PermissionResponse{Outcome: "selected", OptionID: optionID}
+					if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
+						done <- permissionResult{err: err}
+						return
+					}
+					done <- permissionResult{requestID: requestID, optionID: optionID, source: "avenor"}
 				}()
 				continue
 			}
@@ -241,40 +417,54 @@ func waitForSession(
 				fmt.Fprintf(stderr, "avenor: write event: %v\n", err)
 				return 1
 			}
-			if event.Event == "session.end" && promptReturned {
+			if event.Event == "session.end" && promptReturned && permissionDone == nil {
 				return runtime.ExitCodeForStopReason(finalStopReason)
 			}
 		case err := <-promptDone:
 			promptReturned = true
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
-					return cancelAndEnd(provider, writer, sessionID, "cancelled", stderr)
+					return cancelAndEnd(provider, writer, sessionID, runID, runLabel, "cancelled", stderr)
 				}
-				fmt.Fprintf(stderr, "avenor: prompt: %v\n", err)
+				emitErrorEvent(writer, sessionID, runID, "prompt", fmt.Sprintf("prompt: %v", err), stderr, runLabel)
 				return 1
 			}
-			if finalStopReason != "" {
+			if finalStopReason != "" && permissionDone == nil {
 				return runtime.ExitCodeForStopReason(finalStopReason)
 			}
-		case err := <-permissionDone:
+		case res := <-permissionDone:
 			permissionDone = nil
-			if err != nil {
-				fmt.Fprintf(stderr, "avenor: permission handler: %v\n", err)
+			if res.err != nil {
+				emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("permission handler: %v", res.err), stderr, runLabel)
 				return 1
 			}
+			// Emit permission.response audit event for auto-answer (source=="avenor").
+			// The file-handler path (source=="file") does not emit it because the
+			// chosen option is not surfaced by FileHandler.Handle.
+			if res.source == "avenor" && res.requestID != "" {
+				emitPermissionResponse(res.requestID, res.optionID, res.source)
+			}
+			if !writeStatus(tracker.PermissionAnswered()) {
+				return 1
+			}
+			// If session.end + promptDone already arrived while we were waiting for
+			// AnswerPermission, exit now that the permission goroutine has resolved.
+			if finalStopReason != "" && promptReturned {
+				return runtime.ExitCodeForStopReason(finalStopReason)
+			}
 		case <-ctx.Done():
-			return cancelAndEnd(provider, writer, sessionID, "cancelled", stderr)
+			return cancelAndEnd(provider, writer, sessionID, runID, runLabel, "cancelled", stderr)
 		case <-timeout:
-			return cancelAndEnd(provider, writer, sessionID, "timeout", stderr)
+			return cancelAndEnd(provider, writer, sessionID, runID, runLabel, "timeout", stderr)
 		}
 	}
 }
 
-func cancelAndEnd(provider runtime.Provider, writer *eventWriter, sessionID string, stopReason string, stderr io.Writer) int {
+func cancelAndEnd(provider runtime.Provider, writer *eventWriter, sessionID, runID, runLabel, stopReason string, stderr io.Writer) int {
 	cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := provider.Cancel(cancelCtx, sessionID); err != nil {
-		fmt.Fprintf(stderr, "avenor: cancel session: %v\n", err)
+		emitErrorEvent(writer, sessionID, runID, "cancel", fmt.Sprintf("cancel session: %v", err), stderr, runLabel)
 	}
 	if err := writer.Write(events.Event{
 		Event:     "session.end",
@@ -296,6 +486,9 @@ type eventWriter struct {
 }
 
 func newEventWriter(path string) (*eventWriter, error) {
+	if path == "" {
+		return &eventWriter{encoder: json.NewEncoder(io.Discard)}, nil
+	}
 	file, err := os.Create(path)
 	if err != nil {
 		return nil, err
@@ -315,6 +508,9 @@ func (w *eventWriter) Write(event events.Event) error {
 func (w *eventWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.file == nil {
+		return nil
+	}
 	return w.file.Close()
 }
 

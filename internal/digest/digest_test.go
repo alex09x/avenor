@@ -38,6 +38,36 @@ func TestDigestLine(t *testing.T) {
 			want: "EVENT user.message_chunk ses_1 ",
 		},
 		{
+			name: "avenor.retry with attempt and max",
+			raw:  `{"event":"avenor.retry","session_id":"ses_1","attempt":2,"max_retries":3}`,
+			want: "EVENT avenor.retry ses_1 attempt=2/3",
+		},
+		{
+			name: "avenor.retry without attempt falls back",
+			raw:  `{"event":"avenor.retry","session_id":"ses_1"}`,
+			want: "EVENT avenor.retry ses_1 retrying",
+		},
+		{
+			name: "avenor.error with source and message",
+			raw:  `{"event":"avenor.error","session_id":"ses_1","source":"permission","message":"handler timed out"}`,
+			want: "EVENT avenor.error ses_1 permission: handler timed out",
+		},
+		{
+			name: "avenor.error source only",
+			raw:  `{"event":"avenor.error","session_id":"ses_1","source":"cancel"}`,
+			want: "EVENT avenor.error ses_1 cancel",
+		},
+		{
+			name: "agent.status with label",
+			raw:  `{"event":"agent.status","session_id":"ses_1","phase":"working","label":"go test ./...","source":"avenor"}`,
+			want: "EVENT agent.status ses_1 working | go test ./...",
+		},
+		{
+			name: "agent.status without label",
+			raw:  `{"event":"agent.status","session_id":"ses_1","phase":"thinking","source":"avenor"}`,
+			want: "EVENT agent.status ses_1 thinking",
+		},
+		{
 			name: "tool kind title status",
 			raw:  `{"event":"tool.call","session_id":"ses_1","kind":"shell","title":"go test","status":"running"}`,
 			want: "EVENT tool.call ses_1 shell:go test [running]",

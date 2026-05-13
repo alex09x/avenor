@@ -81,7 +81,7 @@ func (h *FileHandler) Handle(ctx context.Context, provider runtime.Provider, eve
 		return err
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(requestPath, data, 0o600); err != nil {
+	if err := writeFileAtomic(requestPath, data, 0o600); err != nil {
 		return err
 	}
 
@@ -135,6 +135,11 @@ func readResponse(path string) (runtime.PermissionResponse, error) {
 	if err != nil {
 		return runtime.PermissionResponse{}, err
 	}
+	if len(data) == 0 {
+		// File exists but is empty — likely a non-atomic writer mid-O_TRUNC.
+		// Treat as not-yet-ready so waitForResponse keeps polling.
+		return runtime.PermissionResponse{}, os.ErrNotExist
+	}
 	var response runtime.PermissionResponse
 	if err := json.Unmarshal(data, &response); err != nil {
 		return runtime.PermissionResponse{}, err
@@ -143,6 +148,14 @@ func readResponse(path string) (runtime.PermissionResponse, error) {
 		response.Outcome = "selected"
 	}
 	return response, nil
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func requestFromEvent(event events.Event) FileRequest {

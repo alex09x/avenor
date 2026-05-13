@@ -242,6 +242,12 @@ func excerpt(event map[string]any, name string) string {
 	switch name {
 	case "agent.message_chunk", "agent.thought_chunk", "user.message_chunk":
 		return contentText(event["content"])
+	case "agent.status":
+		phase := stringField(event, "phase")
+		if label := stringField(event, "label"); label != "" {
+			return phase + " | " + label
+		}
+		return phase
 	case "tool.call", "tool.call_update":
 		return toolSummary(event)
 	case "permission.request":
@@ -256,6 +262,16 @@ func excerpt(event map[string]any, name string) string {
 		return stringField(event, "title")
 	case "session.end":
 		return "stop_reason=" + stringField(event, "stop_reason")
+	case "avenor.retry":
+		if event["attempt"] == nil {
+			return "retrying"
+		}
+		return fmt.Sprintf("attempt=%v/%v", event["attempt"], event["max_retries"])
+	case "avenor.error":
+		if msg := stringField(event, "message"); msg != "" {
+			return stringField(event, "source") + ": " + msg
+		}
+		return stringField(event, "source")
 	default:
 		return ""
 	}

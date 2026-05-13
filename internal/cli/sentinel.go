@@ -28,33 +28,45 @@ func derivePermBase(sentinelPath string) string {
 //
 // Exit code semantics:
 //
-//	0   → DONE\nSESSION=...\nSTOP_REASON=...\n
-//	124 → TIMEOUT\nSESSION=...\nSTOP_REASON=...\n
-//	130 → KILLED\nSESSION=...\nSTOP_REASON=...\nEXIT_CODE=130\n
-//	N   → FAILED\nSESSION=...\nSTOP_REASON=...\nEXIT_CODE=N\n
-func sentinelContent(exitCode int, sessionID, stopReason string) string {
+//	0   → DONE\nSESSION=...\nSTOP_REASON=...\n[RUN=...\n]
+//	124 → TIMEOUT\nSESSION=...\nSTOP_REASON=...\n[RUN=...\n]
+//	130 → KILLED\nSESSION=...\nSTOP_REASON=...\nEXIT_CODE=130\n[RUN=...\n]
+//	N   → FAILED\nSESSION=...\nSTOP_REASON=...\nEXIT_CODE=N\n[RUN=...\n]
+//
+// The RUN= line is omitted when runID is empty.
+func sentinelContent(exitCode int, sessionID, stopReason, runID string) string {
+	run := ""
+	if runID != "" {
+		run = "RUN=" + sentinelLineValue(runID) + "\n"
+	}
 	switch exitCode {
 	case 0:
 		if stopReason == "" {
 			stopReason = "end_turn"
 		}
-		return fmt.Sprintf("DONE\nSESSION=%s\nSTOP_REASON=%s\n", sessionID, stopReason)
+		return fmt.Sprintf("DONE\nSESSION=%s\nSTOP_REASON=%s\n%s", sessionID, stopReason, run)
 	case 124:
 		if stopReason == "" {
 			stopReason = "timeout"
 		}
-		return fmt.Sprintf("TIMEOUT\nSESSION=%s\nSTOP_REASON=%s\n", sessionID, stopReason)
+		return fmt.Sprintf("TIMEOUT\nSESSION=%s\nSTOP_REASON=%s\n%s", sessionID, stopReason, run)
 	case 130:
 		if stopReason == "" {
 			stopReason = "cancelled"
 		}
-		return fmt.Sprintf("KILLED\nSESSION=%s\nSTOP_REASON=%s\nEXIT_CODE=130\n", sessionID, stopReason)
+		return fmt.Sprintf("KILLED\nSESSION=%s\nSTOP_REASON=%s\nEXIT_CODE=130\n%s", sessionID, stopReason, run)
 	default:
 		if stopReason == "" {
 			stopReason = fmt.Sprintf("exit_%d", exitCode)
 		}
-		return fmt.Sprintf("FAILED\nSESSION=%s\nSTOP_REASON=%s\nEXIT_CODE=%d\n", sessionID, stopReason, exitCode)
+		return fmt.Sprintf("FAILED\nSESSION=%s\nSTOP_REASON=%s\nEXIT_CODE=%d\n%s", sessionID, stopReason, exitCode, run)
 	}
+}
+
+func sentinelLineValue(value string) string {
+	value = strings.ReplaceAll(value, "\r", " ")
+	value = strings.ReplaceAll(value, "\n", " ")
+	return value
 }
 
 // sessionEndFields scans an NDJSON event log and returns the session_id and
@@ -101,11 +113,10 @@ func sessionEndFields(eventLogPath string) (sessionID, stopReason string) {
 }
 
 // writeSentinel writes the completion sentinel file at path using an
-// atomic tmp+rename strategy. It extracts session metadata from the event log.
-// Errors are logged to stderr but never affect the caller's exit code.
-func writeSentinel(path string, exitCode int, eventLogPath string, stderr io.Writer) {
-	sessionID, stopReason := sessionEndFields(eventLogPath)
-	content := sentinelContent(exitCode, sessionID, stopReason)
+// atomic tmp+rename strategy. Errors are logged to stderr but never affect
+// the caller's exit code.
+func writeSentinel(path string, exitCode int, sessionID, stopReason, runID string, stderr io.Writer) {
+	content := sentinelContent(exitCode, sessionID, stopReason, runID)
 
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".sentinel-*.tmp")
