@@ -75,46 +75,106 @@ any phases defined in the config.
 
 ## Exit Conditions
 
-A loop exits when any of the following fires (evaluated after each full
-iteration, i.e. after the last loop phase completes):
+A loop stops when any of the following fires:
 
-| Condition | Trigger |
-|---|---|
-| **Marker** | Any phase agent emits `[loop: exit]` or `[loop: exit \| label]` |
-| **Max iterations** | `iteration_count >= max_iterations` |
-| **Phase failure** | Any phase exits with a non-clean stop reason (`refusal`, `max_tokens`, etc.) |
-| **Cancellation / timeout** | Existing signal/timer path, unchanged |
+| Condition | Evaluated | Trigger |
+|---|---|---|
+| **Exit marker** | After phase ends | Any phase agent emits `[loop: exit]` or `[loop: exit \| label]` |
+| **Abort marker** | After phase ends | Any phase agent emits `[loop: abort]` or `[loop: abort \| reason]` |
+| **Max iterations** | After last loop phase | `iteration_count >= max_iterations` |
+| **Phase failure** | Immediately | Any phase exits with a non-clean stop reason |
+| **Cancellation / timeout** | Immediately | Existing signal/timer path, unchanged |
 
 "Clean" is `stop_reason == "end_turn"`. All other terminal stop reasons
-propagate immediately and abort the loop.
+propagate immediately and stop the loop.
 
-The `[loop: exit]` marker is the primary mechanism: phases are prompted to
-emit it when their exit criterion is met, as in the example above. Avenor
-checks for this flag after each phase ends (not mid-stream) so the phase
-always runs to completion before the loop is cut short.
+Both `exit` and `abort` are evaluated at phase-end (not mid-stream): the
+phase always runs to the natural end of its session before the loop acts on
+the marker. This gives the agent time to write findings, explain its
+reasoning, or clean up before control returns to Avenor. The distinction
+between the two is in the outcome — exit is a success signal, abort is an
+escalation signal.
 
 ---
 
-## `[loop: exit]` Marker
+## Loop Markers
 
 Extends the existing `[status: ...]` marker convention in
 `internal/digest/marker.go`.
 
 ```
-[loop: exit]
-[loop: exit | tests green]
-[loop: continue]   ← explicit no-op, for readability in prompts
+[loop: exit]                    ← clean completion, stop iterating
+[loop: exit | tests green]      ← with label
+[loop: continue]                ← explicit no-op, for readability in prompts
+[loop: abort]                   ← blocked, needs escalation
+[loop: abort | architectural issue: layering violation in pkg/db]
 ```
 
-`ExtractLoopMarker(text string) (exit bool, label string, ok bool)`:
+`ExtractLoopMarker(text string) (directive, label string, ok bool)`:
 
-- `ok=true` only for `exit` or `continue` directives.
-- `exit=true` → Avenor sets a flag on the current iteration after the phase ends.
-- Unknown directives → `ok=false`, ignored.
+- `directive` is one of `"exit"`, `"continue"`, `"abort"`.
+- `ok=true` only for known directives; unknown words → `ok=false`, ignored.
+- If multiple markers appear in one chunk the first wins (consistent with
+  status marker behaviour).
 
 Extraction is done inside `waitForSession` on the same chunk events already
 scanned for `[status: ...]`. The marker is **not** stripped from the forwarded
 event — raw text consumers still see it.
+
+The most severe marker seen during a phase wins: `abort` > `exit` > `continue`.
+If a phase emits `[loop: exit]` and later `[loop: abort]` in the same session,
+the phase is treated as aborted.
+
+---
+
+## Phase Abort
+
+An agent emits `[loop: abort | reason]` when it has discovered something it
+cannot resolve on its own — an architectural constraint violation, a decision
+that requires human judgement, or a dependency on another agent's output that
+isn't available.
+
+The abort path diverges from the exit path in three ways:
+
+**1. Outcome: blocked, not success.**
+The loop stops and Avenor writes a `BLOCKED` sentinel (exit code `5`). The
+harness or orchestrating agent reads the sentinel and decides next steps —
+route to a human, invoke a different agent, or re-invoke Avenor with a
+modified prompt. Avenor does not attempt another iteration or retry.
+
+**2. Reason is preserved.**
+The abort label from the marker is carried through the `avenor.phase.end`
+event and the `avenor.loop.end` event, and into the sentinel as a `REASON=`
+line. Harnesses can gate on this without parsing event logs.
+
+**3. Exit code `5` (blocked).**
+Added to `internal/runtime/exit.go` alongside the existing stop-reason map:
+- `StopReasonForExitCode(5) → "blocked"`
+- `ExitCodeForStopReason("blocked") → 5`
+
+Sentinel format for a blocked run:
+```
+BLOCKED
+SESSION=ses_abc123
+STOP_REASON=blocked
+REASON=architectural issue: layering violation in pkg/db
+RUN=a3f9...
+```
+
+The `REASON` line is omitted when the marker had no label (`[loop: abort]`
+with no pipe).
+
+### Inter-agent escalation pattern
+
+A jockey watching a mule's event log via `--on-event` sees the
+`avenor.loop.end` event with `exit_reason: "abort"` and `exit_label` carrying
+the reason. The jockey can then:
+- Surface the reason to a human via a tool call or message.
+- Invoke a specialist agent with the abort label as its prompt context.
+- Re-invoke the original mule with an amended prompt that addresses the blocker.
+
+No new Avenor mechanism is required for the jockey side — reading `exit_reason`
+from the event stream is sufficient.
 
 ---
 
@@ -203,12 +263,22 @@ Emitted after each phase's session ends (before any backoff/retry).
 }
 ```
 
-`exit_marker` is present and `true` only when a `[loop: exit]` marker fired
-in this phase.
+Marker fields present only when a marker fired in this phase:
+
+| Field | Present when |
+|---|---|
+| `exit_marker: true` | `[loop: exit]` was seen |
+| `exit_marker_label` | exit marker had a label |
+| `abort_marker: true` | `[loop: abort]` was seen |
+| `abort_marker_label` | abort marker had a label |
+
+`abort_marker` takes priority: if both appear in the same phase session,
+only the abort fields are set and the loop exits with the blocked outcome.
 
 ### `avenor.loop.end`
 
-Emitted once after the loop (or pre sequence) finishes.
+Emitted once after the loop (or pre sequence) finishes, regardless of how it
+ended — success, abort, failure, or limit.
 
 ```json
 {
@@ -216,13 +286,16 @@ Emitted once after the loop (or pre sequence) finishes.
   "run_id": "a3f9...",
   "ts": 1715000000000,
   "iterations_completed": 2,
-  "exit_reason": "marker",
-  "exit_label": "tests green"
+  "exit_reason": "abort",
+  "exit_label": "architectural issue: layering violation in pkg/db"
 }
 ```
 
-`exit_reason` is one of: `marker`, `max_iterations`, `phase_failure`,
+`exit_reason` is one of: `marker`, `abort`, `max_iterations`, `phase_failure`,
 `cancelled`, `timeout`.
+
+`exit_label` carries the label from the winning marker when `exit_reason` is
+`marker` or `abort`; absent otherwise.
 
 ### Classify / digest
 
@@ -231,19 +304,38 @@ Emitted once after the loop (or pre sequence) finishes.
 | `avenor.loop.start` | MILESTONE | `"loop start, max_iterations=N"` |
 | `avenor.phase.start` | ACTIVITY | `"phase: <name> (iter N)"` |
 | `avenor.phase.end` | MILESTONE | `"phase: <name> → <stop_reason>"` |
-| `avenor.loop.end` | MILESTONE | `"loop end: <exit_reason>"` |
+| `avenor.loop.end` | MILESTONE | `"loop end: <exit_reason>"` (e.g. `"loop end: abort"`) |
 
 ---
 
 ## Sentinel Behaviour
 
-The existing sentinel mechanism is unchanged. `writeSentinel` fires after the
-entire loop finishes (or aborts), not after each phase. The exit code reflects
-the loop's overall outcome:
+`writeSentinel` fires once after the entire loop finishes, not after each
+phase. The exit code reflects the loop's overall outcome:
 
-- Loop exits cleanly (marker or max_iterations reached normally) → `0`
-- Any phase non-clean stop → that phase's exit code propagates
-- Timeout / cancellation → `124` / `130` as today
+| Outcome | Status | Exit code |
+|---|---|---|
+| Clean exit (marker or max_iterations) | `DONE` | `0` |
+| Abort marker | `BLOCKED` | `5` |
+| Phase non-clean stop | `FAILED` | phase exit code |
+| Timeout | `TIMEOUT` | `124` |
+| Cancellation | `KILLED` | `130` |
+
+The `BLOCKED` sentinel includes a `REASON=` line when the abort marker carried
+a label:
+
+```
+BLOCKED
+SESSION=ses_abc123
+STOP_REASON=blocked
+REASON=architectural issue: layering violation in pkg/db
+RUN=a3f9...
+```
+
+Exit code `5` is added to `internal/runtime/exit.go`:
+- `StopReasonForExitCode(5) → "blocked"`
+- `ExitCodeForStopReason("blocked") → 5`
+- `sentinelContent` gains a `case 5:` branch producing the `BLOCKED` prefix.
 
 If a sentinel is wanted per phase (e.g. for external monitoring), the calling
 harness can subscribe to `avenor.phase.end` events via `--on-event` and write
@@ -287,35 +379,60 @@ All other flags (`--agent`, `--dir`, `--model`, `--timeout`, `--max-retries`,
 | File | Purpose |
 |---|---|
 | `internal/cli/loop.go` | `LoopConfig`, `Phase` structs; JSON loading; template rendering; `runLoop` orchestrator |
-| `internal/digest/loopmarker.go` | `ExtractLoopMarker(text string) (exit bool, label string, ok bool)` |
+| `internal/digest/loopmarker.go` | `ExtractLoopMarker(text string) (directive, label string, ok bool)` |
 
 ### Files to modify
 
 | File | Change |
 |---|---|
 | `internal/cli/cli.go` | `--loop-file` flag; dispatch to `runLoop` when set |
-| `internal/cli/cli.go` | `waitForSession` gains a `loopMarkerSeen *bool` out-param (or returned in result) so the loop runner can read it after the session ends |
+| `internal/cli/retry.go` | Extend `attemptResult` with `loopDirective string` and `loopLabel string`; `waitForSession` populates these from the chunk scan |
+| `internal/runtime/exit.go` | Exit code `5` for `"blocked"`; `StopReasonForExitCode` and `ExitCodeForStopReason` cases |
+| `internal/cli/sentinel.go` | `sentinelContent` case 5: `BLOCKED` prefix + optional `REASON=` line; `writeSentinel` accepts optional reason string or the loop runner sets stopReason to `"blocked"` and passes the label separately |
 | `internal/digest/marker.go` | Optional: share regex infrastructure with `loopmarker.go` |
 | `internal/digest/classify.go` | Add cases for the four new event types |
 | `internal/digest/digest.go` | Add excerpts for the four new event types |
 
+### Key data flow for abort
+
+```
+waitForSession  ← sees [loop: abort | reason] in chunk
+    │
+    └─► sets attemptResult.loopDirective = "abort"
+            attemptResult.loopLabel    = "reason"
+
+runSingleAttempt returns attemptResult
+
+runLoop checks result.loopDirective == "abort"
+    │
+    ├─► emit avenor.phase.end { abort_marker: true, abort_marker_label: "..." }
+    ├─► emit avenor.loop.end  { exit_reason: "abort", exit_label: "..." }
+    └─► return exit code 5
+
+exitWithSentinel(5) → writeSentinel writes BLOCKED sentinel
+```
+
 ### Suggested order
 
 1. **`loopmarker.go`** — pure function, no dependencies, easy to test first.
-2. **`loop.go` config structs + validation** — JSON decode, template expansion,
+2. **`runtime/exit.go`** — add exit code 5; update `sentinel.go` `case 5:`.
+3. **`retry.go`** — extend `attemptResult`; hook `waitForSession` chunk scan.
+4. **`loop.go` config structs + validation** — JSON decode, template expansion,
    error cases; no execution yet.
-3. **`loop.go` runLoop orchestrator** — calls `runSingleAttempt` per phase,
-   emits lifecycle events, evaluates exit conditions.
-4. **`cli.go` wiring** — `--loop-file` flag + dispatch.
-5. **`waitForSession` loop marker extraction** — hook into existing chunk scan.
-6. **`classify.go` + `digest.go`** — mechanical additions after events are defined.
+5. **`loop.go` runLoop orchestrator** — calls `runSingleAttempt` per phase,
+   emits lifecycle events, evaluates exit/abort conditions.
+6. **`cli.go` wiring** — `--loop-file` flag + dispatch.
+7. **`classify.go` + `digest.go`** — mechanical additions after events are defined.
 
 ### Testing
 
 - `internal/digest/loopmarker_test.go` — covers `[loop: exit]`, `[loop: exit | label]`,
-  `[loop: continue]`, unknown directive, malformed.
+  `[loop: continue]`, `[loop: abort]`, `[loop: abort | reason]`, abort wins over
+  exit when both appear, unknown directive, malformed.
+- `internal/runtime/exit_test.go` — add `blocked`/`5` to existing tables.
+- `internal/cli/sentinel_test.go` — add `BLOCKED` sentinel case with and without reason.
 - `internal/cli/loop_test.go` — config load/validate (table-driven), template
-  rendering, `backoffDelay` reuse.
+  rendering, abort-wins-over-exit priority logic.
 - Integration: the existing `runSingleAttempt` mock surface in `retry_test.go`
   can be extended to exercise phase sequencing without a live OpenCode process.
 
