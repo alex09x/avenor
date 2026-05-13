@@ -13,7 +13,7 @@ import (
 // time+pid-derived ID prefixed with "auto-" so consumers can distinguish it
 // from the normal random form. The fallback is logged to stderr; the function
 // never panics.
-func generateRunID() string {
+func GenerateRunID() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		fmt.Fprintf(os.Stderr, "avenor: crypto/rand unavailable, using time-based run id: %v\n", err)

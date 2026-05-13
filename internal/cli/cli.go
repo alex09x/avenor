@@ -84,7 +84,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 
 	runID := *runIDFlag
 	if runID == "" {
-		runID = generateRunID()
+		runID = GenerateRunID()
 	}
 
 	// finalSessionID is updated after each attempt so exitWithSentinel always
@@ -93,7 +93,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 
 	exitWithSentinel := func(code int) int {
 		if *sentinelFile != "" {
-			writeSentinel(*sentinelFile, code, finalSessionID, runtime.StopReasonForExitCode(code), runID, stderr)
+			WriteSentinel(*sentinelFile, code, finalSessionID, runtime.StopReasonForExitCode(code), runID, stderr)
 		}
 		return code
 	}
@@ -134,12 +134,12 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		promptText = p
 	}
 
-	baseWriter, err := newEventWriter(*onEvent)
+	baseWriter, err := NewEventWriter(*onEvent)
 	if err != nil {
 		fmt.Fprintf(stderr, "avenor: open event stream: %v\n", err)
 		return exitWithSentinel(1)
 	}
-	var writer eventSink = baseWriter
+	var writer EventSink = baseWriter
 	defer writer.Close()
 
 	state := control.NewState(runID, *label, *maxRetries)
@@ -173,7 +173,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 
 	var fileHandler *permission.FileHandler
 	if effectivePermHandler != "" {
-		fileHandler, err = parsePermissionHandler(effectivePermHandler)
+		fileHandler, err = ParsePermissionHandler(effectivePermHandler)
 		if err != nil {
 			fmt.Fprintf(stderr, "avenor: %v\n", err)
 			return exitWithSentinel(1)
@@ -240,7 +240,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	return exitWithSentinel(result.exitCode)
 }
 
-func startSession(ctx context.Context, provider runtime.Provider, opts runtime.StartOptions, resumeID string) (runtime.Session, error) {
+func StartSession(ctx context.Context, provider runtime.Provider, opts runtime.StartOptions, resumeID string) (runtime.Session, error) {
 	if resumeID != "" {
 		return provider.Resume(ctx, resumeID)
 	}
@@ -255,7 +255,7 @@ func effectivePermissionHandler(sentinelPath, permissionHandler string, autoAppr
 		return permissionHandler
 	}
 	if sentinelPath != "" && !autoApprove {
-		return "file:" + derivePermBase(sentinelPath)
+		return "file:" + DerivePermBase(sentinelPath)
 	}
 	return ""
 }
@@ -266,7 +266,7 @@ func permissionCleanupBase(sentinelPath, permissionHandler string) string {
 		return strings.TrimPrefix(permissionHandler, filePrefix)
 	}
 	if sentinelPath != "" && permissionHandler == "" {
-		return derivePermBase(sentinelPath)
+		return DerivePermBase(sentinelPath)
 	}
 	return ""
 }
@@ -304,10 +304,10 @@ type permissionResult struct {
 	source string
 }
 
-func waitForSession(
+func WaitForSession(
 	ctx context.Context,
 	provider runtime.Provider,
-	writer eventSink,
+	writer EventSink,
 	fileHandler *permission.FileHandler,
 	controlServer *control.ControlServer,
 	eventCh <-chan events.Event,
@@ -470,7 +470,7 @@ func waitForSession(
 	}
 }
 
-func cancelAndEnd(provider runtime.Provider, writer eventSink, sessionID, runID, runLabel, stopReason string, stderr io.Writer) int {
+func cancelAndEnd(provider runtime.Provider, writer EventSink, sessionID, runID, runLabel, stopReason string, stderr io.Writer) int {
 	cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := provider.Cancel(cancelCtx, sessionID); err != nil {
@@ -495,17 +495,17 @@ type eventWriter struct {
 	encoder *json.Encoder
 }
 
-type eventSink interface {
+type EventSink interface {
 	Write(events.Event) error
 	Close() error
 }
 
 type fanoutWriter struct {
-	base    eventSink
+	base    EventSink
 	control *control.ControlServer
 }
 
-func newFanoutWriter(base eventSink, cs *control.ControlServer) eventSink {
+func newFanoutWriter(base EventSink, cs *control.ControlServer) EventSink {
 	if cs == nil {
 		return base
 	}
@@ -582,7 +582,7 @@ func resolvePermission(
 	return permissionResult{source: "none"}
 }
 
-func newEventWriter(path string) (*eventWriter, error) {
+func NewEventWriter(path string) (*eventWriter, error) {
 	if path == "" {
 		return &eventWriter{encoder: json.NewEncoder(io.Discard)}, nil
 	}
@@ -611,7 +611,7 @@ func (w *eventWriter) Close() error {
 	return w.file.Close()
 }
 
-func parsePermissionHandler(value string) (*permission.FileHandler, error) {
+func ParsePermissionHandler(value string) (*permission.FileHandler, error) {
 	const prefix = "file:"
 	if !strings.HasPrefix(value, prefix) {
 		return nil, fmt.Errorf("--permission-handler supports file:<path> only")

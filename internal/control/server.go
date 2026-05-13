@@ -48,6 +48,18 @@ type ControlServer struct {
 
 	interruptMu sync.Mutex
 	interruptCh chan struct{}
+
+	stableHandler StableHandler
+}
+
+type StableHandler interface {
+	Spawn(params json.RawMessage) (any, error)
+	List() any
+	Shutdown(mode string) error
+	RuntimeStatus(runtimeID string) (any, error)
+	RuntimeCancel(runtimeID string) error
+	RuntimePrompt(runtimeID, text string) error
+	RuntimeAnswerPermission(runtimeID, requestID, optionID string) error
 }
 
 type connState struct {
@@ -67,6 +79,21 @@ type subscriber struct {
 
 func NewServer(state *ControlState) *ControlServer {
 	return &ControlServer{state: state, conns: map[*connState]struct{}{}, subs: map[*subscriber]struct{}{}, watch: map[chan events.Event]struct{}{}}
+}
+
+func (s *ControlServer) SetStableHandler(h StableHandler) { s.stableHandler = h }
+
+func runtimeIDFromParams(params json.RawMessage) string {
+	if len(params) == 0 {
+		return ""
+	}
+	var p struct {
+		RuntimeID string `json:"runtime_id"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return ""
+	}
+	return p.RuntimeID
 }
 
 func (s *ControlServer) SetCancelFunc(fn func()) { s.cancelFn = fn }
@@ -338,6 +365,16 @@ func (s *ControlServer) handleConn(c *connState) {
 func (s *ControlServer) dispatch(c *connState, req Request) Response {
 	switch req.Method {
 	case "status":
+		if rtID := runtimeIDFromParams(req.Params); rtID != "" {
+			if s.stableHandler == nil {
+				return failure(req.ID, -32601, "method not found", nil)
+			}
+			result, err := s.stableHandler.RuntimeStatus(rtID)
+			if err != nil {
+				return failure(req.ID, -32000, err.Error(), nil)
+			}
+			return success(req.ID, result)
+		}
 		return success(req.ID, s.state.Snapshot())
 	case "subscribe":
 		sub := &subscriber{conn: c, ch: make(chan events.Event, subscriberBuffer)}
@@ -347,6 +384,18 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 		go sub.loop()
 		return success(req.ID, map[string]any{"subscribed": true})
 	case "cancel":
+		if rtID := runtimeIDFromParams(req.Params); rtID != "" {
+			if s.stableHandler == nil {
+				return failure(req.ID, -32601, "method not found", nil)
+			}
+			if !s.ensureOwner(c) {
+				return failure(req.ID, -32010, "permission_denied", nil)
+			}
+			if err := s.stableHandler.RuntimeCancel(rtID); err != nil {
+				return failure(req.ID, -32000, err.Error(), nil)
+			}
+			return success(req.ID, map[string]any{"ok": true})
+		}
 		if !s.ensureOwner(c) {
 			return failure(req.ID, -32010, "permission_denied", nil)
 		}
@@ -355,6 +404,28 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 		}
 		return success(req.ID, map[string]any{"ok": true})
 	case "answer_permission":
+		if rtID := runtimeIDFromParams(req.Params); rtID != "" {
+			if s.stableHandler == nil {
+				return failure(req.ID, -32601, "method not found", nil)
+			}
+			if !s.ensureOwner(c) {
+				return failure(req.ID, -32010, "permission_denied", nil)
+			}
+			var p struct {
+				RequestID string `json:"request_id"`
+				OptionID  string `json:"option_id"`
+			}
+			if len(req.Params) > 0 {
+				_ = json.Unmarshal(req.Params, &p)
+			}
+			if p.RequestID == "" || p.OptionID == "" {
+				return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"request_id", "option_id"}})
+			}
+			if err := s.stableHandler.RuntimeAnswerPermission(rtID, p.RequestID, p.OptionID); err != nil {
+				return failure(req.ID, -32000, err.Error(), nil)
+			}
+			return success(req.ID, map[string]any{"accepted": true})
+		}
 		if !s.ensureOwner(c) {
 			return failure(req.ID, -32010, "permission_denied", nil)
 		}
@@ -380,6 +451,27 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 		}
 		return success(req.ID, map[string]any{"accepted": true})
 	case "prompt":
+		if rtID := runtimeIDFromParams(req.Params); rtID != "" {
+			if s.stableHandler == nil {
+				return failure(req.ID, -32601, "method not found", nil)
+			}
+			if !s.ensureOwner(c) {
+				return failure(req.ID, -32010, "permission_denied", nil)
+			}
+			var pr struct {
+				Text string `json:"text"`
+			}
+			if len(req.Params) > 0 {
+				_ = json.Unmarshal(req.Params, &pr)
+			}
+			if pr.Text == "" {
+				return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"text"}})
+			}
+			if err := s.stableHandler.RuntimePrompt(rtID, pr.Text); err != nil {
+				return failure(req.ID, -32000, err.Error(), nil)
+			}
+			return success(req.ID, map[string]any{"accepted": true})
+		}
 		if !s.ensureOwner(c) {
 			return failure(req.ID, -32010, "permission_denied", nil)
 		}
@@ -414,6 +506,43 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 		s.InterruptPrompt(ip.Text, ip.KeepQueue)
 		s.state.Update(func(ss *Snapshot) { ss.TurnState = "cancelling" })
 		return success(req.ID, map[string]any{"accepted": true})
+	case "spawn":
+		if !s.ensureOwner(c) {
+			return failure(req.ID, -32010, "permission_denied", nil)
+		}
+		if s.stableHandler == nil {
+			return failure(req.ID, -32601, "method not found", nil)
+		}
+		result, err := s.stableHandler.Spawn(req.Params)
+		if err != nil {
+			return failure(req.ID, -32000, err.Error(), nil)
+		}
+		return success(req.ID, result)
+	case "list":
+		if s.stableHandler == nil {
+			return failure(req.ID, -32601, "method not found", nil)
+		}
+		return success(req.ID, s.stableHandler.List())
+	case "shutdown":
+		if !s.ensureOwner(c) {
+			return failure(req.ID, -32010, "permission_denied", nil)
+		}
+		if s.stableHandler == nil {
+			return failure(req.ID, -32601, "method not found", nil)
+		}
+		var sd struct {
+			Mode string `json:"mode"`
+		}
+		if len(req.Params) > 0 {
+			_ = json.Unmarshal(req.Params, &sd)
+		}
+		if sd.Mode == "" {
+			sd.Mode = "graceful"
+		}
+		if err := s.stableHandler.Shutdown(sd.Mode); err != nil {
+			return failure(req.ID, -32000, err.Error(), nil)
+		}
+		return success(req.ID, map[string]any{"shutting_down": true})
 	default:
 		return failure(req.ID, -32601, "method not found", nil)
 	}

@@ -37,7 +37,7 @@ func runSingleAttempt(
 	ctx context.Context,
 	startOptions runtime.StartOptions,
 	resumeID string,
-	writer eventSink,
+	writer EventSink,
 	fileHandler *permission.FileHandler,
 	controlServer *control.ControlServer,
 	initPrompt string,
@@ -54,7 +54,7 @@ func runSingleAttempt(
 		}
 	}()
 
-	session, err := startSession(ctx, provider, startOptions, resumeID)
+	session, err := StartSession(ctx, provider, startOptions, resumeID)
 	if err != nil {
 		fmt.Fprintf(stderr, "avenor: start session: %v\n", err)
 		return attemptResult{exitCode: 1}
@@ -84,7 +84,7 @@ func runSingleAttempt(
 			promptDone <- provider.Prompt(context.Background(), session.SessionID, prompt)
 		}()
 
-		exitCode := waitForSession(ctx, provider, writer, fileHandler, controlServer, eventCh, promptDone, interruptCh, session.SessionID, runID, runLabel, autoApprove, timer, stderr)
+		exitCode := WaitForSession(ctx, provider, writer, fileHandler, controlServer, eventCh, promptDone, interruptCh, session.SessionID, runID, runLabel, autoApprove, timer, stderr)
 		cancelEvents()
 
 		if controlServer != nil {
@@ -125,7 +125,7 @@ func backoffDelay(attempt int) time.Duration {
 }
 
 // writeRetryEvent emits an avenor.retry event to the writer.
-func writeRetryEvent(writer eventSink, sessionID, runID string, attempt, maxRetries int, runLabel ...string) error {
+func writeRetryEvent(writer EventSink, sessionID, runID string, attempt, maxRetries int, runLabel ...string) error {
 	fields := map[string]any{
 		"attempt":     attempt,
 		"max_retries": maxRetries,

@@ -9,7 +9,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// derivePermBase
+// DerivePermBase
 // ---------------------------------------------------------------------------
 
 func TestDerivePermBase(t *testing.T) {
@@ -52,9 +52,9 @@ func TestDerivePermBase(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := derivePermBase(tt.sentinel)
+			got := DerivePermBase(tt.sentinel)
 			if got != tt.want {
-				t.Fatalf("derivePermBase(%q) = %q, want %q", tt.sentinel, got, tt.want)
+				t.Fatalf("DerivePermBase(%q) = %q, want %q", tt.sentinel, got, tt.want)
 			}
 		})
 	}
@@ -285,7 +285,7 @@ func TestSessionEndFields(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// writeSentinel
+// WriteSentinel
 // ---------------------------------------------------------------------------
 
 func TestWriteSentinel(t *testing.T) {
@@ -299,7 +299,7 @@ func TestWriteSentinel(t *testing.T) {
 		}
 
 		var stderr strings.Builder
-		writeSentinel(sentPath, 0, "ses_write", "end_turn", "", &stderr)
+		WriteSentinel(sentPath, 0, "ses_write", "end_turn", "", &stderr)
 
 		if stderr.Len() > 0 {
 			t.Errorf("unexpected stderr: %s", stderr.String())
@@ -322,7 +322,7 @@ func TestWriteSentinel(t *testing.T) {
 		os.WriteFile(logPath, []byte(""), 0o600)
 
 		var stderr strings.Builder
-		writeSentinel(sentPath, 0, "ses_write", "end_turn", "", &stderr)
+		WriteSentinel(sentPath, 0, "ses_write", "end_turn", "", &stderr)
 
 		entries, _ := os.ReadDir(dir)
 		for _, e := range entries {
@@ -340,7 +340,7 @@ func TestWriteSentinel(t *testing.T) {
 		os.WriteFile(logPath, []byte(""), 0o600)
 
 		var stderr bytes.Buffer
-		writeSentinel(sentPath, 0, "ses_write", "end_turn", "", &stderr)
+		WriteSentinel(sentPath, 0, "ses_write", "end_turn", "", &stderr)
 
 		if stderr.Len() == 0 {
 			t.Error("expected error logged to stderr but got none")

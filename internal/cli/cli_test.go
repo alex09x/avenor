@@ -86,7 +86,7 @@ func TestEffectivePermissionHandlerAutoApproveSkipsDerivedSentinelHandler(t *tes
 	if got := effectivePermissionHandler(sentinel, "", true); got != "" {
 		t.Fatalf("effectivePermissionHandler(autoApprove=true) = %q, want empty", got)
 	}
-	if got := effectivePermissionHandler(sentinel, "", false); got != "file:"+derivePermBase(sentinel) {
+	if got := effectivePermissionHandler(sentinel, "", false); got != "file:"+DerivePermBase(sentinel) {
 		t.Fatalf("effectivePermissionHandler(autoApprove=false) = %q, want derived file handler", got)
 	}
 	if got := effectivePermissionHandler(sentinel, "file:/tmp/custom.perm", true); got != "file:/tmp/custom.perm" {
@@ -134,7 +134,7 @@ func (f *cliFakeProvider) Capabilities(ctx context.Context) (runtime.Capabilitie
 func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -163,12 +163,12 @@ func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) 
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := waitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "review", true, nil, &stderr)
+	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "review", true, nil, &stderr)
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
 	}
 	if code != 0 {
-		t.Fatalf("waitForSession() = %d, want 0; stderr=%s", code, stderr.String())
+		t.Fatalf("WaitForSession() = %d, want 0; stderr=%s", code, stderr.String())
 	}
 	if provider.answerSessionID != "ses_1" || provider.answerRequestID != "req_1" {
 		t.Fatalf("answered session=%q request=%q", provider.answerSessionID, provider.answerRequestID)
@@ -246,7 +246,7 @@ func TestRunCleansSentinelFilesBetweenRetries(t *testing.T) {
 		ctx context.Context,
 		startOptions runtime.StartOptions,
 		resumeID string,
-		writer eventSink,
+		writer EventSink,
 		fileHandler *permission.FileHandler,
 		controlServer *control.ControlServer,
 		prompt string,
@@ -301,7 +301,7 @@ func TestRunCleansSentinelFilesBetweenRetries(t *testing.T) {
 
 func TestWriteRetryEventReturnsWriterError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.ndjson")
-	writer, err := newEventWriter(path)
+	writer, err := NewEventWriter(path)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -314,9 +314,9 @@ func TestWriteRetryEventReturnsWriterError(t *testing.T) {
 }
 
 func TestNewEventWriterNullPath(t *testing.T) {
-	w, err := newEventWriter("")
+	w, err := NewEventWriter("")
 	if err != nil {
-		t.Fatalf("newEventWriter(\"\") error = %v", err)
+		t.Fatalf("NewEventWriter(\"\") error = %v", err)
 	}
 	defer w.Close()
 	// Write should succeed and silently discard.
@@ -444,7 +444,7 @@ func (f *blockingFakeProvider) AnswerPermission(ctx context.Context, sessionID, 
 func TestAutoAnswerGoroutineDoesNotBlockEventLoop(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -469,7 +469,7 @@ func TestAutoAnswerGoroutineDoesNotBlockEventLoop(t *testing.T) {
 	var exitCode int
 	go func() {
 		defer wg.Done()
-		exitCode = waitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, io.Discard)
+		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, io.Discard)
 	}()
 
 	// Wait until AnswerPermission has been called (goroutine is now blocked inside it).
@@ -519,7 +519,7 @@ func TestAutoAnswerGoroutineDoesNotBlockEventLoop(t *testing.T) {
 		t.Fatalf("close writer: %v", err)
 	}
 	if exitCode != 0 {
-		t.Fatalf("waitForSession() = %d, want 0", exitCode)
+		t.Fatalf("WaitForSession() = %d, want 0", exitCode)
 	}
 }
 
@@ -529,7 +529,7 @@ func TestAutoAnswerGoroutineDoesNotBlockEventLoop(t *testing.T) {
 func TestAutoAnswerMissingRequestIDEmitsErrorNotWorking(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -559,12 +559,12 @@ func TestAutoAnswerMissingRequestIDEmitsErrorNotWorking(t *testing.T) {
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := waitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, &stderr)
+	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, &stderr)
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
 	if code != 0 {
-		t.Fatalf("waitForSession() = %d, want 0", code)
+		t.Fatalf("WaitForSession() = %d, want 0", code)
 	}
 	// AnswerPermission must NOT have been called.
 	if provider.answerRequestID != "" {
@@ -597,7 +597,7 @@ func TestAutoAnswerMissingRequestIDEmitsErrorNotWorking(t *testing.T) {
 func TestAutoAnswerEmitsPermissionResponse(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -626,12 +626,12 @@ func TestAutoAnswerEmitsPermissionResponse(t *testing.T) {
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := waitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "mylabel", true, nil, &stderr)
+	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "mylabel", true, nil, &stderr)
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
 	if code != 0 {
-		t.Fatalf("waitForSession() = %d, want 0; stderr=%s", code, stderr.String())
+		t.Fatalf("WaitForSession() = %d, want 0; stderr=%s", code, stderr.String())
 	}
 
 	got := readEventLogForTest(t, eventsPath)
@@ -675,7 +675,7 @@ func TestAutoAnswerEmitsPermissionResponse(t *testing.T) {
 func TestAutoAnswerAnswerPermissionErrorEmitsError(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -705,12 +705,12 @@ func TestAutoAnswerAnswerPermissionErrorEmitsError(t *testing.T) {
 
 	provider := &errorFakeProvider{answerErr: fmt.Errorf("backend unavailable")}
 	var stderr strings.Builder
-	code := waitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, &stderr)
+	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, &stderr)
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
 	}
 	if code != 1 {
-		t.Fatalf("waitForSession() = %d, want 1 (error exit)", code)
+		t.Fatalf("WaitForSession() = %d, want 1 (error exit)", code)
 	}
 
 	got := readEventLogForTest(t, eventsPath)
@@ -736,7 +736,7 @@ func TestAutoAnswerAnswerPermissionErrorEmitsError(t *testing.T) {
 func TestAutoAnswerWorkingStatusEmittedOnPermissionResume(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -760,7 +760,7 @@ func TestAutoAnswerWorkingStatusEmittedOnPermissionResume(t *testing.T) {
 	var exitCode int
 	go func() {
 		defer wg.Done()
-		exitCode = waitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, io.Discard)
+		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, io.Discard)
 	}()
 
 	// Wait until AnswerPermission is called, then unblock it so the
@@ -806,7 +806,7 @@ func TestAutoAnswerWorkingStatusEmittedOnPermissionResume(t *testing.T) {
 		t.Fatalf("close writer: %v", closeErr)
 	}
 	if exitCode != 0 {
-		t.Fatalf("waitForSession() = %d, want 0", exitCode)
+		t.Fatalf("WaitForSession() = %d, want 0", exitCode)
 	}
 
 	got := readEventLogForTest(t, eventsPath)
@@ -843,7 +843,7 @@ func TestControlPermissionResolution(t *testing.T) {
 
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -893,7 +893,7 @@ func TestControlPermissionResolution(t *testing.T) {
 	var exitCode int
 	go func() {
 		defer wg.Done()
-		exitCode = waitForSession(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_ctrl", "run_1", "mylabel", false, nil, io.Discard)
+		exitCode = WaitForSession(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_ctrl", "run_1", "mylabel", false, nil, io.Discard)
 	}()
 
 	// Wait for the permission.request to be processed by the event loop
@@ -927,7 +927,7 @@ func TestControlPermissionResolution(t *testing.T) {
 		t.Fatalf("close writer: %v", err)
 	}
 	if exitCode != 0 {
-		t.Fatalf("waitForSession() = %d, want 0", exitCode)
+		t.Fatalf("WaitForSession() = %d, want 0", exitCode)
 	}
 	if provider.answerRequestID != "req_ctrl" {
 		t.Fatalf("answerRequestID = %q, want req_ctrl", provider.answerRequestID)
@@ -943,7 +943,7 @@ func TestControlPermissionResolution(t *testing.T) {
 func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -967,7 +967,7 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 	var exitCode int
 	go func() {
 		defer wg.Done()
-		exitCode = waitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, io.Discard)
+		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, io.Discard)
 	}()
 
 	// Wait until the first AnswerPermission call is in-flight (blocking).
@@ -996,7 +996,7 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 		t.Fatalf("close writer: %v", closeErr)
 	}
 	if exitCode != 1 {
-		t.Fatalf("waitForSession() = %d, want 1 (duplicate permission guard)", exitCode)
+		t.Fatalf("WaitForSession() = %d, want 1 (duplicate permission guard)", exitCode)
 	}
 
 	got := readEventLogForTest(t, eventsPath)

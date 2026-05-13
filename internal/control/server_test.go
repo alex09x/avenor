@@ -441,3 +441,156 @@ func testSocketPath(t *testing.T) string {
 	t.Helper()
 	return filepath.Join(os.TempDir(), "avc-"+time.Now().Format("150405.000000")+".sock")
 }
+
+type mockStableHandler struct {
+	spawnResult any
+	spawnErr    error
+	listResult  any
+}
+
+func (m *mockStableHandler) Spawn(params json.RawMessage) (any, error) {
+	return m.spawnResult, m.spawnErr
+}
+
+func (m *mockStableHandler) List() any {
+	return m.listResult
+}
+
+func (m *mockStableHandler) Shutdown(mode string) error { return nil }
+
+func (m *mockStableHandler) RuntimeStatus(runtimeID string) (any, error) {
+	return map[string]any{"runtime_id": runtimeID, "status": "running"}, nil
+}
+
+func (m *mockStableHandler) RuntimeCancel(runtimeID string) error { return nil }
+
+func (m *mockStableHandler) RuntimePrompt(runtimeID, text string) error { return nil }
+
+func (m *mockStableHandler) RuntimeAnswerPermission(runtimeID, requestID, optionID string) error {
+	return nil
+}
+
+func TestStableSpawnMethod(t *testing.T) {
+	state := NewState("run_1", "", 0)
+	s := NewServer(state)
+	s.SetStableHandler(&mockStableHandler{
+		spawnResult: map[string]any{"runtime_id": "rt_1", "session_id": "ses_x"},
+	})
+	path := testSocketPath(t)
+	if err := s.Start(path); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Stop()
+
+	c := mustDial(t, path)
+	defer c.Close()
+	params, _ := json.Marshal(map[string]any{"prompt": "hello", "dir": "/tmp"})
+	_ = writeReq(t, c, Request{JSONRPC: "2.0", ID: 1, Method: "spawn", Params: params})
+	r := readResp(t, c)
+	if r.Error != nil {
+		t.Fatalf("spawn error: %+v", r.Error)
+	}
+	res, ok := r.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type: %T", r.Result)
+	}
+	if v, _ := res["runtime_id"].(string); v != "rt_1" {
+		t.Errorf("runtime_id = %q, want rt_1", v)
+	}
+}
+
+func TestStableListMethod(t *testing.T) {
+	state := NewState("run_1", "", 0)
+	s := NewServer(state)
+	s.SetStableHandler(&mockStableHandler{
+		listResult: []map[string]any{
+			{"runtime_id": "rt_1", "status": "running"},
+		},
+	})
+	path := testSocketPath(t)
+	if err := s.Start(path); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Stop()
+
+	c := mustDial(t, path)
+	defer c.Close()
+	_ = writeReq(t, c, Request{JSONRPC: "2.0", ID: 1, Method: "list"})
+	r := readResp(t, c)
+	if r.Error != nil {
+		t.Fatalf("list error: %+v", r.Error)
+	}
+	list, ok := r.Result.([]any)
+	if !ok {
+		t.Fatalf("result type: %T", r.Result)
+	}
+	if len(list) != 1 {
+		t.Fatalf("len(list) = %d, want 1", len(list))
+	}
+}
+
+func TestStableStatusWithRuntimeID(t *testing.T) {
+	state := NewState("run_1", "", 0)
+	s := NewServer(state)
+	s.SetStableHandler(&mockStableHandler{})
+	path := testSocketPath(t)
+	if err := s.Start(path); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Stop()
+
+	c := mustDial(t, path)
+	defer c.Close()
+	params, _ := json.Marshal(map[string]any{"runtime_id": "rt_1"})
+	_ = writeReq(t, c, Request{JSONRPC: "2.0", ID: 1, Method: "status", Params: params})
+	r := readResp(t, c)
+	if r.Error != nil {
+		t.Fatalf("status error: %+v", r.Error)
+	}
+	res, ok := r.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type: %T", r.Result)
+	}
+	if v, _ := res["runtime_id"].(string); v != "rt_1" {
+		t.Errorf("runtime_id = %q, want rt_1", v)
+	}
+}
+
+func TestStableCancelWithRuntimeID(t *testing.T) {
+	state := NewState("run_1", "", 0)
+	s := NewServer(state)
+	s.SetStableHandler(&mockStableHandler{})
+	path := testSocketPath(t)
+	if err := s.Start(path); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Stop()
+
+	c := mustDial(t, path)
+	defer c.Close()
+	params, _ := json.Marshal(map[string]any{"runtime_id": "rt_1"})
+	_ = writeReq(t, c, Request{JSONRPC: "2.0", ID: 1, Method: "cancel", Params: params})
+	r := readResp(t, c)
+	if r.Error != nil {
+		t.Fatalf("cancel error: %+v", r.Error)
+	}
+}
+
+func TestStableSpawnRejectedWithoutHandler(t *testing.T) {
+	state := NewState("run_1", "", 0)
+	s := NewServer(state)
+	path := testSocketPath(t)
+	if err := s.Start(path); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Stop()
+
+	c := mustDial(t, path)
+	defer c.Close()
+	params, _ := json.Marshal(map[string]any{"prompt": "hello", "dir": "/tmp"})
+	_ = writeReq(t, c, Request{JSONRPC: "2.0", ID: 1, Method: "spawn", Params: params})
+	r := readResp(t, c)
+	if r.Error == nil || r.Error.Code != -32601 {
+		t.Fatalf("expected -32601 method not found, got %+v", r.Error)
+	}
+}
