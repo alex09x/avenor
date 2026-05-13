@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sdougbrown/avenor/internal/events"
@@ -77,11 +78,16 @@ func (s *ControlServer) Start(socketPath string) error {
 		}
 		_ = os.Remove(socketPath)
 	}
+	oldMask := syscall.Umask(0o077)
 	l, err := net.Listen("unix", socketPath)
+	syscall.Umask(oldMask)
 	if err != nil {
 		return err
 	}
-	_ = os.Chmod(socketPath, 0o600)
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		_ = l.Close()
+		return fmt.Errorf("chmod control socket: %w", err)
+	}
 
 	s.mu.Lock()
 	s.listener = l

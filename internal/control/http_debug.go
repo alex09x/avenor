@@ -46,12 +46,20 @@ func (h *HTTPDebugServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !isLocalhost(r.Host) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	writeJSON(w, h.control.state.Snapshot())
 }
 
 func (h *HTTPDebugServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !isLocalhost(r.Host) {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -75,6 +83,10 @@ func (h *HTTPDebugServer) handleCancel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !isLocalhost(r.Host) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
 	if h.control.cancelFn != nil {
 		h.control.cancelFn()
 	}
@@ -84,6 +96,10 @@ func (h *HTTPDebugServer) handleCancel(w http.ResponseWriter, r *http.Request) {
 func (h *HTTPDebugServer) handleAnswerPermission(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !isLocalhost(r.Host) {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	var p PermissionAnswer
@@ -109,4 +125,12 @@ func (h *HTTPDebugServer) handleAnswerPermission(w http.ResponseWriter, r *http.
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func isLocalhost(host string) bool {
+	h, _, err := net.SplitHostPort(host)
+	if err != nil {
+		h = host
+	}
+	return h == "localhost" || h == "127.0.0.1" || h == "::1"
 }

@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,7 +52,48 @@ func TestOwnerRejectionForMutatingMethods(t *testing.T) {
 	_ = writeReq(t, c2, Request{JSONRPC: "2.0", ID: 2, Method: "cancel"})
 	r2 := readResp(t, c2)
 	if r2.Error == nil || r2.Error.Code != -32010 {
-		t.Fatalf("expected permission denied, got %+v", r2)
+		t.Fatalf("expected permission denied for cancel, got %+v", r2)
+	}
+
+	apParams, _ := json.Marshal(PermissionAnswer{RequestID: "req_1", OptionID: "allow"})
+	_ = writeReq(t, c2, Request{JSONRPC: "2.0", ID: 3, Method: "answer_permission", Params: apParams})
+	r3 := readResp(t, c2)
+	if r3.Error == nil || r3.Error.Code != -32010 {
+		t.Fatalf("expected permission denied for answer_permission, got %+v", r3)
+	}
+}
+
+func TestOwnershipTransferOnDisconnect(t *testing.T) {
+	state := NewState("run_1", "", 0)
+	s := NewServer(state)
+	path := testSocketPath(t)
+	if err := s.Start(path); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Stop()
+
+	c1 := mustDial(t, path)
+	_ = writeReq(t, c1, Request{JSONRPC: "2.0", ID: 1, Method: "cancel"})
+	r1 := readResp(t, c1)
+	if r1.Error != nil {
+		t.Fatalf("owner cancel failed: %+v", r1.Error)
+	}
+	c1.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	c2 := mustDial(t, path)
+	defer c2.Close()
+	_ = writeReq(t, c2, Request{JSONRPC: "2.0", ID: 2, Method: "cancel"})
+	r2 := readResp(t, c2)
+	if r2.Error != nil {
+		t.Fatalf("new owner cancel failed: %+v", r2.Error)
+	}
+	res, ok := r2.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type: %T", r2.Result)
+	}
+	if v, _ := res["ok"].(bool); !v {
+		t.Fatal("expected ok=true")
 	}
 }
 
@@ -69,7 +112,11 @@ func TestSubscriberBackpressureLaggedEvent(t *testing.T) {
 	}
 	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
 	scanner := bufio.NewScanner(client)
-	foundLag := false
+	var (
+		foundLag     bool
+		eventCount   int
+		droppedCount float64
+	)
 	for scanner.Scan() {
 		var n Notification
 		if err := json.Unmarshal(scanner.Bytes(), &n); err != nil {
@@ -77,14 +124,23 @@ func TestSubscriberBackpressureLaggedEvent(t *testing.T) {
 		}
 		if n.Method == "event" {
 			m, _ := n.Params.(map[string]any)
-			if ev, _ := m["event"].(string); ev == "subscriber.lagged" {
+			ev, _ := m["event"].(string)
+			if ev == "subscriber.lagged" {
 				foundLag = true
-				break
+				droppedCount, _ = m["dropped_count"].(float64)
+			} else {
+				eventCount++
 			}
 		}
 	}
 	if !foundLag {
 		t.Fatal("expected subscriber.lagged notification")
+	}
+	if droppedCount <= 0 {
+		t.Fatalf("expected dropped_count > 0, got %v", droppedCount)
+	}
+	if eventCount == 0 {
+		t.Fatal("expected at least one event notification")
 	}
 }
 
@@ -100,11 +156,35 @@ func TestSubscribeAndStatus(t *testing.T) {
 	c := mustDial(t, path)
 	defer c.Close()
 	_ = writeReq(t, c, Request{JSONRPC: "2.0", ID: 1, Method: "subscribe"})
-	_ = readResp(t, c)
+	r1 := readResp(t, c)
+	if r1.Error != nil {
+		t.Fatalf("subscribe error: %+v", r1.Error)
+	}
+	res1, ok := r1.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("subscribe result type: %T", r1.Result)
+	}
+	if subscribed, _ := res1["subscribed"].(bool); !subscribed {
+		t.Fatal("expected subscribed=true")
+	}
 	_ = writeReq(t, c, Request{JSONRPC: "2.0", ID: 2, Method: "status"})
 	r := readResp(t, c)
 	if r.Error != nil {
 		t.Fatalf("status error: %+v", r.Error)
+	}
+	res, ok := r.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("status result type: %T", r.Result)
+	}
+	if runID, _ := res["run_id"].(string); runID != "run_1" {
+		t.Fatalf("run_id = %q, want run_1", runID)
+	}
+	if runLabel, _ := res["run_label"].(string); runLabel != "label" {
+		t.Fatalf("run_label = %q, want label", runLabel)
+	}
+	mr, _ := res["max_retries"].(float64)
+	if int(mr) != 2 {
+		t.Fatalf("max_retries = %v, want 2", mr)
 	}
 }
 
@@ -149,10 +229,59 @@ func TestHTTPDebugStatusAndCancel(t *testing.T) {
 	state := NewState("run_1", "", 0)
 	s := NewServer(state)
 	h := NewHTTPDebugServer("127.0.0.1:0", s)
-	if err := h.Start(); err != nil {
-		t.Fatalf("http start: %v", err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
 	}
+	addr := ln.Addr().String()
+	go func() { _ = h.server.Serve(ln) }()
 	defer h.Stop(context.Background())
+
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	// GET /status — assert 200 and run_id
+	resp, err := client.Get("http://" + addr + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /status: %d, want 200", resp.StatusCode)
+	}
+	var status Snapshot
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatalf("decode /status: %v", err)
+	}
+	if status.RunID != "run_1" {
+		t.Fatalf("run_id = %q, want run_1", status.RunID)
+	}
+
+	// POST /cancel — assert 200 and ok:true
+	resp, err = client.Post("http://"+addr+"/cancel", "application/json", http.NoBody)
+	if err != nil {
+		t.Fatalf("POST /cancel: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /cancel: %d, want 200", resp.StatusCode)
+	}
+	var cancelResult map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&cancelResult); err != nil {
+		t.Fatalf("decode /cancel: %v", err)
+	}
+	if v, _ := cancelResult["ok"].(bool); !v {
+		t.Fatalf("cancel ok = %v, want true", cancelResult["ok"])
+	}
+
+	// POST /answer-permission with no pending permission — assert 409
+	resp, err = client.Post("http://"+addr+"/answer-permission", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("POST /answer-permission: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("POST /answer-permission: %d, want 409", resp.StatusCode)
+	}
 }
 
 func testSocketPath(t *testing.T) string {

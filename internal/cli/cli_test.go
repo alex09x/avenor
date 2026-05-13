@@ -1,10 +1,12 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -824,6 +826,108 @@ func TestAutoAnswerWorkingStatusEmittedOnPermissionResume(t *testing.T) {
 	}
 	if !workingAfterRequest {
 		t.Fatalf("agent.status working not emitted after permission resolved; events: %+v", got)
+	}
+}
+
+// TestControlPermissionResolution verifies that a control socket owner can
+// answer a permission.request via answer_permission, which flows through
+// resolvePermission and calls AnswerPermission on the provider.
+func TestControlPermissionResolution(t *testing.T) {
+	state := control.NewState("run_1", "mylabel", 0)
+	cs := control.NewServer(state)
+	socketPath := filepath.Join(t.TempDir(), "cs.sock")
+	if err := cs.Start(socketPath); err != nil {
+		t.Fatalf("start control: %v", err)
+	}
+	defer cs.Stop()
+
+	dir := t.TempDir()
+	eventsPath := filepath.Join(dir, "events.ndjson")
+	writer, err := newEventWriter(eventsPath)
+	if err != nil {
+		t.Fatalf("newEventWriter: %v", err)
+	}
+
+	eventCh := make(chan events.Event, 2)
+	eventCh <- events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_ctrl",
+		Fields: map[string]any{
+			"request_id": "req_ctrl",
+			"question":   "Allow?",
+			"options": []any{
+				map[string]any{"optionId": "deny", "kind": "reject"},
+				map[string]any{"optionId": "allow_x", "kind": "allow"},
+			},
+		},
+	}
+	eventCh <- events.Event{
+		Event:     "session.end",
+		SessionID: "ses_ctrl",
+		Fields:    map[string]any{"stop_reason": "end_turn"},
+	}
+	close(eventCh)
+	promptDone := make(chan error, 1)
+	promptDone <- nil
+
+	provider := &cliFakeProvider{}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var exitCode int
+	go func() {
+		defer wg.Done()
+		exitCode = waitForSession(context.Background(), provider, writer, nil, cs, eventCh, promptDone, "ses_ctrl", "run_1", "mylabel", false, nil, io.Discard)
+	}()
+
+	// Connect to the control socket and claim ownership by answering the permission
+	deadline := time.Now().Add(5 * time.Second)
+	var ctrlConn net.Conn
+	for {
+		ctrlConn, err = net.DialTimeout("unix", socketPath, 2*time.Second)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dial control socket: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	defer ctrlConn.Close()
+
+	params, _ := json.Marshal(control.PermissionAnswer{RequestID: "req_ctrl", OptionID: "allow_x"})
+	req := control.Request{JSONRPC: "2.0", ID: 1, Method: "answer_permission", Params: params}
+	b, _ := json.Marshal(req)
+	b = append(b, '\n')
+	if _, err := ctrlConn.Write(b); err != nil {
+		t.Fatalf("write answer_permission: %v", err)
+	}
+
+	_ = ctrlConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	scanner := bufio.NewScanner(ctrlConn)
+	if !scanner.Scan() {
+		t.Fatal("no response to answer_permission")
+	}
+	var resp control.Response
+	if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("answer_permission error: %+v", resp.Error)
+	}
+
+	wg.Wait()
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("waitForSession() = %d, want 0", exitCode)
+	}
+	if provider.answerRequestID != "req_ctrl" {
+		t.Fatalf("answerRequestID = %q, want req_ctrl", provider.answerRequestID)
+	}
+	if provider.answerResponse.OptionID != "allow_x" {
+		t.Fatalf("optionID = %q, want allow_x", provider.answerResponse.OptionID)
 	}
 }
 

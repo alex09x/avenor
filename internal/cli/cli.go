@@ -445,9 +445,9 @@ func waitForSession(
 			}
 			if res.requestID != "" {
 				emitPermissionResponse(res.requestID, res.optionID, res.source)
-			}
-			if !writeStatus(tracker.PermissionAnswered()) {
-				return 1
+				if !writeStatus(tracker.PermissionAnswered()) {
+					return 1
+				}
 			}
 			// If session.end + promptDone already arrived while we were waiting for
 			// AnswerPermission, exit now that the permission goroutine has resolved.
@@ -516,7 +516,7 @@ func (f *fanoutWriter) Close() error { return f.base.Close() }
 
 func permissionKindFromOptionID(optionID string) string {
 	id := strings.ToLower(optionID)
-	if strings.Contains(id, "allow") || strings.Contains(id, "approve") {
+	if strings.HasPrefix(id, "allow") || strings.HasPrefix(id, "approve") {
 		return "allow"
 	}
 	return "reject"
