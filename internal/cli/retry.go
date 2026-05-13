@@ -29,6 +29,7 @@ func runSingleAttempt(
 	fileHandler *permission.FileHandler,
 	prompt string,
 	runID string,
+	autoApprove bool,
 	timer <-chan time.Time,
 	stderr io.Writer,
 ) attemptResult {
@@ -59,7 +60,7 @@ func runSingleAttempt(
 		promptDone <- provider.Prompt(ctx, session.SessionID, prompt)
 	}()
 
-	exitCode := waitForSession(ctx, provider, writer, fileHandler, eventCh, promptDone, session.SessionID, runID, timer, stderr)
+	exitCode := waitForSession(ctx, provider, writer, fileHandler, eventCh, promptDone, session.SessionID, runID, autoApprove, timer, stderr)
 	return attemptResult{exitCode: exitCode, sessionID: session.SessionID}
 }
 

@@ -291,7 +291,7 @@ func TestWriteSentinel(t *testing.T) {
 		}
 
 		var stderr strings.Builder
-		writeSentinel(sentPath, 0, logPath, "", &stderr)
+		writeSentinel(sentPath, 0, "ses_write", "end_turn", "", &stderr)
 
 		if stderr.Len() > 0 {
 			t.Errorf("unexpected stderr: %s", stderr.String())
@@ -314,7 +314,7 @@ func TestWriteSentinel(t *testing.T) {
 		os.WriteFile(logPath, []byte(""), 0o600)
 
 		var stderr strings.Builder
-		writeSentinel(sentPath, 0, logPath, "", &stderr)
+		writeSentinel(sentPath, 0, "ses_write", "end_turn", "", &stderr)
 
 		entries, _ := os.ReadDir(dir)
 		for _, e := range entries {
@@ -332,7 +332,7 @@ func TestWriteSentinel(t *testing.T) {
 		os.WriteFile(logPath, []byte(""), 0o600)
 
 		var stderr bytes.Buffer
-		writeSentinel(sentPath, 0, logPath, "", &stderr)
+		writeSentinel(sentPath, 0, "ses_write", "end_turn", "", &stderr)
 
 		if stderr.Len() == 0 {
 			t.Error("expected error logged to stderr but got none")

@@ -1,6 +1,81 @@
 package cli
 
-import "testing"
+import (
+	"testing"
+)
+
+func TestSelectPermissionOption(t *testing.T) {
+	opts := func(pairs ...string) []any {
+		out := make([]any, 0, len(pairs)/2)
+		for i := 0; i+1 < len(pairs); i += 2 {
+			out = append(out, map[string]any{"optionId": pairs[i], "kind": pairs[i+1]})
+		}
+		return out
+	}
+
+	tests := []struct {
+		name    string
+		options []any
+		approve bool
+		want    string
+	}{
+		{
+			name:    "approve picks approve-kind",
+			options: opts("r1", "reject", "a1", "approve"),
+			approve: true,
+			want:    "a1",
+		},
+		{
+			name:    "reject picks reject-kind",
+			options: opts("r1", "reject", "a1", "approve"),
+			approve: false,
+			want:    "r1",
+		},
+		{
+			name:    "fallback to first when no matching kind",
+			options: opts("x1", "other"),
+			approve: true,
+			want:    "x1",
+		},
+		{
+			name:    "empty options returns empty string",
+			options: nil,
+			approve: true,
+			want:    "",
+		},
+		{
+			name:    "approve prefix match (approve_session)",
+			options: opts("a2", "approve_session"),
+			approve: true,
+			want:    "a2",
+		},
+		{
+			name:    "reject prefix match (reject_all)",
+			options: opts("r2", "reject_all"),
+			approve: false,
+			want:    "r2",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := selectPermissionOption(tt.options, tt.approve); got != tt.want {
+				t.Errorf("selectPermissionOption(approve=%v) = %q, want %q", tt.approve, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewEventWriterNullPath(t *testing.T) {
+	w, err := newEventWriter("")
+	if err != nil {
+		t.Fatalf("newEventWriter(\"\") error = %v", err)
+	}
+	defer w.Close()
+	// Write should succeed and silently discard.
+	if err := w.Write(makeEvent("agent.status", nil)); err != nil {
+		t.Fatalf("Write() to null writer error = %v", err)
+	}
+}
 
 func TestDiscoverServerSelection(t *testing.T) {
 	env := func(key string) string {

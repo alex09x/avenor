@@ -60,11 +60,12 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 
 	agent := fs.String("agent", "", "agent name")
 	label := fs.String("label", "", "free-form label for log correlation")
-	promptFile := fs.String("prompt-file", "", "path to prompt file")
+	promptFile := fs.String("prompt-file", "", "path to prompt file (mutually exclusive with --prompt)")
+	prompt := fs.String("prompt", "", "inline prompt text (mutually exclusive with --prompt-file)")
 	dir := fs.String("dir", ".", "working directory for the agent")
 	resume := fs.String("resume", "", "resume an existing session id")
 	serverURL := fs.String("server-url", "", "long-lived ACP server endpoint")
-	onEvent := fs.String("on-event", "", "path to write NDJSON events")
+	onEvent := fs.String("on-event", "", "path to write NDJSON events (optional; events are discarded if unset)")
 	permissionHandler := fs.String("permission-handler", "", "permission handler, supports file:<path>")
 	sentinelFile := fs.String("sentinel-file", "", "path to write a completion sentinel (also derives permission base unless --permission-handler is set)")
 	timeout := fs.Duration("timeout", 0, "overall session timeout")
@@ -72,6 +73,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	backend := fs.String("backend", defaultBackend, "runtime backend")
 	runIDFlag := fs.String("run-id", "", "correlation id for this run (generated if not set)")
 	maxRetries := fs.Int("max-retries", 0, "maximum retry attempts on transient failure (0 = no retry)")
+	autoApprove := fs.Bool("auto-approve", false, "automatically approve all permission requests")
 
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -82,15 +84,13 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		runID = generateRunID()
 	}
 
-	// Helper to write sentinel and return the provided exit code. Used at
-	// every return path when --sentinel-file is active. Defined immediately
-	// after fs.Parse so it is available for all post-parse return paths.
-	// When *onEvent is empty (flag-validation failures), sessionEndFields
-	// will open-fail silently and produce empty strings — the sentinel will
-	// still be written with FAILED/exit_1 so stableboy gets a signal.
+	// finalSessionID is updated after each attempt so exitWithSentinel always
+	// writes the most recent session ID regardless of which return path fires.
+	var finalSessionID string
+
 	exitWithSentinel := func(code int) int {
 		if *sentinelFile != "" {
-			writeSentinel(*sentinelFile, code, *onEvent, runID, stderr)
+			writeSentinel(*sentinelFile, code, finalSessionID, runtime.StopReasonForExitCode(code), runID, stderr)
 		}
 		return code
 	}
@@ -99,12 +99,12 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "avenor: unknown backend %q\n", *backend)
 		return exitWithSentinel(1)
 	}
-	if *promptFile == "" {
-		fmt.Fprintln(stderr, "avenor: --prompt-file is required")
+	if *prompt != "" && *promptFile != "" {
+		fmt.Fprintln(stderr, "avenor: --prompt and --prompt-file are mutually exclusive")
 		return exitWithSentinel(1)
 	}
-	if *onEvent == "" {
-		fmt.Fprintln(stderr, "avenor: --on-event is required")
+	if *prompt == "" && *promptFile == "" {
+		fmt.Fprintln(stderr, "avenor: --prompt or --prompt-file is required")
 		return exitWithSentinel(1)
 	}
 
@@ -131,10 +131,16 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		cleanupSentinelFiles(*sentinelFile, cleanupPermBase, stderr)
 	}
 
-	prompt, err := os.ReadFile(*promptFile)
-	if err != nil {
-		fmt.Fprintf(stderr, "avenor: read prompt file: %v\n", err)
-		return exitWithSentinel(1)
+	var promptText []byte
+	if *prompt != "" {
+		promptText = []byte(*prompt)
+	} else {
+		p, err := os.ReadFile(*promptFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "avenor: read prompt file: %v\n", err)
+			return exitWithSentinel(1)
+		}
+		promptText = p
 	}
 
 	writer, err := newEventWriter(*onEvent)
@@ -175,7 +181,8 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	resumeID := *resume
 	var result attemptResult
 	for attempt := 1; ; attempt++ {
-		result = runSingleAttempt(ctx, startOptions, resumeID, writer, fileHandler, string(prompt), runID, timer, stderr)
+		result = runSingleAttempt(ctx, startOptions, resumeID, writer, fileHandler, string(promptText), runID, *autoApprove, timer, stderr)
+		finalSessionID = result.sessionID
 
 		if result.exitCode != 1 || attempt > *maxRetries {
 			break
@@ -206,6 +213,33 @@ func startSession(ctx context.Context, provider runtime.Provider, opts runtime.S
 	return provider.Start(ctx, opts)
 }
 
+// selectPermissionOption picks an option ID from the permission event's
+// options slice, preferring approve-kind options when approve is true and
+// reject-kind options otherwise. Falls back to the first option if no
+// preferred kind is found.
+func selectPermissionOption(options []any, approve bool) string {
+	want := "reject"
+	if approve {
+		want = "approve"
+	}
+	fallback := ""
+	for _, opt := range options {
+		m, ok := opt.(map[string]any)
+		if !ok {
+			continue
+		}
+		optID, _ := m["optionId"].(string)
+		kind := strings.ToLower(fmt.Sprint(m["kind"]))
+		if fallback == "" && optID != "" {
+			fallback = optID
+		}
+		if strings.HasPrefix(kind, want) {
+			return optID
+		}
+	}
+	return fallback
+}
+
 func waitForSession(
 	ctx context.Context,
 	provider runtime.Provider,
@@ -215,6 +249,7 @@ func waitForSession(
 	promptDone <-chan error,
 	sessionID string,
 	runID string,
+	autoApprove bool,
 	timeout <-chan time.Time,
 	stderr io.Writer,
 ) int {
@@ -259,17 +294,32 @@ func waitForSession(
 					return 1
 				}
 			}
-			if event.Event == "permission.request" && fileHandler != nil {
-				if permissionDone != nil {
-					emitErrorEvent(writer, sessionID, runID, "permission", "another permission request is already pending", stderr)
+			if event.Event == "permission.request" {
+				if fileHandler != nil {
+					if permissionDone != nil {
+						emitErrorEvent(writer, sessionID, runID, "permission", "another permission request is already pending", stderr)
+						return 1
+					}
+					done := make(chan error, 1)
+					permissionDone = done
+					go func() {
+						done <- fileHandler.Handle(ctx, provider, event, writer.Write)
+					}()
+					continue
+				}
+				// No file handler: auto-answer immediately (approve or reject).
+				requestID, _ := event.Fields["request_id"].(string)
+				options, _ := event.Fields["options"].([]any)
+				optionID := selectPermissionOption(options, autoApprove)
+				if requestID != "" {
+					resp := runtime.PermissionResponse{Outcome: "selected", OptionID: optionID}
+					if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
+						emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("auto-answer permission: %v", err), stderr)
+					}
+				}
+				if !writeStatus(tracker.PermissionAnswered()) {
 					return 1
 				}
-				done := make(chan error, 1)
-				permissionDone = done
-				go func() {
-					done <- fileHandler.Handle(ctx, provider, event, writer.Write)
-				}()
-				continue
 			}
 			if event.Event == "session.end" {
 				finalStopReason, _ = event.Fields["stop_reason"].(string)
@@ -336,6 +386,9 @@ type eventWriter struct {
 }
 
 func newEventWriter(path string) (*eventWriter, error) {
+	if path == "" {
+		return &eventWriter{encoder: json.NewEncoder(io.Discard)}, nil
+	}
 	file, err := os.Create(path)
 	if err != nil {
 		return nil, err
@@ -355,6 +408,9 @@ func (w *eventWriter) Write(event events.Event) error {
 func (w *eventWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.file == nil {
+		return nil
+	}
 	return w.file.Close()
 }
 

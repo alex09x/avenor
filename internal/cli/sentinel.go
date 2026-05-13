@@ -107,10 +107,9 @@ func sessionEndFields(eventLogPath string) (sessionID, stopReason string) {
 }
 
 // writeSentinel writes the completion sentinel file at path using an
-// atomic tmp+rename strategy. It extracts session metadata from the event log.
-// Errors are logged to stderr but never affect the caller's exit code.
-func writeSentinel(path string, exitCode int, eventLogPath, runID string, stderr io.Writer) {
-	sessionID, stopReason := sessionEndFields(eventLogPath)
+// atomic tmp+rename strategy. Errors are logged to stderr but never affect
+// the caller's exit code.
+func writeSentinel(path string, exitCode int, sessionID, stopReason, runID string, stderr io.Writer) {
 	content := sentinelContent(exitCode, sessionID, stopReason, runID)
 
 	dir := filepath.Dir(path)
