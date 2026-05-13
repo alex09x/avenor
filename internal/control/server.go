@@ -1,0 +1,386 @@
+package control
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/sdougbrown/avenor/internal/events"
+)
+
+const subscriberBuffer = 256
+
+type PermissionAnswer struct {
+	RequestID string `json:"request_id"`
+	OptionID  string `json:"option_id"`
+}
+
+type ControlServer struct {
+	state *ControlState
+
+	mu       sync.Mutex
+	listener net.Listener
+	path     string
+	stopped  bool
+
+	conns map[*connState]struct{}
+	subs  map[*subscriber]struct{}
+	owner *connState
+	watch map[chan events.Event]struct{}
+
+	cancelFn func()
+
+	pendingMu      sync.Mutex
+	pendingRequest string
+	pendingAnswer  chan PermissionAnswer
+}
+
+type connState struct {
+	id      uint64
+	server  *ControlServer
+	conn    net.Conn
+	wmu     sync.Mutex
+	closed  bool
+	isOwner bool
+}
+
+type subscriber struct {
+	conn    *connState
+	ch      chan events.Event
+	dropped int
+}
+
+func NewServer(state *ControlState) *ControlServer {
+	return &ControlServer{state: state, conns: map[*connState]struct{}{}, subs: map[*subscriber]struct{}{}, watch: map[chan events.Event]struct{}{}}
+}
+
+func (s *ControlServer) SetCancelFunc(fn func()) { s.cancelFn = fn }
+
+func (s *ControlServer) Start(socketPath string) error {
+	if socketPath == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		return fmt.Errorf("create control socket dir: %w", err)
+	}
+	if _, err := os.Stat(socketPath); err == nil {
+		if c, dialErr := net.DialTimeout("unix", socketPath, 250*time.Millisecond); dialErr == nil {
+			_ = c.Close()
+			return fmt.Errorf("control socket already in use: %s", socketPath)
+		}
+		_ = os.Remove(socketPath)
+	}
+	l, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return err
+	}
+	_ = os.Chmod(socketPath, 0o600)
+
+	s.mu.Lock()
+	s.listener = l
+	s.path = socketPath
+	s.mu.Unlock()
+
+	go s.acceptLoop()
+	return nil
+}
+
+func (s *ControlServer) Stop() {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	s.stopped = true
+	l := s.listener
+	path := s.path
+	conns := make([]*connState, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+
+	if l != nil {
+		_ = l.Close()
+	}
+	for _, c := range conns {
+		_ = c.conn.Close()
+	}
+	if path != "" {
+		_ = os.Remove(path)
+	}
+}
+
+func (s *ControlServer) SubscribeEvents(ctx context.Context) <-chan events.Event {
+	ch := make(chan events.Event, subscriberBuffer)
+	s.mu.Lock()
+	s.watch[ch] = struct{}{}
+	s.mu.Unlock()
+	go func() {
+		<-ctx.Done()
+		s.mu.Lock()
+		delete(s.watch, ch)
+		s.mu.Unlock()
+		close(ch)
+	}()
+	return ch
+}
+
+func (s *ControlServer) PublishEvent(event events.Event) {
+	s.state.Update(func(ss *Snapshot) {
+		ss.LastEvent = event.Event
+		if event.SessionID != "" {
+			ss.SessionID = event.SessionID
+		}
+		if event.Event == "agent.status" {
+			if phase, _ := event.Fields["phase"].(string); phase != "" {
+				ss.Phase = phase
+			}
+			if label, _ := event.Fields["label"].(string); label != "" {
+				ss.PhaseLabel = label
+			}
+		}
+		if event.Event == "permission.request" {
+			ss.PendingPermission = true
+			ss.Permission = map[string]any{}
+			for k, v := range event.Fields {
+				ss.Permission[k] = v
+			}
+		}
+		if event.Event == "permission.response" {
+			ss.PendingPermission = false
+			ss.Permission = nil
+		}
+	})
+
+	s.mu.Lock()
+	subs := make([]*subscriber, 0, len(s.subs))
+	for sub := range s.subs {
+		subs = append(subs, sub)
+	}
+	watch := make([]chan events.Event, 0, len(s.watch))
+	for ch := range s.watch {
+		watch = append(watch, ch)
+	}
+	s.mu.Unlock()
+
+	for _, sub := range subs {
+		sub.enqueue(event)
+	}
+	for _, ch := range watch {
+		select {
+		case ch <- event:
+		default:
+			select {
+			case <-ch:
+			default:
+			}
+			select {
+			case ch <- event:
+			default:
+			}
+		}
+	}
+}
+
+func (s *ControlServer) BeginPermissionClaim(requestID string) <-chan PermissionAnswer {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	s.pendingRequest = requestID
+	s.pendingAnswer = make(chan PermissionAnswer, 1)
+	return s.pendingAnswer
+}
+
+func (s *ControlServer) EndPermissionClaim(requestID string) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if s.pendingRequest == requestID {
+		s.pendingRequest = ""
+		s.pendingAnswer = nil
+	}
+}
+
+func (s *ControlServer) acceptLoop() {
+	var seq uint64
+	for {
+		s.mu.Lock()
+		l := s.listener
+		stopped := s.stopped
+		s.mu.Unlock()
+		if stopped || l == nil {
+			return
+		}
+		conn, err := l.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			continue
+		}
+		seq++
+		cs := &connState{id: seq, server: s, conn: conn}
+		s.mu.Lock()
+		s.conns[cs] = struct{}{}
+		s.mu.Unlock()
+		go s.handleConn(cs)
+	}
+}
+
+func (s *ControlServer) handleConn(c *connState) {
+	defer s.disconnect(c)
+	scanner := bufio.NewScanner(c.conn)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 4*1024*1024)
+	for scanner.Scan() {
+		var req Request
+		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+			_ = c.writeJSON(failure(nil, -32700, "parse error", nil))
+			continue
+		}
+		if req.JSONRPC != "2.0" {
+			_ = c.writeJSON(failure(req.ID, -32600, "invalid request", nil))
+			continue
+		}
+		res := s.dispatch(c, req)
+		if req.ID != nil {
+			_ = c.writeJSON(res)
+		}
+	}
+}
+
+func (s *ControlServer) dispatch(c *connState, req Request) Response {
+	switch req.Method {
+	case "status":
+		return success(req.ID, s.state.Snapshot())
+	case "subscribe":
+		sub := &subscriber{conn: c, ch: make(chan events.Event, subscriberBuffer)}
+		s.mu.Lock()
+		s.subs[sub] = struct{}{}
+		s.mu.Unlock()
+		go sub.loop()
+		return success(req.ID, map[string]any{"subscribed": true})
+	case "cancel":
+		if !s.ensureOwner(c) {
+			return failure(req.ID, -32010, "permission_denied", nil)
+		}
+		if s.cancelFn != nil {
+			s.cancelFn()
+		}
+		return success(req.ID, map[string]any{"ok": true})
+	case "answer_permission":
+		if !s.ensureOwner(c) {
+			return failure(req.ID, -32010, "permission_denied", nil)
+		}
+		var p PermissionAnswer
+		if len(req.Params) > 0 {
+			if err := json.Unmarshal(req.Params, &p); err != nil {
+				return failure(req.ID, -32602, "invalid params", nil)
+			}
+		}
+		if p.RequestID == "" || p.OptionID == "" {
+			return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"request_id", "option_id"}})
+		}
+		s.pendingMu.Lock()
+		pendingReq := s.pendingRequest
+		pending := s.pendingAnswer
+		s.pendingMu.Unlock()
+		if pending == nil || pendingReq != p.RequestID {
+			return failure(req.ID, -32001, "no_pending_permission", nil)
+		}
+		select {
+		case pending <- p:
+		default:
+		}
+		return success(req.ID, map[string]any{"accepted": true})
+	default:
+		return failure(req.ID, -32601, "method not found", nil)
+	}
+}
+
+func (s *ControlServer) ensureOwner(c *connState) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.owner == nil {
+		s.owner = c
+		c.isOwner = true
+		return true
+	}
+	return s.owner == c
+}
+
+func (s *ControlServer) disconnect(c *connState) {
+	s.mu.Lock()
+	delete(s.conns, c)
+	for sub := range s.subs {
+		if sub.conn == c {
+			delete(s.subs, sub)
+			close(sub.ch)
+		}
+	}
+	if s.owner == c {
+		s.owner = nil
+	}
+	s.mu.Unlock()
+	_ = c.conn.Close()
+}
+
+func (c *connState) writeJSON(v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.closed {
+		return net.ErrClosed
+	}
+	_, err = c.conn.Write(b)
+	if err != nil {
+		c.closed = true
+	}
+	return err
+}
+
+func (s *subscriber) enqueue(ev events.Event) {
+	select {
+	case s.ch <- ev:
+	default:
+		<-s.ch
+		s.dropped++
+		s.ch <- ev
+	}
+}
+
+func (s *subscriber) loop() {
+	pendingLag := 0
+	for ev := range s.ch {
+		if s.dropped > 0 {
+			pendingLag += s.dropped
+			s.dropped = 0
+		}
+		if pendingLag > 0 {
+			_ = s.conn.writeJSON(Notification{JSONRPC: "2.0", Method: "event", Params: map[string]any{"event": "subscriber.lagged", "dropped_count": pendingLag, "ts": time.Now().UnixMilli()}})
+			pendingLag = 0
+		}
+		_ = s.conn.writeJSON(Notification{JSONRPC: "2.0", Method: "event", Params: eventToMap(ev)})
+	}
+}
+
+func eventToMap(ev events.Event) map[string]any {
+	fields := map[string]any{"event": ev.Event}
+	if ev.SessionID != "" {
+		fields["session_id"] = ev.SessionID
+	}
+	for k, v := range ev.Fields {
+		fields[k] = v
+	}
+	return fields
+}
