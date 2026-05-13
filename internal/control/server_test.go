@@ -284,6 +284,154 @@ func TestHTTPDebugStatusAndCancel(t *testing.T) {
 	}
 }
 
+func TestPromptDispatch(t *testing.T) {
+	state := NewState("run_1", "", 0)
+	s := NewServer(state)
+	path := testSocketPath(t)
+	if err := s.Start(path); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Stop()
+
+	c := mustDial(t, path)
+	defer c.Close()
+	params, _ := json.Marshal(map[string]any{"text": "do something"})
+	_ = writeReq(t, c, Request{JSONRPC: "2.0", ID: 1, Method: "prompt", Params: params})
+	r := readResp(t, c)
+	if r.Error != nil {
+		t.Fatalf("prompt error: %+v", r.Error)
+	}
+	res, ok := r.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type: %T", r.Result)
+	}
+	if v, _ := res["accepted"].(bool); !v {
+		t.Fatal("expected accepted=true")
+	}
+}
+
+func TestInterruptAndPromptDispatch(t *testing.T) {
+	state := NewState("run_1", "", 0)
+	s := NewServer(state)
+	cancelCalled := false
+	s.SetCancelFunc(func() { cancelCalled = true })
+	path := testSocketPath(t)
+	if err := s.Start(path); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Stop()
+
+	c := mustDial(t, path)
+	defer c.Close()
+	params, _ := json.Marshal(map[string]any{"text": "new task"})
+	_ = writeReq(t, c, Request{JSONRPC: "2.0", ID: 1, Method: "interrupt_and_prompt", Params: params})
+	r := readResp(t, c)
+	if r.Error != nil {
+		t.Fatalf("interrupt_and_prompt error: %+v", r.Error)
+	}
+	res, ok := r.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type: %T", r.Result)
+	}
+	if v, _ := res["accepted"].(bool); !v {
+		t.Fatal("expected accepted=true")
+	}
+	if !cancelCalled {
+		t.Fatal("expected cancelFn to be called")
+	}
+}
+
+func TestPromptRejectedForNonOwner(t *testing.T) {
+	state := NewState("run_1", "", 0)
+	s := NewServer(state)
+	path := testSocketPath(t)
+	if err := s.Start(path); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Stop()
+
+	c1 := mustDial(t, path)
+	defer c1.Close()
+	_ = writeReq(t, c1, Request{JSONRPC: "2.0", ID: 1, Method: "cancel"})
+	r1 := readResp(t, c1)
+	if r1.Error != nil {
+		t.Fatalf("cancel error: %+v", r1.Error)
+	}
+
+	c2 := mustDial(t, path)
+	defer c2.Close()
+	params, _ := json.Marshal(map[string]any{"text": "hello"})
+	_ = writeReq(t, c2, Request{JSONRPC: "2.0", ID: 2, Method: "prompt", Params: params})
+	r2 := readResp(t, c2)
+	if r2.Error == nil || r2.Error.Code != -32010 {
+		t.Fatalf("expected permission_denied for prompt, got %+v", r2)
+	}
+}
+
+func TestInterruptAndPromptRejectedForNonOwner(t *testing.T) {
+	state := NewState("run_1", "", 0)
+	s := NewServer(state)
+	path := testSocketPath(t)
+	if err := s.Start(path); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Stop()
+
+	c1 := mustDial(t, path)
+	defer c1.Close()
+	_ = writeReq(t, c1, Request{JSONRPC: "2.0", ID: 1, Method: "cancel"})
+	r1 := readResp(t, c1)
+	if r1.Error != nil {
+		t.Fatalf("cancel error: %+v", r1.Error)
+	}
+
+	c2 := mustDial(t, path)
+	defer c2.Close()
+	params, _ := json.Marshal(map[string]any{"text": "new task"})
+	_ = writeReq(t, c2, Request{JSONRPC: "2.0", ID: 2, Method: "interrupt_and_prompt", Params: params})
+	r2 := readResp(t, c2)
+	if r2.Error == nil || r2.Error.Code != -32010 {
+		t.Fatalf("expected permission_denied for interrupt_and_prompt, got %+v", r2)
+	}
+}
+
+func TestPromptMissingTextReturnsError(t *testing.T) {
+	state := NewState("run_1", "", 0)
+	s := NewServer(state)
+	path := testSocketPath(t)
+	if err := s.Start(path); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Stop()
+
+	c := mustDial(t, path)
+	defer c.Close()
+	params, _ := json.Marshal(map[string]any{"text": ""})
+	_ = writeReq(t, c, Request{JSONRPC: "2.0", ID: 1, Method: "prompt", Params: params})
+	r := readResp(t, c)
+	if r.Error == nil || r.Error.Code != -32602 {
+		t.Fatalf("expected invalid params error, got %+v", r)
+	}
+}
+
+func TestDequeuePromptOrder(t *testing.T) {
+	state := NewState("run_1", "", 0)
+	s := NewServer(state)
+
+	s.QueuePrompt("prompt1")
+	s.QueuePrompt("prompt2")
+
+	if got := s.DequeuePrompt(); got != "prompt1" {
+		t.Fatalf("first dequeue = %q, want prompt1", got)
+	}
+	if got := s.DequeuePrompt(); got != "prompt2" {
+		t.Fatalf("second dequeue = %q, want prompt2", got)
+	}
+	if got := s.DequeuePrompt(); got != "" {
+		t.Fatalf("third dequeue = %q, want empty", got)
+	}
+}
+
 func testSocketPath(t *testing.T) string {
 	t.Helper()
 	return filepath.Join(os.TempDir(), "avc-"+time.Now().Format("150405.000000")+".sock")

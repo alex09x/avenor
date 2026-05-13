@@ -41,6 +41,10 @@ type ControlServer struct {
 	pendingMu      sync.Mutex
 	pendingRequest string
 	pendingAnswer  chan PermissionAnswer
+
+	promptMu        sync.Mutex
+	promptQueue     []string
+	interruptPrompt string
 }
 
 type connState struct {
@@ -164,6 +168,16 @@ func (s *ControlServer) PublishEvent(event events.Event) {
 			ss.PendingPermission = false
 			ss.Permission = nil
 		}
+		switch event.Event {
+		case "session.start":
+			ss.TurnState = "starting"
+		case "tool.call", "agent.thought_chunk", "agent.message_chunk":
+			if ss.TurnState == "starting" || ss.TurnState == "" {
+				ss.TurnState = "running"
+			}
+		case "session.end":
+			ss.TurnState = "ended"
+		}
 	})
 
 	s.mu.Lock()
@@ -211,6 +225,43 @@ func (s *ControlServer) EndPermissionClaim(requestID string) {
 		s.pendingRequest = ""
 		s.pendingAnswer = nil
 	}
+}
+
+func (s *ControlServer) QueuePrompt(text string) {
+	s.promptMu.Lock()
+	s.promptQueue = append(s.promptQueue, text)
+	s.promptMu.Unlock()
+}
+
+func (s *ControlServer) DequeuePrompt() string {
+	s.promptMu.Lock()
+	defer s.promptMu.Unlock()
+	if len(s.promptQueue) == 0 {
+		return ""
+	}
+	text := s.promptQueue[0]
+	s.promptQueue = s.promptQueue[1:]
+	return text
+}
+
+func (s *ControlServer) InterruptPrompt(text string, keepQueue bool) {
+	s.promptMu.Lock()
+	s.interruptPrompt = text
+	if !keepQueue {
+		s.promptQueue = nil
+	}
+	s.promptMu.Unlock()
+	if s.cancelFn != nil {
+		s.cancelFn()
+	}
+}
+
+func (s *ControlServer) ConsumeInterrupt() string {
+	s.promptMu.Lock()
+	defer s.promptMu.Unlock()
+	text := s.interruptPrompt
+	s.interruptPrompt = ""
+	return text
 }
 
 func (s *ControlServer) acceptLoop() {
@@ -304,6 +355,39 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 		case pending <- p:
 		default:
 		}
+		return success(req.ID, map[string]any{"accepted": true})
+	case "prompt":
+		if !s.ensureOwner(c) {
+			return failure(req.ID, -32010, "permission_denied", nil)
+		}
+		var pr struct {
+			Text string `json:"text"`
+		}
+		if len(req.Params) > 0 {
+			_ = json.Unmarshal(req.Params, &pr)
+		}
+		if pr.Text == "" {
+			return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"text"}})
+		}
+		s.QueuePrompt(pr.Text)
+		s.state.Update(func(ss *Snapshot) { ss.TurnState = "idle" })
+		return success(req.ID, map[string]any{"accepted": true})
+	case "interrupt_and_prompt":
+		if !s.ensureOwner(c) {
+			return failure(req.ID, -32010, "permission_denied", nil)
+		}
+		var ip struct {
+			Text      string `json:"text"`
+			KeepQueue bool   `json:"keep_queue"`
+		}
+		if len(req.Params) > 0 {
+			_ = json.Unmarshal(req.Params, &ip)
+		}
+		if ip.Text == "" {
+			return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"text"}})
+		}
+		s.InterruptPrompt(ip.Text, ip.KeepQueue)
+		s.state.Update(func(ss *Snapshot) { ss.TurnState = "cancelling" })
 		return success(req.ID, map[string]any{"accepted": true})
 	default:
 		return failure(req.ID, -32601, "method not found", nil)

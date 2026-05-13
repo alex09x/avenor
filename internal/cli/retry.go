@@ -19,9 +19,20 @@ type attemptResult struct {
 	sessionID string
 }
 
+// resumeSession resumes an existing session after cancellation so a follow-up
+// prompt can be sent without respawning the provider.
+func resumeSession(ctx context.Context, provider runtime.Provider, sessionID string) (runtime.Session, error) {
+	s, err := provider.Resume(ctx, sessionID)
+	if err != nil {
+		return runtime.Session{}, err
+	}
+	return s, nil
+}
+
 // runSingleAttempt creates a fresh provider, starts or resumes a session,
-// sends the prompt, and runs the event loop. The provider is closed before
-// returning regardless of outcome.
+// sends the initial prompt, and runs a multi-turn event loop. When the
+// control server queues or interrupts a prompt, the loop restarts without
+// returning.
 func runSingleAttempt(
 	ctx context.Context,
 	startOptions runtime.StartOptions,
@@ -29,7 +40,7 @@ func runSingleAttempt(
 	writer eventSink,
 	fileHandler *permission.FileHandler,
 	controlServer *control.ControlServer,
-	prompt string,
+	initPrompt string,
 	runID string,
 	runLabel string,
 	autoApprove bool,
@@ -49,22 +60,47 @@ func runSingleAttempt(
 		return attemptResult{exitCode: 1}
 	}
 
-	eventCtx, cancelEvents := context.WithCancel(ctx)
+	// eventCtx is independent of the orchestrator ctx so the event channel
+	// survives an interrupt_and_prompt restart.
+	eventCtx, cancelEvents := context.WithCancel(context.Background())
 	defer cancelEvents()
 
-	eventCh, err := provider.Events(eventCtx, session.SessionID)
-	if err != nil {
-		fmt.Fprintf(stderr, "avenor: subscribe events: %v\n", err)
-		return attemptResult{exitCode: 1, sessionID: session.SessionID}
+	prompt := initPrompt
+	for {
+		eventCh, err := provider.Events(eventCtx, session.SessionID)
+		if err != nil {
+			fmt.Fprintf(stderr, "avenor: subscribe events: %v\n", err)
+			return attemptResult{exitCode: 1, sessionID: session.SessionID}
+		}
+
+		promptDone := make(chan error, 1)
+		go func() {
+			promptDone <- provider.Prompt(ctx, session.SessionID, prompt)
+		}()
+
+		exitCode := waitForSession(ctx, provider, writer, fileHandler, controlServer, eventCh, promptDone, session.SessionID, runID, runLabel, autoApprove, timer, stderr)
+
+		if controlServer != nil {
+			if exitCode == 130 {
+				if interruptText := controlServer.ConsumeInterrupt(); interruptText != "" {
+					if _, err := resumeSession(ctx, provider, session.SessionID); err != nil {
+						fmt.Fprintf(stderr, "avenor: resume after cancel: %v\n", err)
+						return attemptResult{exitCode: 1, sessionID: session.SessionID}
+					}
+					prompt = interruptText
+					continue
+				}
+			}
+			if exitCode == 0 {
+				if nextPrompt := controlServer.DequeuePrompt(); nextPrompt != "" {
+					prompt = nextPrompt
+					continue
+				}
+			}
+		}
+
+		return attemptResult{exitCode: exitCode, sessionID: session.SessionID}
 	}
-
-	promptDone := make(chan error, 1)
-	go func() {
-		promptDone <- provider.Prompt(ctx, session.SessionID, prompt)
-	}()
-
-	exitCode := waitForSession(ctx, provider, writer, fileHandler, controlServer, eventCh, promptDone, session.SessionID, runID, runLabel, autoApprove, timer, stderr)
-	return attemptResult{exitCode: exitCode, sessionID: session.SessionID}
 }
 
 // backoffDelay returns the retry sleep duration for the nth attempt (1-indexed).

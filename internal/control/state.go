@@ -18,6 +18,7 @@ type Snapshot struct {
 	Permission        map[string]any `json:"permission,omitempty"`
 	StartedAt         int64          `json:"started_at"`
 	UpdatedAt         int64          `json:"updated_at"`
+	TurnState         string         `json:"turn_state,omitempty"`
 }
 
 type ControlState struct {
