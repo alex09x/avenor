@@ -6,6 +6,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/sdougbrown/avenor/internal/control"
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/runtime"
@@ -25,8 +26,9 @@ func runSingleAttempt(
 	ctx context.Context,
 	startOptions runtime.StartOptions,
 	resumeID string,
-	writer *eventWriter,
+	writer eventSink,
 	fileHandler *permission.FileHandler,
+	controlServer *control.ControlServer,
 	prompt string,
 	runID string,
 	runLabel string,
@@ -61,7 +63,7 @@ func runSingleAttempt(
 		promptDone <- provider.Prompt(ctx, session.SessionID, prompt)
 	}()
 
-	exitCode := waitForSession(ctx, provider, writer, fileHandler, eventCh, promptDone, session.SessionID, runID, runLabel, autoApprove, timer, stderr)
+	exitCode := waitForSession(ctx, provider, writer, fileHandler, controlServer, eventCh, promptDone, session.SessionID, runID, runLabel, autoApprove, timer, stderr)
 	return attemptResult{exitCode: exitCode, sessionID: session.SessionID}
 }
 
@@ -76,7 +78,7 @@ func backoffDelay(attempt int) time.Duration {
 }
 
 // writeRetryEvent emits an avenor.retry event to the writer.
-func writeRetryEvent(writer *eventWriter, sessionID, runID string, attempt, maxRetries int, runLabel ...string) error {
+func writeRetryEvent(writer eventSink, sessionID, runID string, attempt, maxRetries int, runLabel ...string) error {
 	fields := map[string]any{
 		"attempt":     attempt,
 		"max_retries": maxRetries,

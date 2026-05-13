@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sdougbrown/avenor/internal/control"
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/runtime"
@@ -160,7 +161,7 @@ func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) 
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := waitForSession(context.Background(), provider, writer, nil, eventCh, promptDone, "ses_1", "run_1", "review", true, nil, &stderr)
+	code := waitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, "ses_1", "run_1", "review", true, nil, &stderr)
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
 	}
@@ -243,8 +244,9 @@ func TestRunCleansSentinelFilesBetweenRetries(t *testing.T) {
 		ctx context.Context,
 		startOptions runtime.StartOptions,
 		resumeID string,
-		writer *eventWriter,
+		writer eventSink,
 		fileHandler *permission.FileHandler,
+		controlServer *control.ControlServer,
 		prompt string,
 		runID string,
 		runLabel string,
@@ -465,7 +467,7 @@ func TestAutoAnswerGoroutineDoesNotBlockEventLoop(t *testing.T) {
 	var exitCode int
 	go func() {
 		defer wg.Done()
-		exitCode = waitForSession(context.Background(), provider, writer, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, io.Discard)
+		exitCode = waitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, io.Discard)
 	}()
 
 	// Wait until AnswerPermission has been called (goroutine is now blocked inside it).
@@ -555,7 +557,7 @@ func TestAutoAnswerMissingRequestIDEmitsErrorNotWorking(t *testing.T) {
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := waitForSession(context.Background(), provider, writer, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, &stderr)
+	code := waitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, &stderr)
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
@@ -622,7 +624,7 @@ func TestAutoAnswerEmitsPermissionResponse(t *testing.T) {
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := waitForSession(context.Background(), provider, writer, nil, eventCh, promptDone, "ses_1", "run_1", "mylabel", true, nil, &stderr)
+	code := waitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, "ses_1", "run_1", "mylabel", true, nil, &stderr)
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
@@ -701,7 +703,7 @@ func TestAutoAnswerAnswerPermissionErrorEmitsError(t *testing.T) {
 
 	provider := &errorFakeProvider{answerErr: fmt.Errorf("backend unavailable")}
 	var stderr strings.Builder
-	code := waitForSession(context.Background(), provider, writer, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, &stderr)
+	code := waitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, &stderr)
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
 	}
@@ -756,7 +758,7 @@ func TestAutoAnswerWorkingStatusEmittedOnPermissionResume(t *testing.T) {
 	var exitCode int
 	go func() {
 		defer wg.Done()
-		exitCode = waitForSession(context.Background(), provider, writer, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, io.Discard)
+		exitCode = waitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, io.Discard)
 	}()
 
 	// Wait until AnswerPermission is called, then unblock it so the
@@ -855,7 +857,7 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 	var exitCode int
 	go func() {
 		defer wg.Done()
-		exitCode = waitForSession(context.Background(), provider, writer, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, io.Discard)
+		exitCode = waitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, io.Discard)
 	}()
 
 	// Wait until the first AnswerPermission call is in-flight (blocking).
