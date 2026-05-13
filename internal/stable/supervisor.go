@@ -62,9 +62,12 @@ type childRuntime struct {
 	onEvent      string
 	sentinelFile string
 	cancelFn     func()
+	interruptFn  func()
 	done         chan struct{}
 	exitCode     int
 	completed    bool
+	active       bool
+	promptCh     chan struct{}
 	promptQueue  []string
 	mu           sync.Mutex
 }
@@ -148,9 +151,21 @@ func idleCheck(idleTimeout time.Duration, active int, deadline *time.Time) <-cha
 	return time.After(time.Until(*deadline))
 }
 
+func (s *Supervisor) activeRuntimeCountLocked() int {
+	n := 0
+	for _, rt := range s.runtimes {
+		rt.mu.Lock()
+		if !rt.completed {
+			n++
+		}
+		rt.mu.Unlock()
+	}
+	return n
+}
+
 func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 	s.controlMu.Lock()
-	if len(s.runtimes) >= s.config.MaxRuntimes {
+	if s.activeRuntimeCountLocked() >= s.config.MaxRuntimes {
 		s.controlMu.Unlock()
 		return SpawnResult{}, fmt.Errorf("max runtimes (%d) reached", s.config.MaxRuntimes)
 	}
@@ -159,8 +174,9 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 
 	// Reserve the slot to prevent TOCTOU bypass of the max-runtime limit.
 	child := &childRuntime{
-		id:   rtID,
-		done: make(chan struct{}),
+		id:       rtID,
+		done:     make(chan struct{}),
+		promptCh: make(chan struct{}, 1),
 	}
 	s.runtimes[rtID] = child
 	s.controlMu.Unlock()
@@ -304,65 +320,56 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 			child.exitCode = result.exitCode
 			child.mu.Unlock()
 
-			// Check for queued follow-up prompts after a successful turn.
 			if result.exitCode == 0 {
-				child.mu.Lock()
-				if len(child.promptQueue) > 0 {
-					nextPrompt := child.promptQueue[0]
-					child.promptQueue = child.promptQueue[1:]
-					child.mu.Unlock()
-					if _, err := cli.StartSession(ctx, child.provider, runtime.StartOptions{
-						Label: child.label,
-						Dir:   child.dir,
-					}, resumeID); err != nil {
-						fmt.Fprintf(os.Stderr, "avenor stable: resume for queued prompt: %v\n", err)
-						break
+				if child.sentinelFile != "" {
+					cli.WriteSentinel(child.sentinelFile, result.exitCode, result.sessionID, runtime.StopReasonForExitCode(result.exitCode), s.runID, os.Stderr)
+				}
+				nextPrompt, ok := child.waitForNextPrompt(ctx)
+				if !ok {
+					if ctx.Err() != nil {
+						s.writeIdleCancelled(child)
+					}
+					return
+				}
+				promptText = nextPrompt
+				resumeID = result.sessionID
+				if resumeID == "" && child.session.SessionID != "" {
+					resumeID = child.session.SessionID
+				}
+				attempt = 0
+				continue
+			}
+
+			if ctx.Err() == nil {
+				if nextPrompt, ok := child.dequeuePrompt(); ok {
+					if child.sentinelFile != "" {
+						cli.WriteSentinel(child.sentinelFile, result.exitCode, result.sessionID, runtime.StopReasonForExitCode(result.exitCode), s.runID, os.Stderr)
 					}
 					promptText = nextPrompt
-					attempt = 1
 					resumeID = result.sessionID
 					if resumeID == "" && child.session.SessionID != "" {
 						resumeID = child.session.SessionID
 					}
+					attempt = 0
 					continue
 				}
-				child.mu.Unlock()
 			}
 
 			if child.sentinelFile != "" {
 				cli.WriteSentinel(child.sentinelFile, result.exitCode, result.sessionID, runtime.StopReasonForExitCode(result.exitCode), s.runID, os.Stderr)
 			}
-			s.emitSessionEnd(child, result.exitCode, "end_turn")
-			return
-		}
-		if ctx.Err() != nil {
-			// Check for interrupt restart: a queued prompt from RuntimeInterruptAndPrompt.
-			child.mu.Lock()
-			hasPrompt := len(child.promptQueue) > 0
-			if hasPrompt {
-				nextPrompt := child.promptQueue[0]
-				child.promptQueue = child.promptQueue[1:]
-				child.mu.Unlock()
-				if _, err := cli.StartSession(ctx, child.provider, runtime.StartOptions{
-					Label: child.label,
-					Dir:   child.dir,
-				}, resumeID); err != nil {
-					fmt.Fprintf(os.Stderr, "avenor stable: resume after interrupt: %v\n", err)
-					return
-				}
-				promptText = nextPrompt
-				attempt = 1
-				resumeID = result.sessionID
-				if resumeID == "" && child.session.SessionID != "" {
-					resumeID = child.session.SessionID
-				}
-				continue
-			}
-			child.mu.Unlock()
 			return
 		}
 		if result.sessionID != "" {
 			resumeID = result.sessionID
+		}
+		if nextPrompt, ok := child.dequeuePrompt(); ok && ctx.Err() == nil {
+			promptText = nextPrompt
+			attempt = 0
+			continue
+		}
+		if ctx.Err() != nil {
+			return
 		}
 		select {
 		case <-time.After(backoffDelay(attempt)):
@@ -375,6 +382,44 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 type childAttemptResult struct {
 	exitCode  int
 	sessionID string
+}
+
+func (c *childRuntime) dequeuePrompt() (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.completed || len(c.promptQueue) == 0 {
+		return "", false
+	}
+	prompt := c.promptQueue[0]
+	c.promptQueue = c.promptQueue[1:]
+	return prompt, true
+}
+
+func (c *childRuntime) waitForNextPrompt(ctx context.Context) (string, bool) {
+	for {
+		if prompt, ok := c.dequeuePrompt(); ok {
+			return prompt, true
+		}
+		c.mu.Lock()
+		if c.completed {
+			c.mu.Unlock()
+			return "", false
+		}
+		ch := c.promptCh
+		c.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return "", false
+		}
+	}
+}
+
+func (c *childRuntime) signalPrompt() {
+	select {
+	case c.promptCh <- struct{}{}:
+	default:
+	}
 }
 
 func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, resumeID, promptText string, timer <-chan time.Time) childAttemptResult {
@@ -390,7 +435,20 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 	child.session = session
 	child.mu.Unlock()
 
-	eventCtx, cancelEvents := context.WithCancel(ctx)
+	turnCtx, cancelTurn := context.WithCancel(ctx)
+	child.mu.Lock()
+	child.active = true
+	child.interruptFn = cancelTurn
+	child.mu.Unlock()
+	defer func() {
+		cancelTurn()
+		child.mu.Lock()
+		child.active = false
+		child.interruptFn = nil
+		child.mu.Unlock()
+	}()
+
+	eventCtx, cancelEvents := context.WithCancel(turnCtx)
 	defer cancelEvents()
 
 	eventCh, err := child.provider.Events(eventCtx, session.SessionID)
@@ -401,7 +459,7 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 	promptDone := make(chan error, 1)
 	go func() {
 		defer func() { recover() }()
-		promptDone <- child.provider.Prompt(ctx, session.SessionID, promptText)
+		promptDone <- child.provider.Prompt(turnCtx, session.SessionID, promptText)
 	}()
 
 	// Tag events with runtime_id and fan out to both file and control subscribers.
@@ -410,7 +468,7 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 		runtimeID: child.id,
 		control:   s.control,
 	}
-	exitCode := cli.WaitForSession(ctx, child.provider, taggedWriter, child.fileHandler, nil, eventCh, promptDone, nil, session.SessionID, s.runID, child.label, child.autoApprove, timer, os.Stderr)
+	exitCode := cli.WaitForSession(turnCtx, child.provider, taggedWriter, child.fileHandler, nil, eventCh, promptDone, nil, session.SessionID, s.runID, child.label, child.autoApprove, timer, os.Stderr)
 	return childAttemptResult{exitCode: exitCode, sessionID: session.SessionID}
 }
 
@@ -425,6 +483,13 @@ func (s *Supervisor) emitSessionEnd(child *childRuntime, exitCode int, stopReaso
 			"ts":          time.Now().UnixMilli(),
 		},
 	})
+}
+
+func (s *Supervisor) writeIdleCancelled(child *childRuntime) {
+	if child.sentinelFile != "" {
+		cli.WriteSentinel(child.sentinelFile, 130, child.session.SessionID, "cancelled", s.runID, os.Stderr)
+	}
+	s.emitSessionEnd(child, 130, "cancelled")
 }
 
 func (s *Supervisor) emitChildError(child *childRuntime, message, source string) {
@@ -480,15 +545,7 @@ func (s *Supervisor) shutdown(mode string) int {
 func (s *Supervisor) activeRuntimeCount() int {
 	s.controlMu.Lock()
 	defer s.controlMu.Unlock()
-	n := 0
-	for _, rt := range s.runtimes {
-		rt.mu.Lock()
-		if !rt.completed {
-			n++
-		}
-		rt.mu.Unlock()
-	}
-	return n
+	return s.activeRuntimeCountLocked()
 }
 
 func (s *Supervisor) listRuntimes() []map[string]any {
@@ -497,7 +554,10 @@ func (s *Supervisor) listRuntimes() []map[string]any {
 	out := make([]map[string]any, 0, len(s.runtimes))
 	for _, rt := range s.runtimes {
 		rt.mu.Lock()
-		status := "running"
+		status := "idle"
+		if rt.active {
+			status = "running"
+		}
 		if rt.completed {
 			status = "ended"
 		}
@@ -597,7 +657,10 @@ func (s *Supervisor) RuntimeStatus(rtID string) (any, error) {
 		return nil, fmt.Errorf("runtime %q not found", rtID)
 	}
 	rt.mu.Lock()
-	status := "running"
+	status := "idle"
+	if rt.active {
+		status = "running"
+	}
 	if rt.completed {
 		status = "ended"
 	}
@@ -627,8 +690,13 @@ func (s *Supervisor) RuntimePrompt(rtID, text string) error {
 		return fmt.Errorf("runtime %q not found", rtID)
 	}
 	rt.mu.Lock()
+	if rt.completed {
+		rt.mu.Unlock()
+		return fmt.Errorf("runtime %q has ended", rtID)
+	}
 	rt.promptQueue = append(rt.promptQueue, text)
 	rt.mu.Unlock()
+	rt.signalPrompt()
 	return nil
 }
 
@@ -644,14 +712,20 @@ func (s *Supervisor) RuntimeInterruptAndPrompt(rtID, text string, keepQueue bool
 		return fmt.Errorf("runtime %q not found", rtID)
 	}
 	rt.mu.Lock()
+	if rt.completed {
+		rt.mu.Unlock()
+		return fmt.Errorf("runtime %q has ended", rtID)
+	}
 	if !keepQueue {
 		rt.promptQueue = nil
 	}
 	// Prepend the interrupt prompt to the front of the queue so it runs next.
 	rt.promptQueue = append([]string{text}, rt.promptQueue...)
+	interruptFn := rt.interruptFn
 	rt.mu.Unlock()
-	if rt.cancelFn != nil {
-		rt.cancelFn()
+	rt.signalPrompt()
+	if interruptFn != nil {
+		interruptFn()
 	}
 	return nil
 }

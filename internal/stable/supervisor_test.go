@@ -93,3 +93,69 @@ func TestSpawnParamsValidation(t *testing.T) {
 	// Dir defaults to ".", so this shouldn't error on validation alone
 	// It might fail on starting the acp session though
 }
+
+func TestActiveRuntimeCountIgnoresCompletedHistory(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-active-count.sock",
+		MaxRuntimes:   1,
+	})
+	sup.runtimes["rt_done"] = &childRuntime{
+		id:        "rt_done",
+		done:      make(chan struct{}),
+		promptCh:  make(chan struct{}, 1),
+		completed: true,
+	}
+
+	if got := sup.activeRuntimeCount(); got != 0 {
+		t.Fatalf("activeRuntimeCount() = %d, want 0 for completed history", got)
+	}
+}
+
+func TestRuntimePromptRejectsCompletedRuntime(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-prompt-completed.sock",
+		MaxRuntimes:   1,
+	})
+	sup.runtimes["rt_done"] = &childRuntime{
+		id:        "rt_done",
+		done:      make(chan struct{}),
+		promptCh:  make(chan struct{}, 1),
+		completed: true,
+	}
+
+	if err := sup.RuntimePrompt("rt_done", "hello"); err == nil {
+		t.Fatal("RuntimePrompt on completed runtime should error")
+	}
+}
+
+func TestRuntimeInterruptAndPromptCancelsTurnNotRuntime(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-interrupt-turn.sock",
+		MaxRuntimes:   1,
+	})
+	runtimeCancelled := false
+	turnInterrupted := false
+	sup.runtimes["rt_1"] = &childRuntime{
+		id:          "rt_1",
+		done:        make(chan struct{}),
+		promptCh:    make(chan struct{}, 1),
+		cancelFn:    func() { runtimeCancelled = true },
+		interruptFn: func() { turnInterrupted = true },
+	}
+
+	if err := sup.RuntimeInterruptAndPrompt("rt_1", "replacement", false); err != nil {
+		t.Fatalf("RuntimeInterruptAndPrompt: %v", err)
+	}
+	if runtimeCancelled {
+		t.Fatal("interrupt_and_prompt called runtime cancelFn; it should only cancel the active turn")
+	}
+	if !turnInterrupted {
+		t.Fatal("interrupt_and_prompt did not call interruptFn")
+	}
+	rt := sup.runtimes["rt_1"]
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if len(rt.promptQueue) != 1 || rt.promptQueue[0] != "replacement" {
+		t.Fatalf("promptQueue = %#v, want replacement queued first", rt.promptQueue)
+	}
+}
