@@ -43,6 +43,8 @@ func runControl(args []string) int {
 		return cmdCancel(c, nonFlag[1:])
 	case "prompt":
 		return cmdPrompt(c, nonFlag[1:])
+	case "interrupt-and-prompt":
+		return cmdInterruptAndPrompt(c, nonFlag[1:])
 	case "answer-permission":
 		return cmdAnswerPermission(c, nonFlag[1:])
 	case "shutdown":
@@ -120,6 +122,23 @@ func cmdPrompt(c *client.Client, args []string) int {
 		return 1
 	}
 	fmt.Println("prompt queued")
+	return 0
+}
+
+func cmdInterruptAndPrompt(c *client.Client, args []string) int {
+	rtID := ""
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "avenor control: interrupt-and-prompt <text> [runtime-id]")
+		return 1
+	}
+	if len(args) >= 2 {
+		rtID = args[1]
+	}
+	if err := c.InterruptAndPrompt(rtID, args[0], false); err != nil {
+		fmt.Fprintf(os.Stderr, "avenor control: interrupt-and-prompt: %v\n", err)
+		return 1
+	}
+	fmt.Println("interrupt queued")
 	return 0
 }
 

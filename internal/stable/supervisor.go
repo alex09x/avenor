@@ -64,6 +64,8 @@ type childRuntime struct {
 	cancelFn     func()
 	done         chan struct{}
 	exitCode     int
+	completed    bool
+	promptQueue  []string
 	mu           sync.Mutex
 }
 
@@ -279,9 +281,9 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 		if closer, ok := child.provider.(interface{ Close() error }); ok {
 			_ = closer.Close()
 		}
-		s.controlMu.Lock()
-		delete(s.runtimes, child.id)
-		s.controlMu.Unlock()
+		child.mu.Lock()
+		child.completed = true
+		child.mu.Unlock()
 	}()
 
 	var timer <-chan time.Time
@@ -301,6 +303,32 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 			child.mu.Lock()
 			child.exitCode = result.exitCode
 			child.mu.Unlock()
+
+			// Check for queued follow-up prompts after a successful turn.
+			if result.exitCode == 0 {
+				child.mu.Lock()
+				if len(child.promptQueue) > 0 {
+					nextPrompt := child.promptQueue[0]
+					child.promptQueue = child.promptQueue[1:]
+					child.mu.Unlock()
+					if _, err := cli.StartSession(ctx, child.provider, runtime.StartOptions{
+						Label: child.label,
+						Dir:   child.dir,
+					}, resumeID); err != nil {
+						fmt.Fprintf(os.Stderr, "avenor stable: resume for queued prompt: %v\n", err)
+						break
+					}
+					promptText = nextPrompt
+					attempt = 1
+					resumeID = result.sessionID
+					if resumeID == "" && child.session.SessionID != "" {
+						resumeID = child.session.SessionID
+					}
+					continue
+				}
+				child.mu.Unlock()
+			}
+
 			if child.sentinelFile != "" {
 				cli.WriteSentinel(child.sentinelFile, result.exitCode, result.sessionID, runtime.StopReasonForExitCode(result.exitCode), s.runID, os.Stderr)
 			}
@@ -308,6 +336,29 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 			return
 		}
 		if ctx.Err() != nil {
+			// Check for interrupt restart: a queued prompt from RuntimeInterruptAndPrompt.
+			child.mu.Lock()
+			hasPrompt := len(child.promptQueue) > 0
+			if hasPrompt {
+				nextPrompt := child.promptQueue[0]
+				child.promptQueue = child.promptQueue[1:]
+				child.mu.Unlock()
+				if _, err := cli.StartSession(ctx, child.provider, runtime.StartOptions{
+					Label: child.label,
+					Dir:   child.dir,
+				}, resumeID); err != nil {
+					fmt.Fprintf(os.Stderr, "avenor stable: resume after interrupt: %v\n", err)
+					return
+				}
+				promptText = nextPrompt
+				attempt = 1
+				resumeID = result.sessionID
+				if resumeID == "" && child.session.SessionID != "" {
+					resumeID = child.session.SessionID
+				}
+				continue
+			}
+			child.mu.Unlock()
 			return
 		}
 		if result.sessionID != "" {
@@ -353,8 +404,12 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 		promptDone <- child.provider.Prompt(ctx, session.SessionID, promptText)
 	}()
 
-	// Tag events with runtime_id before writing.
-	taggedWriter := &runtimeTagWriter{base: child.eventWriter, runtimeID: child.id}
+	// Tag events with runtime_id and fan out to both file and control subscribers.
+	taggedWriter := &runtimeFanoutWriter{
+		base:      child.eventWriter,
+		runtimeID: child.id,
+		control:   s.control,
+	}
 	exitCode := cli.WaitForSession(ctx, child.provider, taggedWriter, child.fileHandler, nil, eventCh, promptDone, nil, session.SessionID, s.runID, child.label, child.autoApprove, timer, os.Stderr)
 	return childAttemptResult{exitCode: exitCode, sessionID: session.SessionID}
 }
@@ -425,7 +480,15 @@ func (s *Supervisor) shutdown(mode string) int {
 func (s *Supervisor) activeRuntimeCount() int {
 	s.controlMu.Lock()
 	defer s.controlMu.Unlock()
-	return len(s.runtimes)
+	n := 0
+	for _, rt := range s.runtimes {
+		rt.mu.Lock()
+		if !rt.completed {
+			n++
+		}
+		rt.mu.Unlock()
+	}
+	return n
 }
 
 func (s *Supervisor) listRuntimes() []map[string]any {
@@ -435,17 +498,18 @@ func (s *Supervisor) listRuntimes() []map[string]any {
 	for _, rt := range s.runtimes {
 		rt.mu.Lock()
 		status := "running"
-		select {
-		case <-rt.done:
+		if rt.completed {
 			status = "ended"
-		default:
 		}
 		entry := map[string]any{
-			"runtime_id": rt.id,
-			"session_id": rt.session.SessionID,
-			"label":      rt.label,
-			"dir":        rt.dir,
-			"status":     status,
+			"runtime_id":    rt.id,
+			"session_id":    rt.session.SessionID,
+			"label":         rt.label,
+			"dir":           rt.dir,
+			"status":        status,
+			"exit_code":     rt.exitCode,
+			"on_event":      rt.onEvent,
+			"sentinel_file": rt.sentinelFile,
 		}
 		rt.mu.Unlock()
 		out = append(out, entry)
@@ -466,16 +530,6 @@ func (s *Supervisor) cancelRuntime(rtID string) error {
 	return nil
 }
 
-func (s *Supervisor) promptRuntime(rtID, text string) error {
-	s.controlMu.Lock()
-	rt := s.runtimes[rtID]
-	s.controlMu.Unlock()
-	if rt == nil {
-		return fmt.Errorf("runtime %q not found", rtID)
-	}
-	return rt.provider.Prompt(context.Background(), rt.session.SessionID, text)
-}
-
 func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 	s.controlMu.Lock()
 	rt := s.runtimes[rtID]
@@ -489,20 +543,24 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 	})
 }
 
-type runtimeTagWriter struct {
+type runtimeFanoutWriter struct {
 	base      cli.EventSink
 	runtimeID string
+	control   *control.ControlServer
 }
 
-func (w *runtimeTagWriter) Write(ev events.Event) error {
+func (w *runtimeFanoutWriter) Write(ev events.Event) error {
 	if ev.Fields == nil {
 		ev.Fields = map[string]any{}
 	}
 	ev.Fields["runtime_id"] = w.runtimeID
+	if w.control != nil {
+		w.control.PublishEvent(ev)
+	}
 	return w.base.Write(ev)
 }
 
-func (w *runtimeTagWriter) Close() error { return w.base.Close() }
+func (w *runtimeFanoutWriter) Close() error { return w.base.Close() }
 
 // StableHandler implementation.
 
@@ -523,6 +581,11 @@ func (s *Supervisor) Shutdown(mode string) error {
 		return fmt.Errorf("shutdown mode must be graceful or kill")
 	}
 	s.shutdown(mode)
+	select {
+	case <-s.shutdownCh:
+	default:
+		close(s.shutdownCh)
+	}
 	return nil
 }
 
@@ -535,10 +598,8 @@ func (s *Supervisor) RuntimeStatus(rtID string) (any, error) {
 	}
 	rt.mu.Lock()
 	status := "running"
-	select {
-	case <-rt.done:
+	if rt.completed {
 		status = "ended"
-	default:
 	}
 	entry := map[string]any{
 		"runtime_id":    rt.id,
@@ -546,6 +607,7 @@ func (s *Supervisor) RuntimeStatus(rtID string) (any, error) {
 		"label":         rt.label,
 		"dir":           rt.dir,
 		"status":        status,
+		"exit_code":     rt.exitCode,
 		"on_event":      rt.onEvent,
 		"sentinel_file": rt.sentinelFile,
 	}
@@ -558,11 +620,40 @@ func (s *Supervisor) RuntimeCancel(rtID string) error {
 }
 
 func (s *Supervisor) RuntimePrompt(rtID, text string) error {
-	return s.promptRuntime(rtID, text)
+	s.controlMu.Lock()
+	rt := s.runtimes[rtID]
+	s.controlMu.Unlock()
+	if rt == nil {
+		return fmt.Errorf("runtime %q not found", rtID)
+	}
+	rt.mu.Lock()
+	rt.promptQueue = append(rt.promptQueue, text)
+	rt.mu.Unlock()
+	return nil
 }
 
 func (s *Supervisor) RuntimeAnswerPermission(rtID, requestID, optionID string) error {
 	return s.answerPermission(rtID, requestID, optionID)
+}
+
+func (s *Supervisor) RuntimeInterruptAndPrompt(rtID, text string, keepQueue bool) error {
+	s.controlMu.Lock()
+	rt := s.runtimes[rtID]
+	s.controlMu.Unlock()
+	if rt == nil {
+		return fmt.Errorf("runtime %q not found", rtID)
+	}
+	rt.mu.Lock()
+	if !keepQueue {
+		rt.promptQueue = nil
+	}
+	// Prepend the interrupt prompt to the front of the queue so it runs next.
+	rt.promptQueue = append([]string{text}, rt.promptQueue...)
+	rt.mu.Unlock()
+	if rt.cancelFn != nil {
+		rt.cancelFn()
+	}
+	return nil
 }
 
 func backoffDelay(attempt int) time.Duration {

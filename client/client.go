@@ -217,3 +217,15 @@ func (c *Client) Spawn(params map[string]any) (map[string]any, error) {
 func (c *Client) Shutdown(mode string) error {
 	return c.Call("shutdown", map[string]string{"mode": mode}, nil)
 }
+
+// InterruptAndPrompt cancels the current turn and starts a new prompt.
+func (c *Client) InterruptAndPrompt(runtimeID, text string, keepQueue bool) error {
+	params := map[string]any{
+		"text":       text,
+		"keep_queue": keepQueue,
+	}
+	if runtimeID != "" {
+		params["runtime_id"] = runtimeID
+	}
+	return c.Call("interrupt_and_prompt", params, nil)
+}

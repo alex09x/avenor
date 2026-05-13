@@ -60,6 +60,7 @@ type StableHandler interface {
 	RuntimeCancel(runtimeID string) error
 	RuntimePrompt(runtimeID, text string) error
 	RuntimeAnswerPermission(runtimeID, requestID, optionID string) error
+	RuntimeInterruptAndPrompt(runtimeID, text string, keepQueue bool) error
 }
 
 type connState struct {
@@ -488,6 +489,30 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 		s.state.Update(func(ss *Snapshot) { ss.TurnState = "idle" })
 		return success(req.ID, map[string]any{"accepted": true})
 	case "interrupt_and_prompt":
+		if rtID := runtimeIDFromParams(req.Params); rtID != "" {
+			if s.stableHandler == nil {
+				return failure(req.ID, -32601, "method not found", nil)
+			}
+			if !s.ensureOwner(c) {
+				return failure(req.ID, -32010, "permission_denied", nil)
+			}
+			var ip struct {
+				Text      string `json:"text"`
+				KeepQueue bool   `json:"keep_queue"`
+			}
+			if len(req.Params) > 0 {
+				if err := json.Unmarshal(req.Params, &ip); err != nil {
+					return failure(req.ID, -32602, "invalid params", map[string]any{"detail": err.Error()})
+				}
+			}
+			if ip.Text == "" {
+				return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"text"}})
+			}
+			if err := s.stableHandler.RuntimeInterruptAndPrompt(rtID, ip.Text, ip.KeepQueue); err != nil {
+				return failure(req.ID, -32000, err.Error(), nil)
+			}
+			return success(req.ID, map[string]any{"accepted": true})
+		}
 		if !s.ensureOwner(c) {
 			return failure(req.ID, -32010, "permission_denied", nil)
 		}

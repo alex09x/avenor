@@ -470,6 +470,10 @@ func (m *mockStableHandler) RuntimeAnswerPermission(runtimeID, requestID, option
 	return nil
 }
 
+func (m *mockStableHandler) RuntimeInterruptAndPrompt(runtimeID, text string, keepQueue bool) error {
+	return nil
+}
+
 func TestStableSpawnMethod(t *testing.T) {
 	state := NewState("run_1", "", 0)
 	s := NewServer(state)
