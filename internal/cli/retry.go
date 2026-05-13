@@ -60,39 +60,50 @@ func runSingleAttempt(
 		return attemptResult{exitCode: 1}
 	}
 
-	// eventCtx is independent of the orchestrator ctx so the event channel
-	// survives an interrupt_and_prompt restart.
-	eventCtx, cancelEvents := context.WithCancel(context.Background())
-	defer cancelEvents()
-
 	prompt := initPrompt
 	for {
+		// Fresh event context per turn so interrupt_and_prompt cancels
+		// the subscription cleanly.
+		eventCtx, cancelEvents := context.WithCancel(ctx)
 		eventCh, err := provider.Events(eventCtx, session.SessionID)
 		if err != nil {
+			cancelEvents()
 			fmt.Fprintf(stderr, "avenor: subscribe events: %v\n", err)
 			return attemptResult{exitCode: 1, sessionID: session.SessionID}
 		}
 
+		var interruptCh <-chan struct{}
+		if controlServer != nil {
+			interruptCh = controlServer.InterruptChan()
+		}
+
+		// Use a background context for Prompt so it survives process-cancellation
+		// (interrupt_and_prompt must not kill the process).
 		promptDone := make(chan error, 1)
 		go func() {
-			promptDone <- provider.Prompt(ctx, session.SessionID, prompt)
+			promptDone <- provider.Prompt(context.Background(), session.SessionID, prompt)
 		}()
 
-		exitCode := waitForSession(ctx, provider, writer, fileHandler, controlServer, eventCh, promptDone, session.SessionID, runID, runLabel, autoApprove, timer, stderr)
+		exitCode := waitForSession(ctx, provider, writer, fileHandler, controlServer, eventCh, promptDone, interruptCh, session.SessionID, runID, runLabel, autoApprove, timer, stderr)
+		cancelEvents()
 
 		if controlServer != nil {
-			if exitCode == 130 {
-				if interruptText := controlServer.ConsumeInterrupt(); interruptText != "" {
-					if _, err := resumeSession(ctx, provider, session.SessionID); err != nil {
-						fmt.Fprintf(stderr, "avenor: resume after cancel: %v\n", err)
-						return attemptResult{exitCode: 1, sessionID: session.SessionID}
-					}
-					prompt = interruptText
-					continue
+			// Check interrupt first (priority over queued prompts) to avoid
+			// losing the interrupt when exitCode==0 overlaps with a queued prompt.
+			if interruptText := controlServer.ConsumeInterrupt(); interruptText != "" {
+				if _, err := resumeSession(ctx, provider, session.SessionID); err != nil {
+					fmt.Fprintf(stderr, "avenor: resume after cancel: %v\n", err)
+					return attemptResult{exitCode: 1, sessionID: session.SessionID}
 				}
+				prompt = interruptText
+				continue
 			}
 			if exitCode == 0 {
 				if nextPrompt := controlServer.DequeuePrompt(); nextPrompt != "" {
+					if _, err := resumeSession(ctx, provider, session.SessionID); err != nil {
+						fmt.Fprintf(stderr, "avenor: resume after end_turn: %v\n", err)
+						return attemptResult{exitCode: 1, sessionID: session.SessionID}
+					}
 					prompt = nextPrompt
 					continue
 				}

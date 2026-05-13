@@ -45,6 +45,9 @@ type ControlServer struct {
 	promptMu        sync.Mutex
 	promptQueue     []string
 	interruptPrompt string
+
+	interruptMu sync.Mutex
+	interruptCh chan struct{}
 }
 
 type connState struct {
@@ -176,7 +179,9 @@ func (s *ControlServer) PublishEvent(event events.Event) {
 				ss.TurnState = "running"
 			}
 		case "session.end":
-			ss.TurnState = "ended"
+			if ss.TurnState != "idle" && ss.TurnState != "cancelling" {
+				ss.TurnState = "ended"
+			}
 		}
 	})
 
@@ -251,9 +256,7 @@ func (s *ControlServer) InterruptPrompt(text string, keepQueue bool) {
 		s.promptQueue = nil
 	}
 	s.promptMu.Unlock()
-	if s.cancelFn != nil {
-		s.cancelFn()
-	}
+	s.signalInterrupt()
 }
 
 func (s *ControlServer) ConsumeInterrupt() string {
@@ -262,6 +265,26 @@ func (s *ControlServer) ConsumeInterrupt() string {
 	text := s.interruptPrompt
 	s.interruptPrompt = ""
 	return text
+}
+
+func (s *ControlServer) InterruptChan() <-chan struct{} {
+	s.interruptMu.Lock()
+	defer s.interruptMu.Unlock()
+	s.interruptCh = make(chan struct{})
+	return s.interruptCh
+}
+
+func (s *ControlServer) signalInterrupt() {
+	s.interruptMu.Lock()
+	ch := s.interruptCh
+	s.interruptMu.Unlock()
+	if ch != nil {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
 }
 
 func (s *ControlServer) acceptLoop() {
@@ -381,7 +404,9 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 			KeepQueue bool   `json:"keep_queue"`
 		}
 		if len(req.Params) > 0 {
-			_ = json.Unmarshal(req.Params, &ip)
+			if err := json.Unmarshal(req.Params, &ip); err != nil {
+				return failure(req.ID, -32602, "invalid params", map[string]any{"detail": err.Error()})
+			}
 		}
 		if ip.Text == "" {
 			return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"text"}})

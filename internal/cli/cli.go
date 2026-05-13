@@ -312,6 +312,7 @@ func waitForSession(
 	controlServer *control.ControlServer,
 	eventCh <-chan events.Event,
 	promptDone <-chan error,
+	interruptCh <-chan struct{},
 	sessionID string,
 	runID string,
 	runLabel string,
@@ -454,6 +455,13 @@ func waitForSession(
 			if finalStopReason != "" && promptReturned {
 				return runtime.ExitCodeForStopReason(finalStopReason)
 			}
+		case <-interruptCh:
+			cancelCtx, cfn := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := provider.Cancel(cancelCtx, sessionID); err != nil {
+				emitErrorEvent(writer, sessionID, runID, "cancel", fmt.Sprintf("cancel session: %v", err), stderr, runLabel)
+			}
+			cfn()
+			finalStopReason = "cancelled"
 		case <-ctx.Done():
 			return cancelAndEnd(provider, writer, sessionID, runID, runLabel, "cancelled", stderr)
 		case <-timeout:

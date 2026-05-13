@@ -313,8 +313,12 @@ func TestPromptDispatch(t *testing.T) {
 func TestInterruptAndPromptDispatch(t *testing.T) {
 	state := NewState("run_1", "", 0)
 	s := NewServer(state)
-	cancelCalled := false
-	s.SetCancelFunc(func() { cancelCalled = true })
+	interruptFired := false
+	ch := s.InterruptChan()
+	go func() {
+		<-ch
+		interruptFired = true
+	}()
 	path := testSocketPath(t)
 	if err := s.Start(path); err != nil {
 		t.Fatalf("start: %v", err)
@@ -336,8 +340,9 @@ func TestInterruptAndPromptDispatch(t *testing.T) {
 	if v, _ := res["accepted"].(bool); !v {
 		t.Fatal("expected accepted=true")
 	}
-	if !cancelCalled {
-		t.Fatal("expected cancelFn to be called")
+	time.Sleep(50 * time.Millisecond)
+	if !interruptFired {
+		t.Fatal("expected InterruptChan to fire")
 	}
 }
 
