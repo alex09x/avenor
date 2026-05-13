@@ -1,10 +1,10 @@
 # Avenor
 
-Avenor is a small, single-binary ACP (Agent Client Protocol) client that helps orchestration harnesses and ACP-speaking backends work together without stepping on each other. Think of it as the bit that sits between a harness like `.botfiles` and a backend like OpenCode.
+Avenor helps an orchestration harness and an ACP-speaking backend coordinate tool calls and approvals without stepping on each other. ACP (Agent Client Protocol) is the wire protocol that lets those two sides talk; if you've got a harness like `.botfiles` on one side and a backend like OpenCode on the other, Avenor is the bit in the middle that keeps the handoff clean.
 
 ## Installation
 
-Grab the latest binary for your platform from [GitHub Releases](https://github.com/sdougbrown/avenor/releases), make it executable, and check that it runs:
+Grab the release asset for your platform from [GitHub Releases](https://github.com/sdougbrown/avenor/releases), make it executable, and check that it runs. On macOS arm64, the direct download looks like this:
 
 ```bash
 curl -fsSL https://github.com/sdougbrown/avenor/releases/latest/download/avenor_darwin_arm64 -o avenor
@@ -16,7 +16,7 @@ If you want a deeper tour, the docs cover the permission handler, event flow, pl
 
 ## Permission handling
 
-When your backend forwards tool approval through ACP `session/request_permission`, point `--permission-handler` at a file path:
+Permission handling matters because a backend can ask for approval mid-run, and Avenor's job is to broker that request without turning the harness into a blocking human-in-the-loop primitive. When your backend forwards tool approval through ACP `session/request_permission`, point `--permission-handler` at a file path:
 
 ```bash
 --permission-handler file:<path>
