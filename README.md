@@ -24,6 +24,41 @@ Permission handling matters because a backend can ask for approval mid-run, and 
 
 Avenor writes the request there and reads the response back from the same handshake. See [docs/permission-handler.md](docs/permission-handler.md) for the request and response JSON shapes.
 
+## Control sockets
+
+Avenor can expose a Unix-domain control socket so another process can inspect status, tail live events, answer permissions, cancel work, and send follow-up prompts while a run is active:
+
+```bash
+avenor \
+  --control-socket /tmp/avenor.sock \
+  --prompt "List the files in this directory and exit." \
+  --on-event /tmp/events.ndjson \
+  --sentinel-file /tmp/done.env
+
+avenor control --socket /tmp/avenor.sock status
+avenor control --socket /tmp/avenor.sock tail
+avenor control --socket /tmp/avenor.sock prompt "Continue with the next step"
+avenor control --socket /tmp/avenor.sock cancel
+```
+
+For long-lived orchestration, `avenor stable` starts a supervisor that can spawn and manage multiple child runtimes:
+
+```bash
+avenor stable --control-socket /tmp/avenor-stable.sock
+
+avenor control --socket /tmp/avenor-stable.sock spawn \
+  --prompt "Review PR #42" \
+  --dir /repo/A \
+  --label review-42
+
+avenor control --socket /tmp/avenor-stable.sock list
+avenor control --socket /tmp/avenor-stable.sock prompt "Continue" rt_1
+avenor control --socket /tmp/avenor-stable.sock cancel rt_1
+avenor control --socket /tmp/avenor-stable.sock shutdown graceful
+```
+
+The socket also speaks newline-delimited JSON-RPC 2.0 directly, and `--http-debug` can expose loopback-only HTTP/SSE endpoints for debugging. See [docs/control-protocol.md](docs/control-protocol.md) for the full method list, event stream, ownership rules, permission precedence, and HTTP debug surface.
+
 ## Consumer integration
 
 If you want to see Avenor from the consumer side, [sdougbrown/.botfiles](https://github.com/sdougbrown/.botfiles) is the reference harness. For the surrounding event model and loop mechanics, see [docs/events.md](docs/events.md), [docs/loop.md](docs/loop.md), [docs/plan.md](docs/plan.md), and [docs/backends.md](docs/backends.md).
