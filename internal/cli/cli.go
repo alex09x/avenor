@@ -84,10 +84,14 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	autoApprove := fs.Bool("auto-approve", false, "automatically approve all permission requests")
 	controlSocket := fs.String("control-socket", "", "unix socket path for control plane")
 	httpDebug := fs.String("http-debug", "", "http debug adapter bind address")
-	permClaimTimeout := fs.Duration("permission-claim-timeout", DefaultPermissionClaimTimeout, "how long to wait for a connected socket client to answer a permission request before falling through to the file handler or 'none' resolver")
+	permClaimTimeout := fs.Duration("permission-claim-timeout", 0, fmt.Sprintf("how long to wait for a connected socket client to answer a permission request before falling through to the file handler or 'none' resolver (0 uses the default: %v)", DefaultPermissionClaimTimeout))
 
 	if err := fs.Parse(args); err != nil {
 		return 1
+	}
+
+	if *permClaimTimeout == 0 {
+		*permClaimTimeout = DefaultPermissionClaimTimeout
 	}
 
 	runID := *runIDFlag
