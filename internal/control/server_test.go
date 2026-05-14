@@ -252,9 +252,22 @@ func TestHTTPDebugStatusAndCancel(t *testing.T) {
 	defer h.Stop(context.Background())
 
 	client := &http.Client{Timeout: 2 * time.Second}
+	token := h.token
 
-	// GET /status — assert 200 and run_id
+	// GET /status without token — assert 401
 	resp, err := client.Get("http://" + addr + "/status")
+	if err != nil {
+		t.Fatalf("GET /status (no token): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("GET /status (no token): %d, want 401", resp.StatusCode)
+	}
+
+	// GET /status with token — assert 200 and run_id
+	req, _ := http.NewRequest(http.MethodGet, "http://"+addr+"/status", http.NoBody)
+	req.Header.Set("X-Avenor-Token", token)
+	resp, err = client.Do(req)
 	if err != nil {
 		t.Fatalf("GET /status: %v", err)
 	}
@@ -270,10 +283,8 @@ func TestHTTPDebugStatusAndCancel(t *testing.T) {
 		t.Fatalf("run_id = %q, want run_1", status.RunID)
 	}
 
-	token := h.token
-
 	// POST /cancel — assert 200 and ok:true
-	req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/cancel", http.NoBody)
+	req, _ = http.NewRequest(http.MethodPost, "http://"+addr+"/cancel", http.NoBody)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Avenor-Token", token)
 	resp, err = client.Do(req)

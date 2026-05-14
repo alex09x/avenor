@@ -20,8 +20,9 @@ type HTTPDebugServer struct {
 }
 
 func NewHTTPDebugServer(addr string, control *ControlServer) *HTTPDebugServer {
-	if strings.HasPrefix(addr, ":") {
-		addr = "127.0.0.1" + addr
+	resolved, err := resolveDebugAddr(addr)
+	if err != nil {
+		panic(err.Error())
 	}
 	tokenBytes := make([]byte, 16)
 	if _, err := rand.Read(tokenBytes); err != nil {
@@ -34,25 +35,59 @@ func NewHTTPDebugServer(addr string, control *ControlServer) *HTTPDebugServer {
 	mux.HandleFunc("/events", h.handleEvents)
 	mux.HandleFunc("/cancel", h.handleCancel)
 	mux.HandleFunc("/answer-permission", h.handleAnswerPermission)
-	h.server = &http.Server{Addr: addr, Handler: mux}
+	h.server = &http.Server{Addr: resolved, Handler: mux}
 	fmt.Fprintf(os.Stderr, "avenor: http debug token: %s\n", token)
 	return h
 }
 
-func (h *HTTPDebugServer) checkAuth(r *http.Request) bool {
+// resolveDebugAddr normalises addr and rejects anything that would bind on a
+// non-loopback interface.  Accepted forms: ":8080", "localhost:8080",
+// "127.0.0.1:8080", "[::1]:8080".  Bare ":port" is rewritten to
+// "127.0.0.1:port".
+func resolveDebugAddr(addr string) (string, error) {
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("avenor: --http-debug: invalid address %q: %w", addr, err)
+	}
+	if port == "" {
+		return "", fmt.Errorf("avenor: --http-debug: address %q must include a port", addr)
+	}
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		// allowed
+	default:
+		return "", fmt.Errorf("avenor: --http-debug: address %q must bind to a loopback interface (localhost, 127.0.0.1, or ::1)", addr)
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+// checkAuthHeader verifies the X-Avenor-Token request header only.
+// Use this for all endpoints except /events (which must support EventSource).
+func (h *HTTPDebugServer) checkAuthHeader(r *http.Request) bool {
 	if h.token == "" {
 		return false
 	}
-	tok := []byte(h.token)
-	if hdr := r.Header.Get("X-Avenor-Token"); hdr != "" && subtle.ConstantTimeCompare([]byte(hdr), tok) == 1 {
+	hdr := r.Header.Get("X-Avenor-Token")
+	return hdr != "" && subtle.ConstantTimeCompare([]byte(hdr), []byte(h.token)) == 1
+}
+
+// checkAuthEventSource verifies the X-Avenor-Token header or the ?token=
+// query parameter.  The query-param fallback exists solely for EventSource
+// clients (browser APIs that cannot set custom headers).  Do not use this on
+// POST endpoints — query params leak into access logs, Referer headers, and
+// shell history.
+func (h *HTTPDebugServer) checkAuthEventSource(r *http.Request) bool {
+	if h.checkAuthHeader(r) {
 		return true
 	}
-	// EventSource cannot set custom headers; accept ?token= as a fallback for
-	// streaming endpoints.
-	if q := r.URL.Query().Get("token"); q != "" && subtle.ConstantTimeCompare([]byte(q), tok) == 1 {
-		return true
+	if h.token == "" {
+		return false
 	}
-	return false
+	q := r.URL.Query().Get("token")
+	return q != "" && subtle.ConstantTimeCompare([]byte(q), []byte(h.token)) == 1
 }
 
 func (h *HTTPDebugServer) Start() error {
@@ -73,6 +108,10 @@ func (h *HTTPDebugServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !h.checkAuthHeader(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	if !isLocalhostRequest(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -85,7 +124,7 @@ func (h *HTTPDebugServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !h.checkAuth(r) {
+	if !h.checkAuthEventSource(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -114,7 +153,7 @@ func (h *HTTPDebugServer) handleCancel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !h.checkAuth(r) {
+	if !h.checkAuthHeader(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -133,7 +172,7 @@ func (h *HTTPDebugServer) handleAnswerPermission(w http.ResponseWriter, r *http.
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !h.checkAuth(r) {
+	if !h.checkAuthHeader(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -166,14 +205,10 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// isLocalhostRequest returns true only when the TCP connection itself
+// originated from a loopback address.  The Host header is intentionally
+// ignored because it is caller-controlled and provides no security guarantee.
 func isLocalhostRequest(r *http.Request) bool {
-	h, _, err := net.SplitHostPort(r.Host)
-	if err != nil {
-		h = r.Host
-	}
-	if h != "localhost" && h != "127.0.0.1" && h != "::1" {
-		return false
-	}
 	remoteHost, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		remoteHost = r.RemoteAddr
