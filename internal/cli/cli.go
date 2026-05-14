@@ -22,15 +22,12 @@ import (
 
 const defaultBackend = "opencode-acp"
 
-// permissionClaimTimeout is the maximum time resolvePermission will wait for a
-// connected socket client to send answer_permission before falling through to
-// the file-handler (or the no-resolver path). This bounds the TOCTOU window
-// where HasClients() was true at the gate but the client disconnects or goes
-// silent before answering. Declared as a var so tests can shorten it.
-//
-// WARNING: tests mutate this variable. Do NOT run permission-claim tests with
-// t.Parallel() — sequential execution is required to avoid data races.
-var permissionClaimTimeout = 30 * time.Second
+// DefaultPermissionClaimTimeout is the default value for --permission-claim-timeout:
+// how long resolvePermission will wait for a connected socket client to send
+// answer_permission before falling through to the file-handler (or the
+// no-resolver path). This bounds the TOCTOU window where HasClients() was true
+// at the gate but the client disconnects or goes silent before answering.
+const DefaultPermissionClaimTimeout = 30 * time.Second
 
 type ServerDiscovery struct {
 	URL    string
@@ -87,6 +84,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	autoApprove := fs.Bool("auto-approve", false, "automatically approve all permission requests")
 	controlSocket := fs.String("control-socket", "", "unix socket path for control plane")
 	httpDebug := fs.String("http-debug", "", "http debug adapter bind address")
+	permClaimTimeout := fs.Duration("permission-claim-timeout", DefaultPermissionClaimTimeout, "how long to wait for a connected socket client to answer a permission request before falling through to the file handler or 'none' resolver")
 
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -222,7 +220,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		if controlServer != nil {
 			state.Update(func(s *control.Snapshot) { s.RetryAttempt = attempt })
 		}
-		result = runAttempt(ctx, startOptions, resumeID, writer, fileHandler, controlServer, string(promptText), runID, *label, *autoApprove, timer, stderr)
+		result = runAttempt(ctx, startOptions, resumeID, writer, fileHandler, controlServer, string(promptText), runID, *label, *autoApprove, *permClaimTimeout, timer, stderr)
 		finalSessionID = result.sessionID
 
 		if result.exitCode != 1 || attempt > *maxRetries {
@@ -332,6 +330,7 @@ func WaitForSession(
 	runID string,
 	runLabel string,
 	autoApprove bool,
+	permClaimTimeout time.Duration,
 	timeout <-chan time.Time,
 	stderr io.Writer,
 ) int {
@@ -425,7 +424,7 @@ func WaitForSession(
 				done := make(chan permissionResult, 1)
 				permissionDone = done
 				go func() {
-					res := resolvePermission(ctx, provider, fileHandler, controlServer, event, sessionID, requestID, autoApprove, writer.Write)
+					res := resolvePermission(ctx, provider, fileHandler, controlServer, event, sessionID, requestID, autoApprove, permClaimTimeout, writer.Write)
 					done <- res
 				}()
 				continue
@@ -560,6 +559,7 @@ func resolvePermission(
 	sessionID string,
 	requestID string,
 	autoApprove bool,
+	claimTimeout time.Duration,
 	emit func(events.Event) error,
 ) permissionResult {
 	options, _ := event.Fields["options"].([]any)
@@ -582,15 +582,15 @@ func resolvePermission(
 	//
 	// TOCTOU note: HasClients() may have been true when checked but the client
 	// can disconnect (or go silent) before we reach BeginPermissionClaim or
-	// before it sends answer_permission. We bound the wait with
-	// permissionClaimTimeout so that on disconnect or a silent client we fall
-	// through to the file-handler rather than blocking until SIGINT.
+	// before it sends answer_permission. We bound the wait with claimTimeout
+	// so that on disconnect or a silent client we fall through to the
+	// file-handler rather than blocking until SIGINT.
 	if controlServer != nil && controlServer.HasClients() {
 		answerCh, ok := controlServer.BeginPermissionClaim(requestID)
 		// If !ok, another claim is already in flight; fall through to the
 		// file-handler block below.
 		if ok {
-			claimTimer := time.NewTimer(permissionClaimTimeout)
+			claimTimer := time.NewTimer(claimTimeout)
 			select {
 			case ans := <-answerCh:
 				claimTimer.Stop()

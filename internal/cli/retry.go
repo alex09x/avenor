@@ -44,6 +44,7 @@ func runSingleAttempt(
 	runID string,
 	runLabel string,
 	autoApprove bool,
+	permClaimTimeout time.Duration,
 	timer <-chan time.Time,
 	stderr io.Writer,
 ) attemptResult {
@@ -97,7 +98,7 @@ func runSingleAttempt(
 			promptDone <- provider.Prompt(context.Background(), session.SessionID, prompt)
 		}()
 
-		exitCode := WaitForSession(ctx, provider, writer, fileHandler, controlServer, eventCh, promptDone, interruptCh, session.SessionID, runID, runLabel, autoApprove, timer, stderr)
+		exitCode := WaitForSession(ctx, provider, writer, fileHandler, controlServer, eventCh, promptDone, interruptCh, session.SessionID, runID, runLabel, autoApprove, permClaimTimeout, timer, stderr)
 		cancelEvents()
 
 		if controlServer != nil {

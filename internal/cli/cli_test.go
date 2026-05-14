@@ -164,7 +164,7 @@ func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) 
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "review", true, nil, &stderr)
+	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "review", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
 	}
@@ -254,6 +254,7 @@ func TestRunCleansSentinelFilesBetweenRetries(t *testing.T) {
 		runID string,
 		runLabel string,
 		autoApprove bool,
+		permClaimTimeout time.Duration,
 		timer <-chan time.Time,
 		stderr io.Writer,
 	) attemptResult {
@@ -470,7 +471,7 @@ func TestAutoAnswerGoroutineDoesNotBlockEventLoop(t *testing.T) {
 	var exitCode int
 	go func() {
 		defer wg.Done()
-		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, io.Discard)
+		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
 	}()
 
 	// Wait until AnswerPermission has been called (goroutine is now blocked inside it).
@@ -560,7 +561,7 @@ func TestAutoAnswerMissingRequestIDEmitsErrorNotWorking(t *testing.T) {
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, &stderr)
+	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
@@ -627,7 +628,7 @@ func TestAutoAnswerEmitsPermissionResponse(t *testing.T) {
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "mylabel", true, nil, &stderr)
+	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "mylabel", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
@@ -706,7 +707,7 @@ func TestAutoAnswerAnswerPermissionErrorEmitsError(t *testing.T) {
 
 	provider := &errorFakeProvider{answerErr: fmt.Errorf("backend unavailable")}
 	var stderr strings.Builder
-	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, &stderr)
+	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
 	}
@@ -761,7 +762,7 @@ func TestAutoAnswerWorkingStatusEmittedOnPermissionResume(t *testing.T) {
 	var exitCode int
 	go func() {
 		defer wg.Done()
-		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, io.Discard)
+		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
 	}()
 
 	// Wait until AnswerPermission is called, then unblock it so the
@@ -874,7 +875,7 @@ func TestControlPermissionResolution(t *testing.T) {
 	provider := &cliFakeProvider{}
 
 	// Connect to control socket BEFORE starting waitForSession so
-	// the answer arrives within the 1s claim window.
+	// the answer arrives within the claim window.
 	deadline := time.Now().Add(5 * time.Second)
 	var ctrlConn net.Conn
 	for {
@@ -894,7 +895,7 @@ func TestControlPermissionResolution(t *testing.T) {
 	var exitCode int
 	go func() {
 		defer wg.Done()
-		exitCode = WaitForSession(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_ctrl", "run_1", "mylabel", false, nil, io.Discard)
+		exitCode = WaitForSession(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_ctrl", "run_1", "mylabel", false, 5*time.Second, nil, io.Discard)
 	}()
 
 	// Wait for the permission.request to be processed by the event loop
@@ -968,7 +969,7 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 	var exitCode int
 	go func() {
 		defer wg.Done()
-		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, nil, io.Discard)
+		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
 	}()
 
 	// Wait until the first AnswerPermission call is in-flight (blocking).
@@ -1019,13 +1020,9 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 // client is connected at the HasClients() gate but never sends answer_permission,
 // resolvePermission times out and falls through to the file-handler rather than
 // blocking until SIGINT.
-//
-// NOTE: mutates package-level permissionClaimTimeout — do not run with t.Parallel().
 func TestControlPermissionClaimTimeoutFallsThrough(t *testing.T) {
 	// Shorten the claim window so the test completes quickly.
-	old := permissionClaimTimeout
-	permissionClaimTimeout = 100 * time.Millisecond
-	t.Cleanup(func() { permissionClaimTimeout = old })
+	claimTimeout := 100 * time.Millisecond
 
 	// Use /tmp to keep socket path under the 104-byte macOS limit.
 	sockDir, err := os.MkdirTemp("", "av-pct-*")
@@ -1076,16 +1073,16 @@ func TestControlPermissionClaimTimeoutFallsThrough(t *testing.T) {
 	// resolvePermission should time out waiting for the silent client,
 	// then fall through to the no-resolver path (fileHandler == nil).
 	start := time.Now()
-	res := resolvePermission(context.Background(), provider, nil, cs, event, "ses_timeout", "req_timeout", false, emit)
+	res := resolvePermission(context.Background(), provider, nil, cs, event, "ses_timeout", "req_timeout", false, claimTimeout, emit)
 	elapsed := time.Since(start)
 
 	// Lower bound: must have waited at least the claim timeout (80ms gives 20ms slack).
 	if elapsed < 80*time.Millisecond {
-		t.Fatalf("resolvePermission returned too quickly (%v); expected to wait ~%v for the claim timer", elapsed, permissionClaimTimeout)
+		t.Fatalf("resolvePermission returned too quickly (%v); expected to wait ~%v for the claim timer", elapsed, claimTimeout)
 	}
 	// Upper bound: should not have blocked indefinitely.
 	if elapsed > 5*time.Second {
-		t.Fatalf("resolvePermission blocked for %v, want ~%v", elapsed, permissionClaimTimeout)
+		t.Fatalf("resolvePermission blocked for %v, want ~%v", elapsed, claimTimeout)
 	}
 	// No file-handler provided, so result should be the no-resolver sentinel.
 	if res.source != "none" {
@@ -1107,12 +1104,8 @@ func TestControlPermissionClaimTimeoutFallsThrough(t *testing.T) {
 // TestControlPermissionClaimTimeoutFallsToFileHandler verifies that when the
 // claim times out and a file-handler is configured, resolvePermission routes to
 // the file-handler rather than returning source "none".
-//
-// NOTE: mutates package-level permissionClaimTimeout — do not run with t.Parallel().
 func TestControlPermissionClaimTimeoutFallsToFileHandler(t *testing.T) {
-	old := permissionClaimTimeout
-	permissionClaimTimeout = 100 * time.Millisecond
-	t.Cleanup(func() { permissionClaimTimeout = old })
+	claimTimeout := 100 * time.Millisecond
 
 	// Use /tmp to keep socket path under the 104-byte macOS limit.
 	sockDir, err := os.MkdirTemp("", "av-pcf-*")
@@ -1187,7 +1180,7 @@ func TestControlPermissionClaimTimeoutFallsToFileHandler(t *testing.T) {
 	provider := &cliFakeProvider{}
 	emit := func(events.Event) error { return nil }
 
-	res := resolvePermission(context.Background(), provider, fh, cs, event, "ses_fh", "req_fh", false, emit)
+	res := resolvePermission(context.Background(), provider, fh, cs, event, "ses_fh", "req_fh", false, claimTimeout, emit)
 
 	if res.err != nil {
 		t.Fatalf("unexpected error: %v", res.err)
@@ -1211,13 +1204,9 @@ func TestControlPermissionClaimTimeoutFallsToFileHandler(t *testing.T) {
 // context is cancelled while resolvePermission is waiting on the control-plane
 // claim channel, the claim is cleaned up (HasPendingPermission returns false)
 // and the result carries the context error.
-//
-// NOTE: mutates package-level permissionClaimTimeout — do not run with t.Parallel().
 func TestControlPermissionClaimContextCancelReleasesClaim(t *testing.T) {
 	// Use a long claim timeout so we know the ctx.Done() branch fires, not the timer.
-	old := permissionClaimTimeout
-	permissionClaimTimeout = 30 * time.Second
-	t.Cleanup(func() { permissionClaimTimeout = old })
+	claimTimeout := 30 * time.Second
 
 	// Use /tmp to keep socket path under the 104-byte macOS limit.
 	sockDir, err := os.MkdirTemp("", "av-pcx-*")
@@ -1282,7 +1271,7 @@ func TestControlPermissionClaimContextCancelReleasesClaim(t *testing.T) {
 
 	resultCh := make(chan permissionResult, 1)
 	go func() {
-		resultCh <- resolvePermission(ctx, provider, nil, cs, event, "ses_cancel", "req_cancel", false, emit)
+		resultCh <- resolvePermission(ctx, provider, nil, cs, event, "ses_cancel", "req_cancel", false, claimTimeout, emit)
 	}()
 
 	// Wait for the claim to be registered before cancelling.

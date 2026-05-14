@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/sdougbrown/avenor/internal/cli"
 	"github.com/sdougbrown/avenor/internal/stable"
 )
 
@@ -16,6 +17,7 @@ func runStable(args []string) int {
 	maxRuntimes := fs.Int("max-runtimes", 8, "maximum concurrent child runtimes")
 	idleTimeout := fs.Duration("idle-timeout", 0, "exit after this duration with no child runtimes and no control connections")
 	shutdownTimeout := fs.Duration("shutdown-timeout", 10*time.Second, "graceful shutdown timeout before killing children")
+	permClaimTimeout := fs.Duration("permission-claim-timeout", cli.DefaultPermissionClaimTimeout, "how long to wait for a connected socket client to answer a permission request before falling through to the file handler or 'none' resolver")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -25,11 +27,12 @@ func runStable(args []string) int {
 	}
 
 	sup := stable.NewSupervisor(stable.Config{
-		ControlSocket:   *controlSocket,
-		HTTPDebug:       *httpDebug,
-		MaxRuntimes:     *maxRuntimes,
-		IdleTimeout:     *idleTimeout,
-		ShutdownTimeout: *shutdownTimeout,
+		ControlSocket:          *controlSocket,
+		HTTPDebug:              *httpDebug,
+		MaxRuntimes:            *maxRuntimes,
+		IdleTimeout:            *idleTimeout,
+		ShutdownTimeout:        *shutdownTimeout,
+		PermissionClaimTimeout: *permClaimTimeout,
 	})
 	return sup.Run()
 }
