@@ -70,6 +70,7 @@ type Client struct {
 	pending   map[int]chan Response
 	eventCh   chan Event
 	eventOnce sync.Once
+	dropped   int // events discarded due to full eventCh; surfaced as client.lagged
 }
 
 func Dial(socketPath string) (*Client, error) {
@@ -209,7 +210,23 @@ func (c *Client) readLoop() {
 		if err := json.Unmarshal(n.Params, &ev); err != nil {
 			continue
 		}
-		c.eventCh <- ev
+		// Non-blocking send: if the consumer falls behind, drop the event and
+		// surface a synthetic client.lagged event so the response dispatch path
+		// never wedges (mirrors the server's subscriber.lagged backpressure).
+		select {
+		case c.eventCh <- ev:
+			if c.dropped > 0 {
+				lag := c.dropped
+				c.dropped = 0
+				select {
+				case c.eventCh <- Event{Event: "client.lagged", Raw: map[string]any{"event": "client.lagged", "dropped_count": lag}}:
+				default:
+					c.dropped += lag
+				}
+			}
+		default:
+			c.dropped++
+		}
 	}
 }
 

@@ -303,7 +303,7 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 			fmt.Fprintf(os.Stderr, "avenor stable: child %s panic: %v\n", child.id, r)
 			s.emitChildError(child, fmt.Sprintf("panic: %v", r), "error")
 			if child.sentinelFile != "" {
-				cli.WriteSentinel(child.sentinelFile, 1, child.session.SessionID, "error", s.runID, os.Stderr)
+				cli.WriteSentinel(child.sentinelFile, 1, child.sessionID(), "error", s.runID, os.Stderr)
 			}
 		}
 		close(child.done)
@@ -436,6 +436,12 @@ func (c *childRuntime) signalPrompt() {
 	}
 }
 
+func (c *childRuntime) sessionID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.session.SessionID
+}
+
 func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, resumeID, promptText string, timer <-chan time.Time) childAttemptResult {
 	session, err := cli.StartSession(ctx, child.provider, runtime.StartOptions{
 		Agent: "",
@@ -491,7 +497,7 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 func (s *Supervisor) emitSessionEnd(child *childRuntime, exitCode int, stopReason string) {
 	s.control.PublishEvent(events.Event{
 		Event:     "session.end",
-		SessionID: child.session.SessionID,
+		SessionID: child.sessionID(),
 		Fields: map[string]any{
 			"stop_reason": stopReason,
 			"runtime_id":  child.id,
@@ -503,7 +509,7 @@ func (s *Supervisor) emitSessionEnd(child *childRuntime, exitCode int, stopReaso
 
 func (s *Supervisor) writeIdleCancelled(child *childRuntime) {
 	if child.sentinelFile != "" {
-		cli.WriteSentinel(child.sentinelFile, 130, child.session.SessionID, "cancelled", s.runID, os.Stderr)
+		cli.WriteSentinel(child.sentinelFile, 130, child.sessionID(), "cancelled", s.runID, os.Stderr)
 	}
 	s.emitSessionEnd(child, 130, "cancelled")
 }
@@ -511,7 +517,7 @@ func (s *Supervisor) writeIdleCancelled(child *childRuntime) {
 func (s *Supervisor) emitChildError(child *childRuntime, message, source string) {
 	s.control.PublishEvent(events.Event{
 		Event:     "avenor.error",
-		SessionID: child.session.SessionID,
+		SessionID: child.sessionID(),
 		Fields: map[string]any{
 			"message":    message,
 			"source":     source,

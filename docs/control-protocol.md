@@ -151,6 +151,8 @@ Cancels the run (equivalent to SIGINT). Writes `STOP_REASON=cancelled` to the se
 
 Queues a follow-up prompt. If the session is idle, starts immediately; otherwise starts after the current turn ends. Requires ownership.
 
+`prompt` never preempts the active turn — the queued text waits for the in-flight `provider.Prompt` to return (whether by `end_turn`, cancellation, or error) before dispatching. Use `interrupt_and_prompt` when you need to cut through the current turn.
+
 #### `answer_permission`
 
 ```json
@@ -216,14 +218,16 @@ Shuts down the supervisor. `graceful` cancels children and waits up to `--shutdo
 
 ## Permission Resolution Precedence
 
-When `--control-socket` is active, permission requests are resolved by trying these sources in order:
+Permission requests are resolved by trying these sources in order:
 
 1. **Auto-approve** (`--auto-approve` flag) — resolves immediately.
-2. **Control owner** — the connected owner may answer within a 1s claim window.
-3. **File handler** (`--permission-handler file:<path>`) — writes `.req`, polls `.req.response`.
+2. **Control socket clients** — when at least one client is connected to the control socket, it is expected to answer via `answer_permission`. The backend waits indefinitely (until the request is answered, the run is cancelled, or the backend times out).
+3. **File handler** (`--permission-handler file:<path>`) — used when no control socket client is connected. Writes `.req`, polls `.req.response`.
 4. **No resolver** — `permission.request` is emitted, backend waits until context cancellation or backend timeout.
 
 `permission.response` events are emitted for all resolution paths (auto-approve, control, file).
+
+The HTTP debug adapter is observation-only with respect to permissions: it can answer via `/answer-permission` **only when `--control-socket` is also active and a client is claiming requests**. Without an active socket client, permission resolution falls through to the file handler regardless of `--http-debug`.
 
 ## Owner Semantics
 

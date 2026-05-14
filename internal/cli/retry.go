@@ -86,6 +86,7 @@ func runSingleAttempt(
 
 		var interruptCh <-chan struct{}
 		if controlServer != nil {
+			controlServer.ResetInterrupt()
 			interruptCh = controlServer.InterruptChan()
 		}
 

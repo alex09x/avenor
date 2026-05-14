@@ -76,6 +76,8 @@ type subscriber struct {
 	conn    *connState
 	ch      chan events.Event
 	dropped int
+	mu      sync.Mutex // guards ch from concurrent close+send
+	closed  bool
 }
 
 func NewServer(state *ControlState) *ControlServer {
@@ -157,6 +159,17 @@ func (s *ControlServer) Stop() {
 	if path != "" {
 		_ = os.Remove(path)
 	}
+}
+
+// HasClients reports whether the control plane has at least one connected
+// client capable of answering control RPCs. Returns false when no socket is
+// bound (e.g. --http-debug without --control-socket) or when no client has
+// dialed in yet. Used to gate features that should defer to fallbacks
+// (file-handler permissions) when nothing on the socket can answer.
+func (s *ControlServer) HasClients() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.path != "" && len(s.conns) > 0
 }
 
 func (s *ControlServer) SubscribeEvents(ctx context.Context) <-chan events.Event {
@@ -298,7 +311,20 @@ func (s *ControlServer) ConsumeInterrupt() string {
 	return text
 }
 
+// InterruptChan returns the channel that closes when an interrupt fires.
+// Idempotent: returns the same channel until ResetInterrupt is called.
 func (s *ControlServer) InterruptChan() <-chan struct{} {
+	s.interruptMu.Lock()
+	defer s.interruptMu.Unlock()
+	if s.interruptCh == nil {
+		s.interruptCh = make(chan struct{})
+	}
+	return s.interruptCh
+}
+
+// ResetInterrupt closes the current interrupt channel (if any) and creates a
+// fresh one. Call this between turns to re-arm the interrupt signal.
+func (s *ControlServer) ResetInterrupt() {
 	s.interruptMu.Lock()
 	defer s.interruptMu.Unlock()
 	if s.interruptCh != nil {
@@ -309,7 +335,6 @@ func (s *ControlServer) InterruptChan() <-chan struct{} {
 		}
 	}
 	s.interruptCh = make(chan struct{})
-	return s.interruptCh
 }
 
 func (s *ControlServer) signalInterrupt() {
@@ -611,7 +636,10 @@ func (s *ControlServer) disconnect(c *connState) {
 	for sub := range s.subs {
 		if sub.conn == c {
 			delete(s.subs, sub)
+			sub.mu.Lock()
+			sub.closed = true
 			close(sub.ch)
+			sub.mu.Unlock()
 		}
 	}
 	if s.owner == c {
@@ -640,6 +668,11 @@ func (c *connState) writeJSON(v any) error {
 }
 
 func (s *subscriber) enqueue(ev events.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
 	select {
 	case s.ch <- ev:
 	default:

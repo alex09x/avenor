@@ -561,7 +561,11 @@ func resolvePermission(
 		return permissionResult{requestID: requestID, optionID: optionID, kind: permissionKindFromOptionID(optionID, options), source: "avenor"}
 	}
 
-	if controlServer != nil {
+	// Only consult the control plane when a client is actually connected to
+	// the socket. Without this gate, --http-debug-only (or a socket with no
+	// connected client) would silently swallow permission requests and the
+	// file-handler fallback below would be unreachable.
+	if controlServer != nil && controlServer.HasClients() {
 		answerCh := controlServer.BeginPermissionClaim(requestID)
 		defer controlServer.EndPermissionClaim(requestID)
 		select {

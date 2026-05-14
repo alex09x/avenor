@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -39,7 +40,19 @@ func NewHTTPDebugServer(addr string, control *ControlServer) *HTTPDebugServer {
 }
 
 func (h *HTTPDebugServer) checkAuth(r *http.Request) bool {
-	return h.token != "" && r.Header.Get("X-Avenor-Token") == h.token
+	if h.token == "" {
+		return false
+	}
+	tok := []byte(h.token)
+	if hdr := r.Header.Get("X-Avenor-Token"); hdr != "" && subtle.ConstantTimeCompare([]byte(hdr), tok) == 1 {
+		return true
+	}
+	// EventSource cannot set custom headers; accept ?token= as a fallback for
+	// streaming endpoints.
+	if q := r.URL.Query().Get("token"); q != "" && subtle.ConstantTimeCompare([]byte(q), tok) == 1 {
+		return true
+	}
+	return false
 }
 
 func (h *HTTPDebugServer) Start() error {
@@ -70,6 +83,10 @@ func (h *HTTPDebugServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (h *HTTPDebugServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.checkAuth(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	if !isLocalhostRequest(r) {
