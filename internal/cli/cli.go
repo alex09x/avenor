@@ -587,65 +587,64 @@ func resolvePermission(
 	// through to the file-handler rather than blocking until SIGINT.
 	if controlServer != nil && controlServer.HasClients() {
 		answerCh, ok := controlServer.BeginPermissionClaim(requestID)
-		if !ok {
-			// Another claim is already in flight; fall through to file-handler.
-			goto fileHandlerFallback
-		}
-		claimTimer := time.NewTimer(permissionClaimTimeout)
-		select {
-		case ans := <-answerCh:
-			claimTimer.Stop()
-			controlServer.EndPermissionClaim(requestID)
-			resp := runtime.PermissionResponse{Outcome: "selected", OptionID: ans.OptionID}
-			if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
-				return permissionResult{err: err}
-			}
-			return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
-		case <-ctx.Done():
-			claimTimer.Stop()
-			// EndPermissionClaim clears pendingAnswer so the server's next
-			// ownership check sees no claim. Drain the channel afterwards to
-			// catch any answer the server sent in the window between reading
-			// pendingAnswer (under its lock) and our clear landing.
-			// Residual window: a send completing after the drain (between
-			// EndPermissionClaim's unlock and select{default}) is silently
-			// lost — no sleep added per policy.
-			controlServer.EndPermissionClaim(requestID)
+		// If !ok, another claim is already in flight; fall through to the
+		// file-handler block below.
+		if ok {
+			claimTimer := time.NewTimer(permissionClaimTimeout)
 			select {
 			case ans := <-answerCh:
+				claimTimer.Stop()
+				controlServer.EndPermissionClaim(requestID)
 				resp := runtime.PermissionResponse{Outcome: "selected", OptionID: ans.OptionID}
 				if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 					return permissionResult{err: err}
 				}
 				return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
-			default:
-			}
-			return permissionResult{err: ctx.Err()}
-		case <-claimTimer.C:
-			// Client disconnected or went silent after HasClients() gate.
-			// EndPermissionClaim first: clears pendingAnswer so the server's
-			// ownership check sees no active claim and won't accept new sends.
-			// Then drain to catch any answer already queued in the buffered
-			// channel before or during our clear.
-			// Residual window: a send completing after the drain (between
-			// EndPermissionClaim's unlock and select{default}) is silently
-			// lost — the server already replied "accepted: true" to the client
-			// in that case. No sleep added per policy.
-			controlServer.EndPermissionClaim(requestID)
-			select {
-			case ans := <-answerCh:
-				resp := runtime.PermissionResponse{Outcome: "selected", OptionID: ans.OptionID}
-				if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
-					return permissionResult{err: err}
+			case <-ctx.Done():
+				claimTimer.Stop()
+				// EndPermissionClaim clears pendingAnswer so the server's next
+				// ownership check sees no claim. Drain the channel afterwards to
+				// catch any answer the server sent in the window between reading
+				// pendingAnswer (under its lock) and our clear landing.
+				// Residual window: a send completing after the drain (between
+				// EndPermissionClaim's unlock and select{default}) is silently
+				// lost — no sleep added per policy.
+				controlServer.EndPermissionClaim(requestID)
+				select {
+				case ans := <-answerCh:
+					resp := runtime.PermissionResponse{Outcome: "selected", OptionID: ans.OptionID}
+					if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
+						return permissionResult{err: err}
+					}
+					return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
+				default:
 				}
-				return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
-			default:
-				// Nothing in the channel; fall through to the file-handler.
+				return permissionResult{err: ctx.Err()}
+			case <-claimTimer.C:
+				// Client disconnected or went silent after HasClients() gate.
+				// EndPermissionClaim first: clears pendingAnswer so the server's
+				// ownership check sees no active claim and won't accept new sends.
+				// Then drain to catch any answer already queued in the buffered
+				// channel before or during our clear.
+				// Residual window: a send completing after the drain (between
+				// EndPermissionClaim's unlock and select{default}) is silently
+				// lost — the server already replied "accepted: true" to the client
+				// in that case. No sleep added per policy.
+				controlServer.EndPermissionClaim(requestID)
+				select {
+				case ans := <-answerCh:
+					resp := runtime.PermissionResponse{Outcome: "selected", OptionID: ans.OptionID}
+					if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
+						return permissionResult{err: err}
+					}
+					return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
+				default:
+					// Nothing in the channel; fall through to the file-handler.
+				}
 			}
 		}
 	}
 
-fileHandlerFallback:
 	if fileHandler != nil {
 		res, err := fileHandler.Handle(ctx, provider, event, emit)
 		if err != nil {
