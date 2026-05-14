@@ -240,13 +240,36 @@ Multiple connections may observe (subscribe, status, list). Event subscriptions 
 When `--http-debug :8080` is passed, the process starts an HTTP debug adapter bound to localhost:
 
 ```
-GET  /status            — current snapshot JSON
-GET  /events            — Server-Sent Events stream (SSE)
-POST /cancel            — cancel the run
-POST /answer-permission — answer a permission request
+GET  /status                    — current snapshot JSON
+GET  /status/<runtime_id>       — per-runtime snapshot (stable mode only)
+GET  /events                    — Server-Sent Events stream (SSE)
+GET  /events?runtime_id=<id>    — SSE stream filtered to one runtime
+POST /cancel                    — cancel the run (CLI mode); 400 in stable mode
+POST /cancel/<runtime_id>       — cancel a single runtime (stable mode only)
+POST /answer-permission         — answer a permission request
 ```
 
-The HTTP adapter is an in-process debug tool. It binds only to localhost by default (`127.0.0.1`). The Unix socket remains the source of truth for ownership, lifecycles, and permission state.
+### Authentication
+
+All endpoints except `/events` require an `X-Avenor-Token` header. The token is printed to stderr at startup (only when stderr is an interactive terminal). `/events` additionally accepts a `?token=` query parameter as a fallback for EventSource clients that cannot set custom headers — do not use the query-param form on POST endpoints.
+
+### Endpoint details
+
+**`GET /status`** — returns the top-level control state snapshot as JSON. Responds `401` if the token is missing or wrong.
+
+**`GET /status/<runtime_id>`** (stable mode only) — returns the snapshot for a single runtime. Same `X-Avenor-Token` auth as `/status`. Returns `404 runtime not found` if the ID is unknown. In CLI mode (no stable adapter wired) this route always returns `404 not found`.
+
+**`GET /events`** — SSE stream of all events. Accepts auth via `X-Avenor-Token` header or `?token=` query parameter. An optional `?runtime_id=<id>` query parameter filters the stream to events whose `runtime_id` field matches; if omitted, the full unfiltered stream is delivered.
+
+**`POST /cancel`** — in CLI mode, fires the global cancel (equivalent to SIGINT). In stable mode this endpoint returns `400 runtime_id required in stable mode; use POST /cancel/<runtime_id>`. Clients that previously relied on `POST /cancel` in stable mode to cancel everything must migrate to cancelling each runtime individually with `POST /cancel/<runtime_id>`.
+
+**`POST /cancel/<runtime_id>`** (stable mode only) — cancels a single runtime. Returns `404 runtime not found` if the ID is unknown. In CLI mode returns `404 not found`.
+
+**`POST /answer-permission`** — answers the currently pending permission request. See the Permission Resolution Precedence section for constraints.
+
+### Localhost binding
+
+The HTTP adapter binds only to loopback. Bare `:port` is rewritten to `127.0.0.1:port`. When the `--http-debug` host is a hostname (e.g. `localhost`), the bind address is resolved at startup and rejected unless every resolved IP is a loopback address. `localhost` is hard-coded to `127.0.0.1` to avoid `/etc/hosts` ordering flakiness rather than being passed to DNS. The Unix socket remains the source of truth for ownership, lifecycles, and permission state.
 
 ## Socket Lifecycle
 
