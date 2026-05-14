@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -63,6 +64,7 @@ func authedPost(t *testing.T, client *http.Client, url, token string) *http.Resp
 // --- mock StableAdapter ------------------------------------------------------
 
 type mockAdapter struct {
+	mu          sync.RWMutex
 	runtimes    map[string]any
 	cancelCalls []string
 	cancelErr   error
@@ -72,20 +74,51 @@ func newMockAdapter(runtimes map[string]any) *mockAdapter {
 	return &mockAdapter{runtimes: runtimes}
 }
 
-func (m *mockAdapter) HTTPRuntimeStatus(runtimeID string) (any, bool) {
+func (m *mockAdapter) HTTPRuntimeStatus(runtimeID string) (any, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	snap, ok := m.runtimes[runtimeID]
-	return snap, ok
+	if !ok {
+		return nil, ErrRuntimeNotFound
+	}
+	return snap, nil
 }
 
 func (m *mockAdapter) HTTPCancelRuntime(runtimeID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.cancelErr != nil {
 		return m.cancelErr
 	}
 	if _, ok := m.runtimes[runtimeID]; !ok {
-		return fmt.Errorf("runtime %q not found", runtimeID)
+		return ErrRuntimeNotFound
 	}
 	m.cancelCalls = append(m.cancelCalls, runtimeID)
 	return nil
+}
+
+// SetRuntime is a concurrency-safe helper for tests that mutate adapter state
+// after construction (e.g., while a concurrent SSE stream is active).
+func (m *mockAdapter) SetRuntime(id string, snap any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.runtimes[id] = snap
+}
+
+// SetCancelErr is a concurrency-safe helper to inject a cancel error.
+func (m *mockAdapter) SetCancelErr(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cancelErr = err
+}
+
+// CancelCalls returns a copy of the cancel call log.
+func (m *mockAdapter) CancelCalls() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]string, len(m.cancelCalls))
+	copy(out, m.cancelCalls)
+	return out
 }
 
 // --- resolveDebugAddr tests --------------------------------------------------
@@ -502,8 +535,8 @@ func TestHTTPCancelRuntimeStableMode(t *testing.T) {
 	if v, _ := result["ok"].(bool); !v {
 		t.Errorf("ok = %v, want true", result["ok"])
 	}
-	if len(adapter.cancelCalls) != 1 || adapter.cancelCalls[0] != "rt_1" {
-		t.Errorf("cancelCalls = %v, want [rt_1]", adapter.cancelCalls)
+	if calls := adapter.CancelCalls(); len(calls) != 1 || calls[0] != "rt_1" {
+		t.Errorf("cancelCalls = %v, want [rt_1]", calls)
 	}
 }
 
@@ -552,4 +585,201 @@ func TestHTTPCancelCLIModeFiresGlobalCancel(t *testing.T) {
 	if !cancelled {
 		t.Error("cancelFn was not called")
 	}
+}
+
+// --- Auth matrix tests for per-runtime and events endpoints ------------------
+//
+// Each sub-test checks: (1) missing token → 401, (2) wrong token → 401,
+// (3) correct token → non-401 (auth passed; exact success/not-found code is
+// route-specific and tested elsewhere).
+
+// unauthGet sends a GET without any auth header or token query parameter.
+func unauthGet(t *testing.T, client *http.Client, url string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, url, http.NoBody)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	return resp
+}
+
+// wrongTokenGet sends a GET with a deliberately incorrect X-Avenor-Token header.
+func wrongTokenGet(t *testing.T, client *http.Client, url string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, url, http.NoBody)
+	req.Header.Set("X-Avenor-Token", "00000000000000000000000000000000")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	return resp
+}
+
+// unauthPost sends a POST without any auth header.
+func unauthPost(t *testing.T, client *http.Client, url string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, url, http.NoBody)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	return resp
+}
+
+// wrongTokenPost sends a POST with a deliberately incorrect X-Avenor-Token header.
+func wrongTokenPost(t *testing.T, client *http.Client, url string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, url, http.NoBody)
+	req.Header.Set("X-Avenor-Token", "00000000000000000000000000000000")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	return resp
+}
+
+func TestAuthRequiredStatusRuntime(t *testing.T) {
+	state := NewState("run_stable", "", 0)
+	ctrl := NewServer(state)
+	adapter := newMockAdapter(map[string]any{
+		"rt_1": map[string]any{"runtime_id": "rt_1"},
+	})
+	_, addr, token := startDebugServer(t, ctrl, adapter)
+	client := &http.Client{Timeout: 2 * time.Second}
+	url := "http://" + addr + "/status/rt_1"
+
+	t.Run("missing token returns 401", func(t *testing.T) {
+		resp := unauthGet(t, client, url)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("GET /status/rt_1 (no token): %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("wrong token returns 401", func(t *testing.T) {
+		resp := wrongTokenGet(t, client, url)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("GET /status/rt_1 (wrong token): %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("correct token passes auth", func(t *testing.T) {
+		resp := authedGet(t, client, url, token)
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized {
+			t.Fatalf("GET /status/rt_1 (correct token): got 401, want non-401")
+		}
+	})
+}
+
+func TestAuthRequiredCancelRuntime(t *testing.T) {
+	state := NewState("run_stable", "", 0)
+	ctrl := NewServer(state)
+	adapter := newMockAdapter(map[string]any{
+		"rt_1": map[string]any{"runtime_id": "rt_1"},
+	})
+	_, addr, token := startDebugServer(t, ctrl, adapter)
+	client := &http.Client{Timeout: 2 * time.Second}
+	url := "http://" + addr + "/cancel/rt_1"
+
+	t.Run("missing token returns 401", func(t *testing.T) {
+		resp := unauthPost(t, client, url)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("POST /cancel/rt_1 (no token): %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("wrong token returns 401", func(t *testing.T) {
+		resp := wrongTokenPost(t, client, url)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("POST /cancel/rt_1 (wrong token): %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("correct token passes auth", func(t *testing.T) {
+		resp := authedPost(t, client, url, token)
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized {
+			t.Fatalf("POST /cancel/rt_1 (correct token): got 401, want non-401")
+		}
+	})
+}
+
+func TestAuthRequiredEventsRuntimeIDFilter(t *testing.T) {
+	// /events uses checkAuthEventSource which accepts both header and ?token=
+	// query parameter. Test both the header path and the query-param path.
+	state := NewState("run_stable", "", 0)
+	ctrl := NewServer(state)
+	_, addr, token := startDebugServer(t, ctrl, nil)
+	// Use a very short timeout: we only care about the HTTP status, not the
+	// streaming body.
+	client := &http.Client{Timeout: 2 * time.Second}
+	baseURL := "http://" + addr + "/events?runtime_id=rt_1"
+
+	t.Run("missing header and no token param returns 401", func(t *testing.T) {
+		resp := unauthGet(t, client, baseURL)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("GET /events (no token): %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("wrong header token returns 401", func(t *testing.T) {
+		resp := wrongTokenGet(t, client, baseURL)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("GET /events (wrong header token): %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("wrong query token returns 401", func(t *testing.T) {
+		url := baseURL + "&token=00000000000000000000000000000000"
+		resp := unauthGet(t, client, url)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("GET /events (wrong query token): %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("correct header token passes auth", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		req, _ := http.NewRequest(http.MethodGet, baseURL, http.NoBody)
+		req.Header.Set("X-Avenor-Token", token)
+		req = req.WithContext(ctx)
+		sseClient := &http.Client{}
+		resp, err := sseClient.Do(req)
+		if err != nil && ctx.Err() == nil {
+			t.Fatalf("GET /events (correct header token): %v", err)
+		}
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusUnauthorized {
+				t.Fatalf("GET /events (correct header token): got 401, want non-401")
+			}
+		}
+	})
+
+	t.Run("correct query token passes auth", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		url := baseURL + "&token=" + token
+		req, _ := http.NewRequest(http.MethodGet, url, http.NoBody)
+		req = req.WithContext(ctx)
+		sseClient := &http.Client{}
+		resp, err := sseClient.Do(req)
+		if err != nil && ctx.Err() == nil {
+			t.Fatalf("GET /events (correct query token): %v", err)
+		}
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusUnauthorized {
+				t.Fatalf("GET /events (correct query token): got 401, want non-401")
+			}
+		}
+	})
 }
