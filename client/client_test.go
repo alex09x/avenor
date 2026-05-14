@@ -322,3 +322,62 @@ func TestClientStatusWithRuntimeID(t *testing.T) {
 		t.Fatalf("status with runtime_id: %v", err)
 	}
 }
+
+func TestClientCallAfterEventsHandlesImmediateResponse(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	c := &Client{
+		conn:    clientConn,
+		scan:    bufio.NewScanner(clientConn),
+		pending: map[int]chan Response{},
+		eventCh: make(chan Event, 2),
+	}
+	_ = c.Events()
+
+	go func() {
+		scanner := bufio.NewScanner(serverConn)
+		if !scanner.Scan() {
+			return
+		}
+		var req Request
+		_ = json.Unmarshal(scanner.Bytes(), &req)
+		resp := Response{JSONRPC: "2.0", ID: req.ID}
+		resp.Result, _ = json.Marshal(map[string]any{"ok": true})
+		data, _ := json.Marshal(resp)
+		data = append(data, '\n')
+		_, _ = serverConn.Write(data)
+	}()
+
+	var result map[string]any
+	if err := c.Call("status", nil, &result); err != nil {
+		t.Fatalf("Call after Events(): %v", err)
+	}
+	if result["ok"] != true {
+		t.Fatalf("result = %#v, want ok=true", result)
+	}
+}
+
+func TestClientCallReturnsErrorWhenConnectionCloses(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	c := &Client{
+		conn:    clientConn,
+		scan:    bufio.NewScanner(clientConn),
+		pending: map[int]chan Response{},
+		eventCh: make(chan Event, 2),
+	}
+
+	go func() {
+		buf := make([]byte, 1024)
+		_, _ = serverConn.Read(buf)
+		_ = serverConn.Close()
+	}()
+
+	if err := c.Call("status", nil, nil); err == nil {
+		t.Fatal("Call returned nil after connection closed; want error")
+	}
+}

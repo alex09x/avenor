@@ -1,7 +1,12 @@
 package stable
 
 import (
+	"context"
 	"testing"
+	"time"
+
+	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/sdougbrown/avenor/internal/runtime"
 )
 
 func TestNewSupervisor(t *testing.T) {
@@ -158,4 +163,107 @@ func TestRuntimeInterruptAndPromptCancelsTurnNotRuntime(t *testing.T) {
 	if len(rt.promptQueue) != 1 || rt.promptQueue[0] != "replacement" {
 		t.Fatalf("promptQueue = %#v, want replacement queued first", rt.promptQueue)
 	}
+}
+
+func TestRunChildAttemptUsesInitialSpawnSession(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-initial-session.sock",
+		MaxRuntimes:   1,
+	})
+	provider := &stableFakeProvider{
+		events: make(chan events.Event, 1),
+	}
+	child := &childRuntime{
+		id:          "rt_1",
+		label:       "test",
+		provider:    provider,
+		session:     runtime.Session{SessionID: "ses_initial"},
+		eventWriter: stableTestSink{},
+		done:        make(chan struct{}),
+		promptCh:    make(chan struct{}, 1),
+	}
+
+	result := sup.runChildAttempt(context.Background(), child, "", "hello", nil)
+	if result.exitCode != 0 {
+		t.Fatalf("exitCode = %d, want 0", result.exitCode)
+	}
+	if result.sessionID != "ses_initial" {
+		t.Fatalf("sessionID = %q, want initial session", result.sessionID)
+	}
+	if provider.startCalls != 0 {
+		t.Fatalf("Start called %d times, want 0 for initial spawn session", provider.startCalls)
+	}
+}
+
+func TestShutdownTimeoutDoesNotHangWithMultipleStuckRuntimes(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket:   "/tmp/test-shutdown-timeout.sock",
+		MaxRuntimes:     2,
+		ShutdownTimeout: 10 * time.Millisecond,
+	})
+	sup.runtimes["rt_1"] = &childRuntime{
+		id:       "rt_1",
+		done:     make(chan struct{}),
+		cancelFn: func() {},
+	}
+	sup.runtimes["rt_2"] = &childRuntime{
+		id:       "rt_2",
+		done:     make(chan struct{}),
+		cancelFn: func() {},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		sup.shutdown("graceful")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("shutdown did not return after timeout with multiple stuck runtimes")
+	}
+}
+
+type stableTestSink struct{}
+
+func (stableTestSink) Write(events.Event) error { return nil }
+func (stableTestSink) Close() error             { return nil }
+
+type stableFakeProvider struct {
+	events     chan events.Event
+	startCalls int
+}
+
+func (p *stableFakeProvider) Start(context.Context, runtime.StartOptions) (runtime.Session, error) {
+	p.startCalls++
+	return runtime.Session{SessionID: "ses_started"}, nil
+}
+
+func (p *stableFakeProvider) Resume(context.Context, string) (runtime.Session, error) {
+	return runtime.Session{SessionID: "ses_resumed"}, nil
+}
+
+func (p *stableFakeProvider) Prompt(context.Context, string, string) error {
+	p.events <- events.Event{
+		Event:     "session.end",
+		SessionID: "ses_initial",
+		Fields:    map[string]any{"stop_reason": "end_turn"},
+	}
+	close(p.events)
+	return nil
+}
+
+func (p *stableFakeProvider) Cancel(context.Context, string) error { return nil }
+
+func (p *stableFakeProvider) Events(context.Context, string) (<-chan events.Event, error) {
+	return p.events, nil
+}
+
+func (p *stableFakeProvider) AnswerPermission(context.Context, string, string, runtime.PermissionResponse) error {
+	return nil
+}
+
+func (p *stableFakeProvider) Capabilities(context.Context) (runtime.Capabilities, error) {
+	return runtime.Capabilities{}, nil
 }

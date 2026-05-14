@@ -34,7 +34,10 @@ avenor control --socket /tmp/avenor.sock cancel
 avenor stable --control-socket /tmp/avenor-stable.sock
 
 # Spawn a child runtime
-avenor control --socket /tmp/avenor-stable.sock prompt "Review PR #42" -- spawn
+avenor control --socket /tmp/avenor-stable.sock spawn \
+  --prompt "Review PR #42" \
+  --dir /repo/A \
+  --label review-42
 
 # List all runtimes
 avenor control --socket /tmp/avenor-stable.sock list
@@ -42,7 +45,7 @@ avenor control --socket /tmp/avenor-stable.sock list
 # Cancel a specific runtime
 avenor control --socket /tmp/avenor-stable.sock cancel rt_1
 
-# Shut down the supervisor
+# Ask children to shut down and wait for them up to --shutdown-timeout
 avenor control --socket /tmp/avenor-stable.sock shutdown graceful
 ```
 
@@ -189,7 +192,7 @@ Returns:
 }
 ```
 
-Required: `prompt` or `prompt_file`, `dir`. Optional: `agent`, `label`, `model`, `server_url`, `on_event`, `sentinel_file`, `permission_handler`, `auto_approve`, `timeout`, `max_retries`.
+Required: `prompt` or `prompt_file`. Optional: `dir` (defaults to `.`), `agent`, `label`, `model`, `server_url`, `on_event`, `sentinel_file`, `permission_handler`, `auto_approve`, `timeout`, `max_retries`.
 
 If `on_event` or `sentinel_file` is omitted, stable mode creates per-runtime files under `$TMPDIR/avenor-stable/<supervisor_run_id>/<runtime_id>/`.
 
@@ -207,7 +210,7 @@ Returns all active and recently-completed runtimes with status summaries. No own
 {"jsonrpc":"2.0","id":1,"method":"shutdown","params":{"mode":"graceful"}}
 ```
 
-Shuts down the supervisor. `graceful` cancels children and waits up to `--shutdown-timeout` (default 10s). `kill` cancels children immediately. Requires ownership.
+Shuts down the supervisor. `graceful` cancels children and waits up to `--shutdown-timeout` (default 10s). `kill` also cancels children, but waits for them without applying the graceful timeout. Requires ownership.
 
 #### Runtime-scoped methods (require `runtime_id`)
 
@@ -221,8 +224,8 @@ Shuts down the supervisor. `graceful` cancels children and waits up to `--shutdo
 Permission requests are resolved by trying these sources in order:
 
 1. **Auto-approve** (`--auto-approve` flag) — resolves immediately.
-2. **Control socket clients** — when at least one client is connected to the control socket, it is expected to answer via `answer_permission`. The backend waits indefinitely (until the request is answered, the run is cancelled, or the backend times out).
-3. **File handler** (`--permission-handler file:<path>`) — used when no control socket client is connected. Writes `.req`, polls `.req.response`.
+2. **Control socket clients** — when at least one client is connected to the control socket, it is expected to answer via `answer_permission`. A claim waits up to `--permission-claim-timeout` (default 30s); if no answer arrives, resolution falls through to the file handler or no-resolver path.
+3. **File handler** (`--permission-handler file:<path>`) — used when no control socket client is connected, when a socket claim times out, or when no socket claim can be registered. Writes `.req`, polls `.req.response`.
 4. **No resolver** — `permission.request` is emitted, backend waits until context cancellation or backend timeout.
 
 `permission.response` events are emitted for all resolution paths (auto-approve, control, file).

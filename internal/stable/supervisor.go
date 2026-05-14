@@ -337,8 +337,8 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 
 	resumeID := ""
 	for attempt := 1; ; attempt++ {
-		if attempt > 1 && resumeID == "" && child.session.SessionID != "" {
-			resumeID = child.session.SessionID
+		if attempt > 1 && resumeID == "" {
+			resumeID = child.sessionID()
 		}
 		result := s.runChildAttempt(ctx, child, resumeID, promptText, timer)
 		if result.exitCode != 1 || attempt > maxRetries {
@@ -359,8 +359,8 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 				}
 				promptText = nextPrompt
 				resumeID = result.sessionID
-				if resumeID == "" && child.session.SessionID != "" {
-					resumeID = child.session.SessionID
+				if resumeID == "" {
+					resumeID = child.sessionID()
 				}
 				attempt = 0
 				continue
@@ -373,8 +373,8 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 					}
 					promptText = nextPrompt
 					resumeID = result.sessionID
-					if resumeID == "" && child.session.SessionID != "" {
-						resumeID = child.session.SessionID
+					if resumeID == "" {
+						resumeID = child.sessionID()
 					}
 					attempt = 0
 					continue
@@ -455,11 +455,7 @@ func (c *childRuntime) sessionID() string {
 }
 
 func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, resumeID, promptText string, timer <-chan time.Time) childAttemptResult {
-	session, err := cli.StartSession(ctx, child.provider, runtime.StartOptions{
-		Agent: "",
-		Label: child.label,
-		Dir:   child.dir,
-	}, resumeID)
+	session, err := s.attemptSession(ctx, child, resumeID)
 	if err != nil {
 		s.emitChildError(child, fmt.Sprintf("start session: %v", err), "error")
 		return childAttemptResult{exitCode: 1}
@@ -504,6 +500,22 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 	}
 	exitCode := cli.WaitForSession(turnCtx, child.provider, taggedWriter, child.fileHandler, nil, eventCh, promptDone, nil, session.SessionID, s.runID, child.label, child.autoApprove, child.permClaimTimeout, timer, os.Stderr)
 	return childAttemptResult{exitCode: exitCode, sessionID: session.SessionID}
+}
+
+func (s *Supervisor) attemptSession(ctx context.Context, child *childRuntime, resumeID string) (runtime.Session, error) {
+	if resumeID == "" {
+		child.mu.Lock()
+		session := child.session
+		child.mu.Unlock()
+		if session.SessionID != "" {
+			return session, nil
+		}
+	}
+	return cli.StartSession(ctx, child.provider, runtime.StartOptions{
+		Agent: "",
+		Label: child.label,
+		Dir:   child.dir,
+	}, resumeID)
 }
 
 func (s *Supervisor) emitSessionEnd(child *childRuntime, exitCode int, stopReason string) {
@@ -567,17 +579,34 @@ func (s *Supervisor) shutdown(mode string) int {
 		return 0
 	}
 
-	deadline := time.After(timeout)
-	remaining := len(runtimes)
+	var wg sync.WaitGroup
 	for _, rt := range runtimes {
-		select {
-		case <-rt.done:
-			remaining--
-		case <-deadline:
-		}
+		wg.Add(1)
+		go func(r *childRuntime) {
+			defer wg.Done()
+			<-r.done
+		}(rt)
 	}
-	if remaining > 0 {
-		fmt.Fprintf(os.Stderr, "avenor stable: %d runtimes did not finish within %v\n", remaining, timeout)
+	allDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(allDone)
+	}()
+
+	select {
+	case <-allDone:
+	case <-time.After(timeout):
+		remaining := 0
+		for _, rt := range runtimes {
+			select {
+			case <-rt.done:
+			default:
+				remaining++
+			}
+		}
+		if remaining > 0 {
+			fmt.Fprintf(os.Stderr, "avenor stable: %d runtimes did not finish within %v\n", remaining, timeout)
+		}
 	}
 	return 0
 }

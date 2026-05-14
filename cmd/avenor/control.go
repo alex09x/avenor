@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/sdougbrown/avenor/client"
@@ -21,7 +22,7 @@ func runControl(args []string) int {
 	}
 	nonFlag := fs.Args()
 	if len(nonFlag) == 0 {
-		fmt.Fprintln(os.Stderr, "avenor control: command required (status, list, tail, cancel, prompt, answer-permission, shutdown)")
+		fmt.Fprintln(os.Stderr, "avenor control: command required (status, list, tail, spawn, cancel, prompt, interrupt-and-prompt, answer-permission, shutdown)")
 		return 1
 	}
 
@@ -39,6 +40,8 @@ func runControl(args []string) int {
 		return cmdList(c)
 	case "tail":
 		return cmdTail(c)
+	case "spawn":
+		return cmdSpawn(c, nonFlag[1:])
 	case "cancel":
 		return cmdCancel(c, nonFlag[1:])
 	case "prompt":
@@ -91,6 +94,76 @@ func cmdTail(c *client.Client) int {
 		fmt.Println(string(data))
 	}
 	return 0
+}
+
+func cmdSpawn(c *client.Client, args []string) int {
+	params, code := spawnParamsFromArgs(args, os.Stderr)
+	if code != 0 {
+		return code
+	}
+	result, err := c.Spawn(params)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "avenor control: spawn: %v\n", err)
+		return 1
+	}
+	data, _ := json.MarshalIndent(result, "", "  ")
+	fmt.Println(string(data))
+	return 0
+}
+
+func spawnParamsFromArgs(args []string, stderr io.Writer) (map[string]any, int) {
+	fs := flag.NewFlagSet("spawn", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	prompt := fs.String("prompt", "", "inline prompt text")
+	promptFile := fs.String("prompt-file", "", "path to prompt file")
+	dir := fs.String("dir", "", "working directory for the runtime")
+	agent := fs.String("agent", "", "agent name")
+	label := fs.String("label", "", "free-form label for log correlation")
+	model := fs.String("model", "", "backend-specific model id")
+	serverURL := fs.String("server-url", "", "long-lived ACP server endpoint")
+	onEvent := fs.String("on-event", "", "path to write NDJSON events")
+	sentinelFile := fs.String("sentinel-file", "", "path to write a completion sentinel")
+	permissionHandler := fs.String("permission-handler", "", "permission handler, supports file:<path>")
+	autoApprove := fs.Bool("auto-approve", false, "automatically approve all permission requests")
+	timeout := fs.Int("timeout", 0, "overall session timeout in seconds")
+	maxRetries := fs.Int("max-retries", 0, "maximum retry attempts on transient failure")
+	if err := fs.Parse(args); err != nil {
+		return nil, 1
+	}
+	if *prompt != "" && *promptFile != "" {
+		fmt.Fprintln(stderr, "avenor control: spawn: --prompt and --prompt-file are mutually exclusive")
+		return nil, 1
+	}
+	if *prompt == "" && *promptFile == "" {
+		fmt.Fprintln(stderr, "avenor control: spawn: --prompt or --prompt-file is required")
+		return nil, 1
+	}
+	params := map[string]any{}
+	addString := func(key, value string) {
+		if value != "" {
+			params[key] = value
+		}
+	}
+	addString("prompt", *prompt)
+	addString("prompt_file", *promptFile)
+	addString("dir", *dir)
+	addString("agent", *agent)
+	addString("label", *label)
+	addString("model", *model)
+	addString("server_url", *serverURL)
+	addString("on_event", *onEvent)
+	addString("sentinel_file", *sentinelFile)
+	addString("permission_handler", *permissionHandler)
+	if *autoApprove {
+		params["auto_approve"] = true
+	}
+	if *timeout > 0 {
+		params["timeout"] = *timeout
+	}
+	if *maxRetries > 0 {
+		params["max_retries"] = *maxRetries
+	}
+	return params, 0
 }
 
 func cmdCancel(c *client.Client, args []string) int {

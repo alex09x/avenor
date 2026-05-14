@@ -109,25 +109,31 @@ func (c *Client) Call(method string, params any, result any) error {
 		c.mu.Unlock()
 		return fmt.Errorf("marshal request: %w", err)
 	}
-	data = append(data, '\n')
-	if _, err := c.conn.Write(data); err != nil {
-		c.mu.Unlock()
-		return fmt.Errorf("write request: %w", err)
-	}
-
-	// Create a response channel before releasing mu so readLoop sees it.
+	// Register the response waiter before writing so an already-running
+	// readLoop cannot receive and discard a fast response.
 	respCh := make(chan Response, 1)
 	c.pending[id] = respCh
-	c.mu.Unlock()
 
 	// Ensure readLoop is running.
 	c.eventOnce.Do(func() {
 		go c.readLoop()
 	})
 
+	data = append(data, '\n')
+	if _, err := c.conn.Write(data); err != nil {
+		delete(c.pending, id)
+		c.mu.Unlock()
+		return fmt.Errorf("write request: %w", err)
+	}
+	c.mu.Unlock()
+
 	var resp Response
 	select {
-	case resp = <-respCh:
+	case r, ok := <-respCh:
+		if !ok {
+			return fmt.Errorf("read response: connection closed")
+		}
+		resp = r
 	case <-time.After(30 * time.Second):
 		c.mu.Lock()
 		delete(c.pending, id)
