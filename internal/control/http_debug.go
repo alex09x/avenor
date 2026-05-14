@@ -79,11 +79,15 @@ func (h *HTTPDebugServer) SetStableAdapter(a StableAdapter) {
 // "127.0.0.1:8080", "[::1]:8080".  Bare ":port" is rewritten to
 // "127.0.0.1:port".
 //
-// For hostname addresses (e.g. "localhost") the function resolves the name via
-// DNS and verifies that every returned IP is a loopback address.  This closes
-// the /etc/hosts hijack vector: a misconfigured or hostile hosts file mapping
-// "localhost" to a public IP will be rejected rather than silently bound.
+// Hostname inputs are resolved to a numeric IP before being returned so that
+// the caller's net.Listen call binds to the same address that was verified.
 func resolveDebugAddr(addr string) (string, error) {
+	return resolveDebugAddrWith(addr, net.LookupIP)
+}
+
+// resolveDebugAddrWith is the testable implementation of resolveDebugAddr.
+// lookup is called only for hostname inputs; numeric IPs bypass it.
+func resolveDebugAddrWith(addr string, lookup func(string) ([]net.IP, error)) (string, error) {
 	if strings.HasPrefix(addr, ":") {
 		addr = "127.0.0.1" + addr
 	}
@@ -103,10 +107,17 @@ func resolveDebugAddr(addr string) (string, error) {
 		return net.JoinHostPort(host, port), nil
 	}
 
-	// Hostname path: case-insensitive acceptance followed by DNS verification.
-	// We allow any hostname that resolves exclusively to loopback IPs, but the
-	// most common valid value is "localhost" (any capitalisation).
-	resolved, err := net.LookupIP(host)
+	// "localhost" is a special name (RFC 6761) that must always mean the
+	// loopback interface.  Short-circuit to 127.0.0.1 so we don't depend on
+	// /etc/hosts or nsswitch ordering.
+	if strings.EqualFold(host, "localhost") {
+		return net.JoinHostPort("127.0.0.1", port), nil
+	}
+
+	// Hostname path: resolve to IPs and verify every result is loopback.
+	// Return a numeric IP so the subsequent net.Listen binds to the same
+	// address that was verified here.
+	resolved, err := lookup(host)
 	if err != nil {
 		return "", fmt.Errorf("avenor: --http-debug: cannot resolve %q: %w", host, err)
 	}
@@ -118,7 +129,15 @@ func resolveDebugAddr(addr string) (string, error) {
 			return "", fmt.Errorf("avenor: --http-debug: hostname %q resolves to non-loopback address %s; use 127.0.0.1 or ::1 explicitly", host, ip)
 		}
 	}
-	return net.JoinHostPort(host, port), nil
+	// Prefer 127.0.0.1 when available; fall back to the first result.
+	chosen := resolved[0]
+	for _, ip := range resolved {
+		if ip4 := ip.To4(); ip4 != nil && ip4.Equal(net.ParseIP("127.0.0.1")) {
+			chosen = ip
+			break
+		}
+	}
+	return net.JoinHostPort(chosen.String(), port), nil
 }
 
 // checkAuthHeader verifies the X-Avenor-Token request header only.
@@ -152,6 +171,7 @@ func (h *HTTPDebugServer) Start() error {
 	if err != nil {
 		return err
 	}
+	h.server.Addr = ln.Addr().String()
 	go func() { _ = h.server.Serve(ln) }()
 	return nil
 }

@@ -136,13 +136,17 @@ func TestResolveDebugAddr(t *testing.T) {
 			addr:    "not:an:address:8080",
 			wantErr: true,
 		},
-		// Hostname "localhost" — resolved by the system; must be loopback.
-		// We rely on the test environment having a sane /etc/hosts.
+		// "localhost" short-circuits to 127.0.0.1 without a DNS lookup.
 		{
-			name: "localhost hostname",
-			addr: "localhost:8080",
-			// Not asserting exact output because localhost could map to ::1 on
-			// some systems; we just want no error.
+			name:    "localhost hostname",
+			addr:    "localhost:8080",
+			wantOut: "127.0.0.1:8080",
+		},
+		// "LOCALHOST" (uppercase) must also short-circuit.
+		{
+			name:    "localhost uppercase",
+			addr:    "LOCALHOST:8080",
+			wantOut: "127.0.0.1:8080",
 		},
 	}
 
@@ -166,6 +170,139 @@ func TestResolveDebugAddr(t *testing.T) {
 				t.Fatalf("resolveDebugAddr(%q) returned empty string", tc.addr)
 			}
 		})
+	}
+}
+
+// --- resolveDebugAddrWith injection-seam tests -------------------------------
+
+func TestResolveDebugAddrWith(t *testing.T) {
+	loopbackIPs := func(ips ...string) func(string) ([]net.IP, error) {
+		return func(host string) ([]net.IP, error) {
+			var result []net.IP
+			for _, s := range ips {
+				result = append(result, net.ParseIP(s))
+			}
+			return result, nil
+		}
+	}
+	failLookup := func(t *testing.T) func(string) ([]net.IP, error) {
+		return func(host string) ([]net.IP, error) {
+			t.Errorf("lookup called for %q but should have been short-circuited", host)
+			return nil, fmt.Errorf("unexpected lookup for %q", host)
+		}
+	}
+	noIPs := func(string) ([]net.IP, error) { return nil, nil }
+	lookupErr := func(string) ([]net.IP, error) { return nil, fmt.Errorf("no such host") }
+
+	tests := []struct {
+		name    string
+		addr    string
+		lookup  func(string) ([]net.IP, error)
+		wantErr bool
+		wantOut string
+	}{
+		{
+			name:    "numeric loopback returns as-is",
+			addr:    "127.0.0.1:9000",
+			lookup:  failLookup(t),
+			wantOut: "127.0.0.1:9000",
+		},
+		{
+			name:    "localhost short-circuits — lookup not called",
+			addr:    "localhost:9000",
+			lookup:  failLookup(t),
+			wantOut: "127.0.0.1:9000",
+		},
+		{
+			name:    "hostname resolving to all loopback returns resolved IP",
+			addr:    "myloopback.local:9000",
+			lookup:  loopbackIPs("127.0.0.1"),
+			wantOut: "127.0.0.1:9000",
+		},
+		{
+			name:    "hostname resolving to loopback set prefers 127.0.0.1",
+			addr:    "myloopback.local:9000",
+			lookup:  loopbackIPs("::1", "127.0.0.1"),
+			wantOut: "127.0.0.1:9000",
+		},
+		{
+			name:    "hostname resolving to only ::1 returns ::1",
+			addr:    "myloopback.local:9000",
+			lookup:  loopbackIPs("::1"),
+			wantOut: "[::1]:9000",
+		},
+		{
+			name:    "hostname resolving to mixed loopback and public is rejected",
+			addr:    "mixed.local:9000",
+			lookup:  loopbackIPs("127.0.0.1", "93.184.216.34"),
+			wantErr: true,
+		},
+		{
+			name:    "hostname resolving to all public is rejected",
+			addr:    "public.example:9000",
+			lookup:  loopbackIPs("93.184.216.34"),
+			wantErr: true,
+		},
+		{
+			name:    "hostname resolving to nothing is rejected",
+			addr:    "empty.local:9000",
+			lookup:  noIPs,
+			wantErr: true,
+		},
+		{
+			name:    "lookup error is rejected",
+			addr:    "bad.local:9000",
+			lookup:  lookupErr,
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveDebugAddrWith(tc.addr, tc.lookup)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("resolveDebugAddrWith(%q) = %q, nil; want error", tc.addr, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveDebugAddrWith(%q): %v", tc.addr, err)
+			}
+			if tc.wantOut != "" && got != tc.wantOut {
+				t.Fatalf("resolveDebugAddrWith(%q) = %q, want %q", tc.addr, got, tc.wantOut)
+			}
+		})
+	}
+}
+
+// --- Start() loopback-literal binding test -----------------------------------
+
+func TestHTTPDebugServerStartBindsLoopbackLiteral(t *testing.T) {
+	state := NewState("run_cli", "", 0)
+	ctrl := NewServer(state)
+
+	h, err := NewHTTPDebugServer("127.0.0.1:0", ctrl)
+	if err != nil {
+		t.Fatalf("NewHTTPDebugServer: %v", err)
+	}
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	boundAddr := h.server.Addr
+	host, _, err := net.SplitHostPort(boundAddr)
+	if err != nil {
+		t.Fatalf("SplitHostPort(%q): %v", boundAddr, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		t.Fatalf("bound host %q is not a numeric IP address", host)
+	}
+	if !ip.IsLoopback() {
+		t.Fatalf("bound host %q is not a loopback address", host)
 	}
 }
 
