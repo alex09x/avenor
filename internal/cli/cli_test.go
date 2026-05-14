@@ -1013,3 +1013,163 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 		t.Fatalf("expected avenor.error about 'already pending'; events: %+v", got)
 	}
 }
+
+// TestControlPermissionClaimTimeoutFallsThrough verifies the TOCTOU fix: when a
+// client is connected at the HasClients() gate but never sends answer_permission,
+// resolvePermission times out and falls through to the file-handler rather than
+// blocking until SIGINT.
+func TestControlPermissionClaimTimeoutFallsThrough(t *testing.T) {
+	// Shorten the claim window so the test completes quickly.
+	old := permissionClaimTimeout
+	permissionClaimTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { permissionClaimTimeout = old })
+
+	// Use /tmp to keep socket path under the 104-byte macOS limit.
+	sockDir, err := os.MkdirTemp("", "av-pct-*")
+	if err != nil {
+		t.Fatalf("mkdirtemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+
+	state := control.NewState("run_timeout", "label", 0)
+	cs := control.NewServer(state)
+	socketPath := filepath.Join(sockDir, "t.sock")
+	if err := cs.Start(socketPath); err != nil {
+		t.Fatalf("start control server: %v", err)
+	}
+	defer cs.Stop()
+
+	// Connect a client so HasClients() returns true — but never answer.
+	silentConn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("dial silent client: %v", err)
+	}
+	defer silentConn.Close()
+
+	// Verify HasClients() is true before we call resolvePermission.
+	deadline := time.Now().Add(2 * time.Second)
+	for !cs.HasClients() {
+		if time.Now().After(deadline) {
+			t.Fatal("HasClients() never became true")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	event := events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_timeout",
+		Fields: map[string]any{
+			"request_id": "req_timeout",
+			"options": []any{
+				map[string]any{"optionId": "deny", "kind": "reject"},
+				map[string]any{"optionId": "allow_t", "kind": "allow"},
+			},
+		},
+	}
+
+	provider := &cliFakeProvider{}
+	emit := func(events.Event) error { return nil }
+
+	// resolvePermission should time out waiting for the silent client,
+	// then fall through to the no-resolver path (fileHandler == nil).
+	start := time.Now()
+	res := resolvePermission(context.Background(), provider, nil, cs, event, "ses_timeout", "req_timeout", false, emit)
+	elapsed := time.Since(start)
+
+	// Should have returned in roughly the claim timeout, not blocked indefinitely.
+	if elapsed > 5*time.Second {
+		t.Fatalf("resolvePermission blocked for %v, want ~%v", elapsed, permissionClaimTimeout)
+	}
+	// No file-handler provided, so result should be the no-resolver sentinel.
+	if res.source != "none" {
+		t.Fatalf("result source = %q, want \"none\"", res.source)
+	}
+	if res.err != nil {
+		t.Fatalf("unexpected error: %v", res.err)
+	}
+	// The claim should have been cleaned up.
+	if cs.HasPendingPermission() {
+		t.Fatal("permission claim still registered after timeout")
+	}
+}
+
+// TestControlPermissionClaimTimeoutFallsToFileHandler verifies that when the
+// claim times out and a file-handler is configured, resolvePermission routes to
+// the file-handler rather than returning source "none".
+func TestControlPermissionClaimTimeoutFallsToFileHandler(t *testing.T) {
+	old := permissionClaimTimeout
+	permissionClaimTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { permissionClaimTimeout = old })
+
+	// Use /tmp to keep socket path under the 104-byte macOS limit.
+	sockDir, err := os.MkdirTemp("", "av-pcf-*")
+	if err != nil {
+		t.Fatalf("mkdirtemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+
+	state := control.NewState("run_fh", "label", 0)
+	cs := control.NewServer(state)
+	socketPath := filepath.Join(sockDir, "f.sock")
+	if err := cs.Start(socketPath); err != nil {
+		t.Fatalf("start control server: %v", err)
+	}
+	defer cs.Stop()
+
+	// Silent client keeps HasClients() true.
+	silentConn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("dial silent client: %v", err)
+	}
+	defer silentConn.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !cs.HasClients() {
+		if time.Now().After(deadline) {
+			t.Fatal("HasClients() never became true")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	dir := t.TempDir()
+	base := filepath.Join(dir, "perm")
+	fh := permission.NewFileHandler(base)
+	fh.Timeout = 5 * time.Second
+	fh.PollInterval = 20 * time.Millisecond
+
+	// The file handler deletes any pre-existing response file before polling.
+	// Write the response asynchronously after a short delay so the handler
+	// finds it on its first or second poll tick.
+	respPath := base + ".req.response"
+	go func() {
+		time.Sleep(200 * time.Millisecond) // after claim timeout, during handler poll
+		_ = os.WriteFile(respPath, []byte(`{"outcome":"selected","option_id":"allow_fh"}`+"\n"), 0o600)
+	}()
+
+	event := events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_fh",
+		Fields: map[string]any{
+			"request_id": "req_fh",
+			"options": []any{
+				map[string]any{"optionId": "deny", "kind": "reject"},
+				map[string]any{"optionId": "allow_fh", "kind": "allow"},
+			},
+		},
+	}
+
+	provider := &cliFakeProvider{}
+	emit := func(events.Event) error { return nil }
+
+	res := resolvePermission(context.Background(), provider, fh, cs, event, "ses_fh", "req_fh", false, emit)
+
+	if res.err != nil {
+		t.Fatalf("unexpected error: %v", res.err)
+	}
+	if res.source != "file" {
+		t.Fatalf("result source = %q, want \"file\"", res.source)
+	}
+	if res.optionID != "allow_fh" {
+		t.Fatalf("optionID = %q, want \"allow_fh\"", res.optionID)
+	}
+}

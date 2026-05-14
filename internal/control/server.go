@@ -276,6 +276,14 @@ func (s *ControlServer) EndPermissionClaim(requestID string) {
 	}
 }
 
+// HasPendingPermission reports whether a permission claim is currently
+// registered. Used by tests to verify claims are cleaned up after timeout.
+func (s *ControlServer) HasPendingPermission() bool {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	return s.pendingRequest != ""
+}
+
 func (s *ControlServer) QueuePrompt(text string) {
 	s.promptMu.Lock()
 	s.promptQueue = append(s.promptQueue, text)

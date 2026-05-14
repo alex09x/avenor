@@ -22,6 +22,13 @@ import (
 
 const defaultBackend = "opencode-acp"
 
+// permissionClaimTimeout is the maximum time resolvePermission will wait for a
+// connected socket client to send answer_permission before falling through to
+// the file-handler (or the no-resolver path). This bounds the TOCTOU window
+// where HasClients() was true at the gate but the client disconnects or goes
+// silent before answering. Declared as a var so tests can shorten it.
+var permissionClaimTimeout = 30 * time.Second
+
 type ServerDiscovery struct {
 	URL    string
 	Source string
@@ -565,18 +572,32 @@ func resolvePermission(
 	// the socket. Without this gate, --http-debug-only (or a socket with no
 	// connected client) would silently swallow permission requests and the
 	// file-handler fallback below would be unreachable.
+	//
+	// TOCTOU note: HasClients() may have been true when checked but the client
+	// can disconnect (or go silent) before we reach BeginPermissionClaim or
+	// before it sends answer_permission. We bound the wait with
+	// permissionClaimTimeout so that on disconnect or a silent client we fall
+	// through to the file-handler rather than blocking until SIGINT.
 	if controlServer != nil && controlServer.HasClients() {
 		answerCh := controlServer.BeginPermissionClaim(requestID)
-		defer controlServer.EndPermissionClaim(requestID)
+		claimTimer := time.NewTimer(permissionClaimTimeout)
 		select {
 		case ans := <-answerCh:
+			claimTimer.Stop()
+			controlServer.EndPermissionClaim(requestID)
 			resp := runtime.PermissionResponse{Outcome: "selected", OptionID: ans.OptionID}
 			if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 				return permissionResult{err: err}
 			}
 			return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
 		case <-ctx.Done():
+			claimTimer.Stop()
+			controlServer.EndPermissionClaim(requestID)
 			return permissionResult{err: ctx.Err()}
+		case <-claimTimer.C:
+			// Client disconnected or went silent after HasClients() gate.
+			// Release the claim and fall through to the file-handler.
+			controlServer.EndPermissionClaim(requestID)
 		}
 	}
 
