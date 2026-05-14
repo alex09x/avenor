@@ -781,17 +781,30 @@ func backoffDelay(attempt int) time.Duration {
 // StableAdapter implementation — used by HTTPDebugServer for per-runtime HTTP endpoints.
 
 // HTTPRuntimeStatus implements control.StableAdapter.  Returns the runtime
-// snapshot and true when runtimeID is known; nil, false when not found.
-func (s *Supervisor) HTTPRuntimeStatus(runtimeID string) (any, bool) {
+// snapshot when runtimeID is known.  Returns control.ErrRuntimeNotFound when
+// the ID does not exist.
+func (s *Supervisor) HTTPRuntimeStatus(runtimeID string) (any, error) {
+	s.controlMu.Lock()
+	rt := s.runtimes[runtimeID]
+	s.controlMu.Unlock()
+	if rt == nil {
+		return nil, control.ErrRuntimeNotFound
+	}
 	snap, err := s.RuntimeStatus(runtimeID)
 	if err != nil {
-		return nil, false
+		return nil, err
 	}
-	return snap, true
+	return snap, nil
 }
 
-// HTTPCancelRuntime implements control.StableAdapter.  Delegates to the
-// existing cancelRuntime helper; returns a non-nil error when the ID is unknown.
+// HTTPCancelRuntime implements control.StableAdapter.  Returns
+// control.ErrRuntimeNotFound when the ID does not exist.
 func (s *Supervisor) HTTPCancelRuntime(runtimeID string) error {
+	s.controlMu.Lock()
+	rt := s.runtimes[runtimeID]
+	s.controlMu.Unlock()
+	if rt == nil {
+		return control.ErrRuntimeNotFound
+	}
 	return s.cancelRuntime(runtimeID)
 }

@@ -6,12 +6,16 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 )
+
+var ErrRuntimeNotFound = errors.New("runtime not found")
 
 // StableAdapter is the minimal interface that HTTPDebugServer needs to serve
 // per-runtime endpoints in stable mode.  The supervisor implements this; CLI
@@ -21,17 +25,19 @@ import (
 // methods on *Supervisor which carry the same logical names but different
 // signatures (e.g. RuntimeStatus returns (any, error) there).
 type StableAdapter interface {
-	// HTTPRuntimeStatus returns the runtime snapshot and true when runtimeID
-	// is known.  Returns nil, false when the ID does not exist.
-	HTTPRuntimeStatus(runtimeID string) (any, bool)
-	// HTTPCancelRuntime cancels the named runtime.  Returns a non-nil error
-	// if the ID is unknown.
+	// HTTPRuntimeStatus returns the runtime snapshot for the given runtimeID.
+	// Returns ErrRuntimeNotFound if the runtime ID does not exist.  Other
+	// errors indicate operational failures and should map to 500.
+	HTTPRuntimeStatus(runtimeID string) (any, error)
+	// HTTPCancelRuntime cancels the named runtime.  Returns ErrRuntimeNotFound
+	// if the runtime ID does not exist.  Other errors indicate operational
+	// failures and should map to 500.
 	HTTPCancelRuntime(runtimeID string) error
 }
 
 type HTTPDebugServer struct {
 	control       *ControlServer
-	stableAdapter StableAdapter
+	stableAdapter atomic.Value // holds StableAdapter, nil if unset
 	server        *http.Server
 	token         string
 }
@@ -68,10 +74,21 @@ func NewHTTPDebugServer(addr string, control *ControlServer) (*HTTPDebugServer, 
 }
 
 // SetStableAdapter wires a StableAdapter into the debug server so that
-// per-runtime endpoints are active.  Call this before Start().  The supervisor
-// calls this immediately after NewHTTPDebugServer; CLI mode never calls it.
+// per-runtime endpoints are active.  The supervisor calls this immediately
+// after NewHTTPDebugServer; CLI mode never calls it.  Passing nil is a no-op.
 func (h *HTTPDebugServer) SetStableAdapter(a StableAdapter) {
-	h.stableAdapter = a
+	if a == nil {
+		return
+	}
+	h.stableAdapter.Store(a)
+}
+
+func (h *HTTPDebugServer) getStableAdapter() StableAdapter {
+	v := h.stableAdapter.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(StableAdapter)
 }
 
 // resolveDebugAddr normalises addr and rejects anything that would bind on a
@@ -211,7 +228,8 @@ func (h *HTTPDebugServer) handleStatusRuntime(w http.ResponseWriter, r *http.Req
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	if h.stableAdapter == nil {
+	adapter := h.getStableAdapter()
+	if adapter == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
@@ -220,9 +238,15 @@ func (h *HTTPDebugServer) handleStatusRuntime(w http.ResponseWriter, r *http.Req
 		http.Error(w, "runtime_id required", http.StatusBadRequest)
 		return
 	}
-	snap, ok := h.stableAdapter.HTTPRuntimeStatus(rtID)
-	if !ok {
-		http.Error(w, "runtime not found", http.StatusNotFound)
+	snap, err := adapter.HTTPRuntimeStatus(rtID)
+	if err != nil {
+		if errors.Is(err, ErrRuntimeNotFound) {
+			http.Error(w, "runtime not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, snap)
@@ -287,7 +311,7 @@ func (h *HTTPDebugServer) handleCancel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	if h.stableAdapter != nil {
+	if h.getStableAdapter() != nil {
 		http.Error(w, "runtime_id required in stable mode; use POST /cancel/<runtime_id>", http.StatusBadRequest)
 		return
 	}
@@ -312,7 +336,8 @@ func (h *HTTPDebugServer) handleCancelRuntime(w http.ResponseWriter, r *http.Req
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	if h.stableAdapter == nil {
+	adapter := h.getStableAdapter()
+	if adapter == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
@@ -321,8 +346,14 @@ func (h *HTTPDebugServer) handleCancelRuntime(w http.ResponseWriter, r *http.Req
 		http.Error(w, "runtime_id required", http.StatusBadRequest)
 		return
 	}
-	if err := h.stableAdapter.HTTPCancelRuntime(rtID); err != nil {
-		http.Error(w, "runtime not found", http.StatusNotFound)
+	if err := adapter.HTTPCancelRuntime(rtID); err != nil {
+		if errors.Is(err, ErrRuntimeNotFound) {
+			http.Error(w, "runtime not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true})
