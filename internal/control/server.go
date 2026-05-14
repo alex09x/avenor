@@ -685,10 +685,12 @@ func (s *subscriber) enqueue(ev events.Event) {
 func (s *subscriber) loop() {
 	pendingLag := 0
 	for ev := range s.ch {
+		s.mu.Lock()
 		if s.dropped > 0 {
 			pendingLag += s.dropped
 			s.dropped = 0
 		}
+		s.mu.Unlock()
 		if pendingLag > 0 {
 			_ = s.conn.writeJSON(Notification{JSONRPC: "2.0", Method: "event", Params: map[string]any{"event": "subscriber.lagged", "dropped_count": pendingLag, "ts": time.Now().UnixMilli()}})
 			pendingLag = 0
