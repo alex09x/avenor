@@ -81,6 +81,7 @@ type Supervisor struct {
 	runtimes   map[string]*childRuntime
 	nextID     int
 	shutdownCh chan struct{}
+	runtimeActivity chan struct{}
 	httpServer *control.HTTPDebugServer
 }
 
@@ -94,6 +95,7 @@ func NewSupervisor(cfg Config) *Supervisor {
 		control:    control.NewServer(state),
 		runtimes:   map[string]*childRuntime{},
 		shutdownCh: make(chan struct{}),
+		runtimeActivity: make(chan struct{}),
 	}
 	sup.control.SetStableHandler(sup)
 	return sup
@@ -136,6 +138,8 @@ func (s *Supervisor) Run() int {
 			return s.shutdown("graceful")
 		case <-idleCh:
 			return s.shutdown("graceful")
+		case <-s.runtimeActivity:
+			continue
 		}
 	}
 }
@@ -254,7 +258,9 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 	provider := opencodeacp.NewWithOptions(startOpts)
 	session, err := cli.StartSession(context.Background(), provider, startOpts, "")
 	if err != nil {
-		_ = provider.(interface{ Close() error }).Close()
+		if closer, ok := provider.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
 		_ = writer.Close()
 		return SpawnResult{}, fmt.Errorf("start session: %w", err)
 	}
@@ -278,6 +284,11 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 	// Start the child event loop in a goroutine.
 	go s.runChild(childCtx, child, promptText, params.Timeout, params.MaxRetries)
 
+	select {
+	case s.runtimeActivity <- struct{}{}:
+	default:
+	}
+
 	return SpawnResult{
 		RuntimeID:    rtID,
 		SessionID:    session.SessionID,
@@ -291,6 +302,9 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 		if r := recover(); r != nil {
 			fmt.Fprintf(os.Stderr, "avenor stable: child %s panic: %v\n", child.id, r)
 			s.emitChildError(child, fmt.Sprintf("panic: %v", r), "error")
+			if child.sentinelFile != "" {
+				cli.WriteSentinel(child.sentinelFile, 1, child.session.SessionID, "error", s.runID, os.Stderr)
+			}
 		}
 		close(child.done)
 		_ = child.eventWriter.Close()
@@ -429,6 +443,7 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 		Dir:   child.dir,
 	}, resumeID)
 	if err != nil {
+		s.emitChildError(child, fmt.Sprintf("start session: %v", err), "error")
 		return childAttemptResult{exitCode: 1}
 	}
 	child.mu.Lock()
@@ -453,6 +468,7 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 
 	eventCh, err := child.provider.Events(eventCtx, session.SessionID)
 	if err != nil {
+		s.emitChildError(child, fmt.Sprintf("subscribe events: %v", err), "error")
 		return childAttemptResult{exitCode: 1, sessionID: session.SessionID}
 	}
 
@@ -521,9 +537,15 @@ func (s *Supervisor) shutdown(mode string) int {
 
 	timeout := s.config.ShutdownTimeout
 	if mode == "kill" || timeout == 0 {
+		var wg sync.WaitGroup
 		for _, rt := range runtimes {
-			<-rt.done
+			wg.Add(1)
+			go func(r *childRuntime) {
+				defer wg.Done()
+				<-r.done
+			}(rt)
 		}
+		wg.Wait()
 		return 0
 	}
 

@@ -300,6 +300,7 @@ type permissionResult struct {
 	err       error
 	requestID string
 	optionID  string
+	kind      string
 	// source is "avenor", "control", or "file".
 	source string
 }
@@ -336,8 +337,7 @@ func WaitForSession(
 		return true
 	}
 
-	emitPermissionResponse := func(requestID, optionID, source string) {
-		kind := permissionKindFromOptionID(optionID)
+	emitPermissionResponse := func(requestID, optionID, kind, source string) {
 		fields := map[string]any{
 			"request_id": requestID,
 			"option_id":  optionID,
@@ -445,7 +445,7 @@ func WaitForSession(
 				return 1
 			}
 			if res.requestID != "" {
-				emitPermissionResponse(res.requestID, res.optionID, res.source)
+				emitPermissionResponse(res.requestID, res.optionID, res.kind, res.source)
 				if !writeStatus(tracker.PermissionAnswered()) {
 					return 1
 				}
@@ -522,12 +522,19 @@ func (f *fanoutWriter) Write(event events.Event) error {
 
 func (f *fanoutWriter) Close() error { return f.base.Close() }
 
-func permissionKindFromOptionID(optionID string) string {
-	id := strings.ToLower(optionID)
-	if strings.HasPrefix(id, "allow") || strings.HasPrefix(id, "approve") {
-		return "allow"
+func permissionKindFromOptionID(optionID string, options []any) string {
+	for _, opt := range options {
+		m, ok := opt.(map[string]any)
+		if !ok {
+			continue
+		}
+		oid, _ := m["optionId"].(string)
+		if oid == optionID {
+			kind, _ := m["kind"].(string)
+			return strings.ToLower(kind)
+		}
 	}
-	return "reject"
+	return "unknown"
 }
 
 func resolvePermission(
@@ -551,7 +558,7 @@ func resolvePermission(
 		if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 			return permissionResult{err: err}
 		}
-		return permissionResult{requestID: requestID, optionID: optionID, source: "avenor"}
+		return permissionResult{requestID: requestID, optionID: optionID, kind: permissionKindFromOptionID(optionID, options), source: "avenor"}
 	}
 
 	if controlServer != nil {
@@ -563,8 +570,7 @@ func resolvePermission(
 			if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 				return permissionResult{err: err}
 			}
-			return permissionResult{requestID: requestID, optionID: ans.OptionID, source: "control"}
-		case <-time.After(1 * time.Second):
+			return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
 		case <-ctx.Done():
 			return permissionResult{err: ctx.Err()}
 		}
@@ -575,11 +581,11 @@ func resolvePermission(
 		if err != nil {
 			return permissionResult{err: err}
 		}
-		return permissionResult{requestID: res.RequestID, optionID: res.OptionID, source: "file"}
+		return permissionResult{requestID: res.RequestID, optionID: res.OptionID, kind: permissionKindFromOptionID(res.OptionID, options), source: "file"}
 	}
 
 	// no resolver: leave backend waiting
-	return permissionResult{source: "none"}
+	return permissionResult{kind: "", source: "none"}
 }
 
 func NewEventWriter(path string) (*eventWriter, error) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
 type Request struct {
@@ -59,11 +60,16 @@ func (e *Event) UnmarshalJSON(data []byte) error {
 }
 
 type Client struct {
-	conn   net.Conn
-	mu     sync.Mutex
-	readMu sync.Mutex
-	scan   *bufio.Scanner
-	nextID int
+	conn    net.Conn
+	mu      sync.Mutex
+	scan    *bufio.Scanner
+	nextID  int
+	started bool
+
+	readMu    sync.Mutex
+	pending   map[int]chan Response
+	eventCh   chan Event
+	eventOnce sync.Once
 }
 
 func Dial(socketPath string) (*Client, error) {
@@ -71,7 +77,12 @@ func Dial(socketPath string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial control socket: %w", err)
 	}
-	return &Client{conn: conn, scan: bufio.NewScanner(conn)}, nil
+	return &Client{
+		conn:    conn,
+		scan:    bufio.NewScanner(conn),
+		pending: map[int]chan Response{},
+		eventCh: make(chan Event, 256),
+	}, nil
 }
 
 func (c *Client) Close() error {
@@ -102,22 +113,27 @@ func (c *Client) Call(method string, params any, result any) error {
 		c.mu.Unlock()
 		return fmt.Errorf("write request: %w", err)
 	}
+
+	// Create a response channel before releasing mu so readLoop sees it.
+	respCh := make(chan Response, 1)
+	c.pending[id] = respCh
 	c.mu.Unlock()
 
-	c.readMu.Lock()
-	defer c.readMu.Unlock()
+	// Ensure readLoop is running.
+	c.eventOnce.Do(func() {
+		go c.readLoop()
+	})
 
 	var resp Response
-	if !c.scan.Scan() {
-		err := c.scan.Err()
-		if err == nil {
-			err = fmt.Errorf("connection closed")
-		}
-		return fmt.Errorf("read response: %w", err)
+	select {
+	case resp = <-respCh:
+	case <-time.After(30 * time.Second):
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		return fmt.Errorf("read response: timeout")
 	}
-	if err := json.Unmarshal(c.scan.Bytes(), &resp); err != nil {
-		return fmt.Errorf("unmarshal response: %w", err)
-	}
+
 	if resp.Error != nil {
 		return fmt.Errorf("rpc error [%d]: %s", resp.Error.Code, resp.Error.Message)
 	}
@@ -136,26 +152,76 @@ func (c *Client) subscribe() error {
 	return c.Call("subscribe", nil, &result)
 }
 
+// Events returns a channel of server-sent events. Only one subscriber is
+// supported. Call before any Call() to avoid missing events.
 func (c *Client) Events() <-chan Event {
-	ch := make(chan Event, 256)
-	go func() {
-		defer close(ch)
-		for c.scan.Scan() {
-			var n Notification
-			if err := json.Unmarshal(c.scan.Bytes(), &n); err != nil {
-				continue
-			}
-			if n.Method != "event" {
-				continue
-			}
-			var ev Event
-			if err := json.Unmarshal(n.Params, &ev); err != nil {
-				continue
-			}
-			ch <- ev
+	c.eventOnce.Do(func() {
+		go c.readLoop()
+	})
+	return c.eventCh
+}
+
+// readLoop is the single goroutine that reads from the bufio.Scanner,
+// dispatching responses to pending Call() waiters and events to the
+// Events() channel. Only one readLoop runs per Client.
+func (c *Client) readLoop() {
+	defer close(c.eventCh)
+	defer func() {
+		// Drain pending channels so Call() goroutines don't hang
+		// on the 30s timeout after connection drop.
+		c.mu.Lock()
+		for id, ch := range c.pending {
+			delete(c.pending, id)
+			close(ch)
 		}
+		c.mu.Unlock()
 	}()
-	return ch
+	for c.scan.Scan() {
+		line := c.scan.Bytes()
+		// Try parsing as a Response (has "id" field).
+		var resp Response
+		if err := json.Unmarshal(line, &resp); err != nil {
+			continue
+		}
+		if resp.ID != nil {
+			// Extract numeric ID.
+			id, ok := idToInt(resp.ID)
+			if ok {
+				c.mu.Lock()
+				ch := c.pending[id]
+				delete(c.pending, id)
+				c.mu.Unlock()
+				if ch != nil {
+					ch <- resp
+				}
+			}
+			continue
+		}
+		// No id field — try parsing as a Notification.
+		var n Notification
+		if err := json.Unmarshal(line, &n); err != nil {
+			continue
+		}
+		if n.Method != "event" {
+			continue
+		}
+		var ev Event
+		if err := json.Unmarshal(n.Params, &ev); err != nil {
+			continue
+		}
+		c.eventCh <- ev
+	}
+}
+
+func idToInt(v any) (int, bool) {
+	switch id := v.(type) {
+	case float64:
+		return int(id), true
+	case int:
+		return id, true
+	default:
+		return 0, false
+	}
 }
 
 // Status returns the snapshot for the one-shot run or a runtime if runtimeID is set.

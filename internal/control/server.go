@@ -228,6 +228,9 @@ func (s *ControlServer) PublishEvent(event events.Event) {
 		sub.enqueue(event)
 	}
 	for _, ch := range watch {
+		// Best-effort deliver to in-process watchers: drain one stale
+		// event if full, then retry. Under concurrent load, events may
+		// be silently dropped.
 		select {
 		case ch <- event:
 		default:
@@ -298,6 +301,13 @@ func (s *ControlServer) ConsumeInterrupt() string {
 func (s *ControlServer) InterruptChan() <-chan struct{} {
 	s.interruptMu.Lock()
 	defer s.interruptMu.Unlock()
+	if s.interruptCh != nil {
+		select {
+		case <-s.interruptCh:
+		default:
+			close(s.interruptCh)
+		}
+	}
 	s.interruptCh = make(chan struct{})
 	return s.interruptCh
 }
@@ -417,7 +427,9 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 				OptionID  string `json:"option_id"`
 			}
 			if len(req.Params) > 0 {
-				_ = json.Unmarshal(req.Params, &p)
+				if err := json.Unmarshal(req.Params, &p); err != nil {
+					return failure(req.ID, -32602, "invalid params", map[string]any{"detail": err.Error()})
+				}
 			}
 			if p.RequestID == "" || p.OptionID == "" {
 				return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"request_id", "option_id"}})
@@ -463,7 +475,9 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 				Text string `json:"text"`
 			}
 			if len(req.Params) > 0 {
-				_ = json.Unmarshal(req.Params, &pr)
+				if err := json.Unmarshal(req.Params, &pr); err != nil {
+					return failure(req.ID, -32602, "invalid params", map[string]any{"detail": err.Error()})
+				}
 			}
 			if pr.Text == "" {
 				return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"text"}})
@@ -480,7 +494,9 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 			Text string `json:"text"`
 		}
 		if len(req.Params) > 0 {
-			_ = json.Unmarshal(req.Params, &pr)
+			if err := json.Unmarshal(req.Params, &pr); err != nil {
+				return failure(req.ID, -32602, "invalid params", map[string]any{"detail": err.Error()})
+			}
 		}
 		if pr.Text == "" {
 			return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"text"}})
@@ -573,6 +589,11 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 	}
 }
 
+// ensureOwner implements first-come-first-served ownership: the first connected
+// client to issue a mutating command becomes the owner. When the owner
+// disconnects, ownership is released and the next client to call a mutating
+// method inherits it. This relies on Unix socket permissions (0600) for
+// process-level isolation.
 func (s *ControlServer) ensureOwner(c *connState) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

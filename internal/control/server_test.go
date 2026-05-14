@@ -79,7 +79,21 @@ func TestOwnershipTransferOnDisconnect(t *testing.T) {
 		t.Fatalf("owner cancel failed: %+v", r1.Error)
 	}
 	c1.Close()
-	time.Sleep(50 * time.Millisecond)
+
+	// Poll until owner is cleared (server processes disconnect).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.mu.Lock()
+		owner := s.owner
+		s.mu.Unlock()
+		if owner == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("owner not cleared after close")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	c2 := mustDial(t, path)
 	defer c2.Close()
@@ -256,8 +270,13 @@ func TestHTTPDebugStatusAndCancel(t *testing.T) {
 		t.Fatalf("run_id = %q, want run_1", status.RunID)
 	}
 
+	token := h.token
+
 	// POST /cancel — assert 200 and ok:true
-	resp, err = client.Post("http://"+addr+"/cancel", "application/json", http.NoBody)
+	req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/cancel", http.NoBody)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Avenor-Token", token)
+	resp, err = client.Do(req)
 	if err != nil {
 		t.Fatalf("POST /cancel: %v", err)
 	}
@@ -274,7 +293,10 @@ func TestHTTPDebugStatusAndCancel(t *testing.T) {
 	}
 
 	// POST /answer-permission with no pending permission — assert 409
-	resp, err = client.Post("http://"+addr+"/answer-permission", "application/json", strings.NewReader(`{}`))
+	req, _ = http.NewRequest(http.MethodPost, "http://"+addr+"/answer-permission", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Avenor-Token", token)
+	resp, err = client.Do(req)
 	if err != nil {
 		t.Fatalf("POST /answer-permission: %v", err)
 	}
@@ -313,18 +335,13 @@ func TestPromptDispatch(t *testing.T) {
 func TestInterruptAndPromptDispatch(t *testing.T) {
 	state := NewState("run_1", "", 0)
 	s := NewServer(state)
-	interruptFired := false
-	ch := s.InterruptChan()
-	go func() {
-		<-ch
-		interruptFired = true
-	}()
 	path := testSocketPath(t)
 	if err := s.Start(path); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	defer s.Stop()
 
+	ch := s.InterruptChan()
 	c := mustDial(t, path)
 	defer c.Close()
 	params, _ := json.Marshal(map[string]any{"text": "new task"})
@@ -340,8 +357,9 @@ func TestInterruptAndPromptDispatch(t *testing.T) {
 	if v, _ := res["accepted"].(bool); !v {
 		t.Fatal("expected accepted=true")
 	}
-	time.Sleep(50 * time.Millisecond)
-	if !interruptFired {
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
 		t.Fatal("expected InterruptChan to fire")
 	}
 }

@@ -61,6 +61,18 @@ func runSingleAttempt(
 	}
 
 	prompt := initPrompt
+
+	// Check for interrupts that arrived between turns (during backoff).
+	if controlServer != nil {
+		if text := controlServer.ConsumeInterrupt(); text != "" {
+			prompt = text
+			if _, err := resumeSession(ctx, provider, session.SessionID); err != nil {
+				fmt.Fprintf(stderr, "avenor: resume for interrupt: %v\n", err)
+				return attemptResult{exitCode: 1, sessionID: session.SessionID}
+			}
+		}
+	}
+
 	for {
 		// Fresh event context per turn so interrupt_and_prompt cancels
 		// the subscription cleanly.

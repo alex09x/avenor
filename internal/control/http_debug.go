@@ -2,30 +2,44 @@ package control
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 )
 
 type HTTPDebugServer struct {
 	control *ControlServer
 	server  *http.Server
+	token   string
 }
 
 func NewHTTPDebugServer(addr string, control *ControlServer) *HTTPDebugServer {
 	if strings.HasPrefix(addr, ":") {
 		addr = "127.0.0.1" + addr
 	}
-	h := &HTTPDebugServer{control: control}
+	tokenBytes := make([]byte, 16)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		panic("avenor: failed to generate debug token: " + err.Error())
+	}
+	token := hex.EncodeToString(tokenBytes)
+	h := &HTTPDebugServer{control: control, token: token}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", h.handleStatus)
 	mux.HandleFunc("/events", h.handleEvents)
 	mux.HandleFunc("/cancel", h.handleCancel)
 	mux.HandleFunc("/answer-permission", h.handleAnswerPermission)
 	h.server = &http.Server{Addr: addr, Handler: mux}
+	fmt.Fprintf(os.Stderr, "avenor: http debug token: %s\n", token)
 	return h
+}
+
+func (h *HTTPDebugServer) checkAuth(r *http.Request) bool {
+	return h.token != "" && r.Header.Get("X-Avenor-Token") == h.token
 }
 
 func (h *HTTPDebugServer) Start() error {
@@ -46,7 +60,7 @@ func (h *HTTPDebugServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !isLocalhost(r.Host) {
+	if !isLocalhostRequest(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -58,7 +72,7 @@ func (h *HTTPDebugServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !isLocalhost(r.Host) {
+	if !isLocalhostRequest(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -83,7 +97,11 @@ func (h *HTTPDebugServer) handleCancel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !isLocalhost(r.Host) {
+	if !h.checkAuth(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !isLocalhostRequest(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -98,7 +116,11 @@ func (h *HTTPDebugServer) handleAnswerPermission(w http.ResponseWriter, r *http.
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !isLocalhost(r.Host) {
+	if !h.checkAuth(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !isLocalhostRequest(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -127,10 +149,17 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func isLocalhost(host string) bool {
-	h, _, err := net.SplitHostPort(host)
+func isLocalhostRequest(r *http.Request) bool {
+	h, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
-		h = host
+		h = r.Host
 	}
-	return h == "localhost" || h == "127.0.0.1" || h == "::1"
+	if h != "localhost" && h != "127.0.0.1" && h != "::1" {
+		return false
+	}
+	remoteHost, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		remoteHost = r.RemoteAddr
+	}
+	return remoteHost == "127.0.0.1" || remoteHost == "::1"
 }
