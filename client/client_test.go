@@ -205,6 +205,22 @@ func TestClientSubscribe(t *testing.T) {
 	}
 }
 
+// waitForBufferLen busy-waits until len(c.eventCh) == n or timeout elapses.
+// It returns false if the timeout is reached before the condition is met,
+// causing the caller to fail the test with a clear message rather than
+// letting a timing-sensitive sleep hide the hang.
+func waitForBufferLen(t *testing.T, c *Client, n int, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if len(c.eventCh) == n {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
 // TestLaggedOrdering verifies that client.lagged arrives *before* the
 // post-drop event — matching the server's subscriber.loop() guarantee.
 func TestLaggedOrdering(t *testing.T) {
@@ -232,38 +248,59 @@ func TestLaggedOrdering(t *testing.T) {
 	// Fill the channel buffer without consuming, then send more to force drops.
 	sendEvent("first")
 	sendEvent("second")
-	// Give readLoop time to place both events before we send a third.
-	time.Sleep(20 * time.Millisecond)
-	// third and fourth arrive while the buffer is full — both dropped.
+	// Wait until readLoop has placed both events into the buffer before sending
+	// more — this replaces the original time.Sleep(20ms) with a deterministic
+	// check so CI CPU contention can't cause a false pass or hang.
+	if !waitForBufferLen(t, c, 2, time.Second) {
+		t.Fatal("timeout waiting for buffer to fill with first two events")
+	}
+	// third, fourth, fifth, and sixth arrive while the buffer is full — all dropped.
 	sendEvent("third")
 	sendEvent("fourth")
-	// fifth arrives while buffer is still full — also dropped.
 	sendEvent("fifth")
-	// sixth arrives while buffer is still full — also dropped.
 	sendEvent("sixth")
-	// Drain to unblock and send the recovery event.
+	// Drain to unblock the channel so readLoop can make progress.
 	<-ch // "first"
 	<-ch // "second"
-	// Give readLoop time to retry the lagged notification and enqueue "seventh".
-	time.Sleep(20 * time.Millisecond)
+	// Send the recovery event. readLoop will emit client.lagged *before* it
+	// when the next real event arrives and c.dropped > 0 is detected.
 	sendEvent("seventh")
-	time.Sleep(20 * time.Millisecond)
 
-	var got []string
+	var got []Event
 	deadline := time.After(2 * time.Second)
 	for len(got) < 2 {
 		select {
 		case ev := <-ch:
-			got = append(got, ev.Event)
+			got = append(got, ev)
 		case <-deadline:
 			t.Fatalf("timeout; collected so far: %v", got)
 		}
 	}
 
-	if got[0] != "client.lagged" {
-		t.Errorf("got[0] = %q, want client.lagged (lag notification must precede recovery events)", got[0])
+	if got[0].Event != "client.lagged" {
+		t.Errorf("got[0] = %q, want client.lagged (lag notification must precede recovery events)", got[0].Event)
 	}
-	if got[1] == "client.lagged" {
+
+	// Validate the dropped_count payload. The event is constructed directly in
+	// readLoop (not via JSON unmarshal), so dropped_count is stored as int.
+	// We sent 6 events with channel capacity 2: "first" and "second" filled
+	// the buffer, so "third" through "sixth" should have been dropped. In
+	// practice the drain (above) may race with readLoop's processing of
+	// "sixth" — if readLoop sees an empty channel while processing "sixth", it
+	// successfully enqueues the lagged notification (count=3) instead of
+	// dropping it. We therefore expect exactly 3 or 4 drops.
+	if dc, ok := got[0].Raw["dropped_count"]; !ok {
+		t.Errorf("got[0].Raw missing dropped_count key")
+	} else {
+		count, isInt := dc.(int)
+		if !isInt {
+			t.Errorf("dropped_count has wrong type %T (want int), value: %v", dc, dc)
+		} else if count < 3 || count > 4 {
+			t.Errorf("dropped_count = %d, want 3 or 4 (third–sixth dropped, sixth may have enqueued if drain raced)", count)
+		}
+	}
+
+	if got[1].Event == "client.lagged" {
 		t.Errorf("got[1] = client.lagged again; expected a real event after the lag notification")
 	}
 
