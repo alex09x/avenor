@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sdougbrown/avenor/internal/control"
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/runtime"
@@ -83,7 +87,7 @@ func TestEffectivePermissionHandlerAutoApproveSkipsDerivedSentinelHandler(t *tes
 	if got := effectivePermissionHandler(sentinel, "", true); got != "" {
 		t.Fatalf("effectivePermissionHandler(autoApprove=true) = %q, want empty", got)
 	}
-	if got := effectivePermissionHandler(sentinel, "", false); got != "file:"+derivePermBase(sentinel) {
+	if got := effectivePermissionHandler(sentinel, "", false); got != "file:"+DerivePermBase(sentinel) {
 		t.Fatalf("effectivePermissionHandler(autoApprove=false) = %q, want derived file handler", got)
 	}
 	if got := effectivePermissionHandler(sentinel, "file:/tmp/custom.perm", true); got != "file:/tmp/custom.perm" {
@@ -131,7 +135,7 @@ func (f *cliFakeProvider) Capabilities(ctx context.Context) (runtime.Capabilitie
 func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -160,12 +164,12 @@ func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) 
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := waitForSession(context.Background(), provider, writer, nil, eventCh, promptDone, "ses_1", "run_1", "review", true, nil, &stderr)
+	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "review", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
 	}
 	if code != 0 {
-		t.Fatalf("waitForSession() = %d, want 0; stderr=%s", code, stderr.String())
+		t.Fatalf("WaitForSession() = %d, want 0; stderr=%s", code, stderr.String())
 	}
 	if provider.answerSessionID != "ses_1" || provider.answerRequestID != "req_1" {
 		t.Fatalf("answered session=%q request=%q", provider.answerSessionID, provider.answerRequestID)
@@ -243,12 +247,14 @@ func TestRunCleansSentinelFilesBetweenRetries(t *testing.T) {
 		ctx context.Context,
 		startOptions runtime.StartOptions,
 		resumeID string,
-		writer *eventWriter,
+		writer EventSink,
 		fileHandler *permission.FileHandler,
+		controlServer *control.ControlServer,
 		prompt string,
 		runID string,
 		runLabel string,
 		autoApprove bool,
+		permClaimTimeout time.Duration,
 		timer <-chan time.Time,
 		stderr io.Writer,
 	) attemptResult {
@@ -297,7 +303,7 @@ func TestRunCleansSentinelFilesBetweenRetries(t *testing.T) {
 
 func TestWriteRetryEventReturnsWriterError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.ndjson")
-	writer, err := newEventWriter(path)
+	writer, err := NewEventWriter(path)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -310,9 +316,9 @@ func TestWriteRetryEventReturnsWriterError(t *testing.T) {
 }
 
 func TestNewEventWriterNullPath(t *testing.T) {
-	w, err := newEventWriter("")
+	w, err := NewEventWriter("")
 	if err != nil {
-		t.Fatalf("newEventWriter(\"\") error = %v", err)
+		t.Fatalf("NewEventWriter(\"\") error = %v", err)
 	}
 	defer w.Close()
 	// Write should succeed and silently discard.
@@ -440,7 +446,7 @@ func (f *blockingFakeProvider) AnswerPermission(ctx context.Context, sessionID, 
 func TestAutoAnswerGoroutineDoesNotBlockEventLoop(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -465,7 +471,7 @@ func TestAutoAnswerGoroutineDoesNotBlockEventLoop(t *testing.T) {
 	var exitCode int
 	go func() {
 		defer wg.Done()
-		exitCode = waitForSession(context.Background(), provider, writer, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, io.Discard)
+		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
 	}()
 
 	// Wait until AnswerPermission has been called (goroutine is now blocked inside it).
@@ -515,7 +521,7 @@ func TestAutoAnswerGoroutineDoesNotBlockEventLoop(t *testing.T) {
 		t.Fatalf("close writer: %v", err)
 	}
 	if exitCode != 0 {
-		t.Fatalf("waitForSession() = %d, want 0", exitCode)
+		t.Fatalf("WaitForSession() = %d, want 0", exitCode)
 	}
 }
 
@@ -525,7 +531,7 @@ func TestAutoAnswerGoroutineDoesNotBlockEventLoop(t *testing.T) {
 func TestAutoAnswerMissingRequestIDEmitsErrorNotWorking(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -555,12 +561,12 @@ func TestAutoAnswerMissingRequestIDEmitsErrorNotWorking(t *testing.T) {
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := waitForSession(context.Background(), provider, writer, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, &stderr)
+	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
 	if code != 0 {
-		t.Fatalf("waitForSession() = %d, want 0", code)
+		t.Fatalf("WaitForSession() = %d, want 0", code)
 	}
 	// AnswerPermission must NOT have been called.
 	if provider.answerRequestID != "" {
@@ -593,7 +599,7 @@ func TestAutoAnswerMissingRequestIDEmitsErrorNotWorking(t *testing.T) {
 func TestAutoAnswerEmitsPermissionResponse(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -622,12 +628,12 @@ func TestAutoAnswerEmitsPermissionResponse(t *testing.T) {
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := waitForSession(context.Background(), provider, writer, nil, eventCh, promptDone, "ses_1", "run_1", "mylabel", true, nil, &stderr)
+	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "mylabel", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
 	if code != 0 {
-		t.Fatalf("waitForSession() = %d, want 0; stderr=%s", code, stderr.String())
+		t.Fatalf("WaitForSession() = %d, want 0; stderr=%s", code, stderr.String())
 	}
 
 	got := readEventLogForTest(t, eventsPath)
@@ -671,7 +677,7 @@ func TestAutoAnswerEmitsPermissionResponse(t *testing.T) {
 func TestAutoAnswerAnswerPermissionErrorEmitsError(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -701,12 +707,12 @@ func TestAutoAnswerAnswerPermissionErrorEmitsError(t *testing.T) {
 
 	provider := &errorFakeProvider{answerErr: fmt.Errorf("backend unavailable")}
 	var stderr strings.Builder
-	code := waitForSession(context.Background(), provider, writer, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, &stderr)
+	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
 	}
 	if code != 1 {
-		t.Fatalf("waitForSession() = %d, want 1 (error exit)", code)
+		t.Fatalf("WaitForSession() = %d, want 1 (error exit)", code)
 	}
 
 	got := readEventLogForTest(t, eventsPath)
@@ -732,7 +738,7 @@ func TestAutoAnswerAnswerPermissionErrorEmitsError(t *testing.T) {
 func TestAutoAnswerWorkingStatusEmittedOnPermissionResume(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -756,7 +762,7 @@ func TestAutoAnswerWorkingStatusEmittedOnPermissionResume(t *testing.T) {
 	var exitCode int
 	go func() {
 		defer wg.Done()
-		exitCode = waitForSession(context.Background(), provider, writer, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, io.Discard)
+		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
 	}()
 
 	// Wait until AnswerPermission is called, then unblock it so the
@@ -802,7 +808,7 @@ func TestAutoAnswerWorkingStatusEmittedOnPermissionResume(t *testing.T) {
 		t.Fatalf("close writer: %v", closeErr)
 	}
 	if exitCode != 0 {
-		t.Fatalf("waitForSession() = %d, want 0", exitCode)
+		t.Fatalf("WaitForSession() = %d, want 0", exitCode)
 	}
 
 	got := readEventLogForTest(t, eventsPath)
@@ -825,13 +831,121 @@ func TestAutoAnswerWorkingStatusEmittedOnPermissionResume(t *testing.T) {
 	}
 }
 
+// TestControlPermissionResolution verifies that a control socket owner can
+// answer a permission.request via answer_permission, which flows through
+// resolvePermission and calls AnswerPermission on the provider.
+func TestControlPermissionResolution(t *testing.T) {
+	state := control.NewState("run_1", "mylabel", 0)
+	cs := control.NewServer(state)
+	socketPath := filepath.Join(t.TempDir(), "cs.sock")
+	if err := cs.Start(socketPath); err != nil {
+		t.Fatalf("start control: %v", err)
+	}
+	defer cs.Stop()
+
+	dir := t.TempDir()
+	eventsPath := filepath.Join(dir, "events.ndjson")
+	writer, err := NewEventWriter(eventsPath)
+	if err != nil {
+		t.Fatalf("newEventWriter: %v", err)
+	}
+
+	eventCh := make(chan events.Event, 2)
+	eventCh <- events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_ctrl",
+		Fields: map[string]any{
+			"request_id": "req_ctrl",
+			"question":   "Allow?",
+			"options": []any{
+				map[string]any{"optionId": "deny", "kind": "reject"},
+				map[string]any{"optionId": "allow_x", "kind": "allow"},
+			},
+		},
+	}
+	eventCh <- events.Event{
+		Event:     "session.end",
+		SessionID: "ses_ctrl",
+		Fields:    map[string]any{"stop_reason": "end_turn"},
+	}
+	close(eventCh)
+	promptDone := make(chan error, 1)
+	promptDone <- nil
+
+	provider := &cliFakeProvider{}
+
+	// Connect to control socket BEFORE starting waitForSession so
+	// the answer arrives within the claim window.
+	deadline := time.Now().Add(5 * time.Second)
+	var ctrlConn net.Conn
+	for {
+		ctrlConn, err = net.DialTimeout("unix", socketPath, 2*time.Second)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dial control socket: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	defer ctrlConn.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var exitCode int
+	go func() {
+		defer wg.Done()
+		exitCode = WaitForSession(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_ctrl", "run_1", "mylabel", false, 5*time.Second, nil, io.Discard)
+	}()
+
+	// Wait for the permission.request to be processed by the event loop
+	// before sending the answer so the claim window is open.
+	time.Sleep(100 * time.Millisecond)
+
+	// Answer the pending permission via the control socket.
+	params, _ := json.Marshal(control.PermissionAnswer{RequestID: "req_ctrl", OptionID: "allow_x"})
+	req := control.Request{JSONRPC: "2.0", ID: 1, Method: "answer_permission", Params: params}
+	b, _ := json.Marshal(req)
+	b = append(b, '\n')
+	if _, err := ctrlConn.Write(b); err != nil {
+		t.Fatalf("write answer_permission: %v", err)
+	}
+
+	_ = ctrlConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	scanner := bufio.NewScanner(ctrlConn)
+	if !scanner.Scan() {
+		t.Fatal("no response to answer_permission")
+	}
+	var resp control.Response
+	if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("answer_permission error: %+v", resp.Error)
+	}
+
+	wg.Wait()
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("WaitForSession() = %d, want 0", exitCode)
+	}
+	if provider.answerRequestID != "req_ctrl" {
+		t.Fatalf("answerRequestID = %q, want req_ctrl", provider.answerRequestID)
+	}
+	if provider.answerResponse.OptionID != "allow_x" {
+		t.Fatalf("optionID = %q, want allow_x", provider.answerResponse.OptionID)
+	}
+}
+
 // TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits verifies that
 // receiving a second permission.request while one is already in-flight causes
 // the loop to emit an avenor.error and exit with code 1.
 func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
-	writer, err := newEventWriter(eventsPath)
+	writer, err := NewEventWriter(eventsPath)
 	if err != nil {
 		t.Fatalf("newEventWriter: %v", err)
 	}
@@ -855,7 +969,7 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 	var exitCode int
 	go func() {
 		defer wg.Done()
-		exitCode = waitForSession(context.Background(), provider, writer, nil, eventCh, promptDone, "ses_1", "run_1", "", true, nil, io.Discard)
+		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
 	}()
 
 	// Wait until the first AnswerPermission call is in-flight (blocking).
@@ -884,7 +998,7 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 		t.Fatalf("close writer: %v", closeErr)
 	}
 	if exitCode != 1 {
-		t.Fatalf("waitForSession() = %d, want 1 (duplicate permission guard)", exitCode)
+		t.Fatalf("WaitForSession() = %d, want 1 (duplicate permission guard)", exitCode)
 	}
 
 	got := readEventLogForTest(t, eventsPath)
@@ -899,5 +1013,296 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 	}
 	if !hasError {
 		t.Fatalf("expected avenor.error about 'already pending'; events: %+v", got)
+	}
+}
+
+// TestControlPermissionClaimTimeoutFallsThrough verifies the TOCTOU fix: when a
+// client is connected at the HasClients() gate but never sends answer_permission,
+// resolvePermission times out and falls through to the file-handler rather than
+// blocking until SIGINT.
+func TestControlPermissionClaimTimeoutFallsThrough(t *testing.T) {
+	// Shorten the claim window so the test completes quickly.
+	claimTimeout := 100 * time.Millisecond
+
+	// Use /tmp to keep socket path under the 104-byte macOS limit.
+	sockDir, err := os.MkdirTemp("", "av-pct-*")
+	if err != nil {
+		t.Fatalf("mkdirtemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+
+	state := control.NewState("run_timeout", "label", 0)
+	cs := control.NewServer(state)
+	socketPath := filepath.Join(sockDir, "t.sock")
+	if err := cs.Start(socketPath); err != nil {
+		t.Fatalf("start control server: %v", err)
+	}
+	defer cs.Stop()
+
+	// Connect a client so HasClients() returns true — but never answer.
+	silentConn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("dial silent client: %v", err)
+	}
+	defer silentConn.Close()
+
+	// Verify HasClients() is true before we call resolvePermission.
+	deadline := time.Now().Add(2 * time.Second)
+	for !cs.HasClients() {
+		if time.Now().After(deadline) {
+			t.Fatal("HasClients() never became true")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	event := events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_timeout",
+		Fields: map[string]any{
+			"request_id": "req_timeout",
+			"options": []any{
+				map[string]any{"optionId": "deny", "kind": "reject"},
+				map[string]any{"optionId": "allow_t", "kind": "allow"},
+			},
+		},
+	}
+
+	provider := &cliFakeProvider{}
+	emit := func(events.Event) error { return nil }
+
+	// resolvePermission should time out waiting for the silent client,
+	// then fall through to the no-resolver path (fileHandler == nil).
+	start := time.Now()
+	res := resolvePermission(context.Background(), provider, nil, cs, event, "ses_timeout", "req_timeout", false, claimTimeout, emit)
+	elapsed := time.Since(start)
+
+	// Lower bound: must have waited at least the claim timeout (80ms gives 20ms slack).
+	if elapsed < 80*time.Millisecond {
+		t.Fatalf("resolvePermission returned too quickly (%v); expected to wait ~%v for the claim timer", elapsed, claimTimeout)
+	}
+	// Upper bound: should not have blocked indefinitely.
+	if elapsed > 5*time.Second {
+		t.Fatalf("resolvePermission blocked for %v, want ~%v", elapsed, claimTimeout)
+	}
+	// No file-handler provided, so result should be the no-resolver sentinel.
+	if res.source != "none" {
+		t.Fatalf("result source = %q, want \"none\"", res.source)
+	}
+	if res.err != nil {
+		t.Fatalf("unexpected error: %v", res.err)
+	}
+	// The claim should have been cleaned up.
+	if cs.HasPendingPermission() {
+		t.Fatal("permission claim still registered after timeout")
+	}
+	// Control path timed out without answering — AnswerPermission must NOT have been called.
+	if provider.answerRequestID != "" {
+		t.Fatalf("provider.AnswerPermission was called with requestID=%q, want no call (control path should not answer on timeout)", provider.answerRequestID)
+	}
+}
+
+// TestControlPermissionClaimTimeoutFallsToFileHandler verifies that when the
+// claim times out and a file-handler is configured, resolvePermission routes to
+// the file-handler rather than returning source "none".
+func TestControlPermissionClaimTimeoutFallsToFileHandler(t *testing.T) {
+	claimTimeout := 100 * time.Millisecond
+
+	// Use /tmp to keep socket path under the 104-byte macOS limit.
+	sockDir, err := os.MkdirTemp("", "av-pcf-*")
+	if err != nil {
+		t.Fatalf("mkdirtemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+
+	state := control.NewState("run_fh", "label", 0)
+	cs := control.NewServer(state)
+	socketPath := filepath.Join(sockDir, "f.sock")
+	if err := cs.Start(socketPath); err != nil {
+		t.Fatalf("start control server: %v", err)
+	}
+	defer cs.Stop()
+
+	// Silent client keeps HasClients() true.
+	silentConn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("dial silent client: %v", err)
+	}
+	defer silentConn.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !cs.HasClients() {
+		if time.Now().After(deadline) {
+			t.Fatal("HasClients() never became true")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	dir := t.TempDir()
+	base := filepath.Join(dir, "perm")
+	fh := permission.NewFileHandler(base)
+	fh.Timeout = 5 * time.Second
+	fh.PollInterval = 20 * time.Millisecond
+
+	// The file handler writes <base>.req then removes any pre-existing
+	// <base>.req.response before polling for a new one. Write the response
+	// only after the .req file appears — this eliminates the race where
+	// os.Remove in the file handler deletes a response written too early
+	// (which would cause the handler to wait the full fh.Timeout).
+	reqPath := base + ".req"
+	respPath := base + ".req.response"
+	go func() {
+		// Poll for the request file with a generous deadline.
+		pollDeadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, statErr := os.Stat(reqPath); statErr == nil {
+				break
+			}
+			if time.Now().After(pollDeadline) {
+				return // test will fail via fh.Timeout; no need to panic here
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		_ = os.WriteFile(respPath, []byte(`{"outcome":"selected","option_id":"allow_fh"}`+"\n"), 0o600)
+	}()
+
+	event := events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_fh",
+		Fields: map[string]any{
+			"request_id": "req_fh",
+			"options": []any{
+				map[string]any{"optionId": "deny", "kind": "reject"},
+				map[string]any{"optionId": "allow_fh", "kind": "allow"},
+			},
+		},
+	}
+
+	provider := &cliFakeProvider{}
+	emit := func(events.Event) error { return nil }
+
+	res := resolvePermission(context.Background(), provider, fh, cs, event, "ses_fh", "req_fh", false, claimTimeout, emit)
+
+	if res.err != nil {
+		t.Fatalf("unexpected error: %v", res.err)
+	}
+	if res.source != "file" {
+		t.Fatalf("result source = %q, want \"file\"", res.source)
+	}
+	if res.optionID != "allow_fh" {
+		t.Fatalf("optionID = %q, want \"allow_fh\"", res.optionID)
+	}
+	// File handler called provider.AnswerPermission — verify the fields.
+	if provider.answerRequestID != "req_fh" {
+		t.Fatalf("provider.answerRequestID = %q, want \"req_fh\"", provider.answerRequestID)
+	}
+	if provider.answerResponse.OptionID != "allow_fh" {
+		t.Fatalf("provider.answerResponse.OptionID = %q, want \"allow_fh\"", provider.answerResponse.OptionID)
+	}
+}
+
+// TestControlPermissionClaimContextCancelReleasesClaim verifies that when the
+// context is cancelled while resolvePermission is waiting on the control-plane
+// claim channel, the claim is cleaned up (HasPendingPermission returns false)
+// and the result carries the context error.
+func TestControlPermissionClaimContextCancelReleasesClaim(t *testing.T) {
+	// Use a long claim timeout so we know the ctx.Done() branch fires, not the timer.
+	claimTimeout := 30 * time.Second
+
+	// Use /tmp to keep socket path under the 104-byte macOS limit.
+	sockDir, err := os.MkdirTemp("", "av-pcx-*")
+	if err != nil {
+		t.Fatalf("mkdirtemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+
+	state := control.NewState("run_cancel", "label", 0)
+	cs := control.NewServer(state)
+	socketPath := filepath.Join(sockDir, "x.sock")
+	if err := cs.Start(socketPath); err != nil {
+		t.Fatalf("start control server: %v", err)
+	}
+	defer cs.Stop()
+
+	// Silent client — never sends answer_permission, just keeps HasClients() true.
+	silentConn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("dial silent client: %v", err)
+	}
+	defer silentConn.Close()
+
+	// Wait until the server registers the client.
+	deadline := time.Now().Add(2 * time.Second)
+	for !cs.HasClients() {
+		if time.Now().After(deadline) {
+			t.Fatal("HasClients() never became true")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	event := events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_cancel",
+		Fields: map[string]any{
+			"request_id": "req_cancel",
+			"options": []any{
+				map[string]any{"optionId": "deny", "kind": "reject"},
+				map[string]any{"optionId": "allow_c", "kind": "allow"},
+			},
+		},
+	}
+
+	provider := &cliFakeProvider{}
+	emit := func(events.Event) error { return nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Channel closed once resolvePermission has registered the claim.
+	claimRegistered := make(chan struct{})
+	go func() {
+		// Poll until HasPendingPermission becomes true, then signal.
+		for {
+			if cs.HasPendingPermission() {
+				close(claimRegistered)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	resultCh := make(chan permissionResult, 1)
+	go func() {
+		resultCh <- resolvePermission(ctx, provider, nil, cs, event, "ses_cancel", "req_cancel", false, claimTimeout, emit)
+	}()
+
+	// Wait for the claim to be registered before cancelling.
+	select {
+	case <-claimRegistered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("claim was never registered within 2 seconds")
+	}
+
+	cancel()
+
+	var res permissionResult
+	select {
+	case res = <-resultCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("resolvePermission did not return within 5 seconds after context cancel")
+	}
+
+	// The result must carry the context error.
+	if res.err == nil {
+		t.Fatal("expected non-nil error from context cancellation, got nil")
+	}
+	if !errors.Is(res.err, context.Canceled) {
+		t.Fatalf("res.err = %v, want context.Canceled", res.err)
+	}
+	// The claim must have been released.
+	if cs.HasPendingPermission() {
+		t.Fatal("HasPendingPermission() = true after context cancel; claim was not cleaned up")
+	}
+	// AnswerPermission must NOT have been called (ctx was cancelled before any answer).
+	if provider.answerRequestID != "" {
+		t.Fatalf("provider.AnswerPermission called with requestID=%q, want no call", provider.answerRequestID)
 	}
 }

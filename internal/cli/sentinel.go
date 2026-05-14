@@ -15,7 +15,7 @@ import (
 // Rule: if the path ends in ".done", strip it and append ".perm".
 // Otherwise append ".perm" directly.
 // This mirrors the derive_permission_base function in dispatch-avenor.sh.
-func derivePermBase(sentinelPath string) string {
+func DerivePermBase(sentinelPath string) string {
 	if strings.HasSuffix(sentinelPath, ".done") {
 		return strings.TrimSuffix(sentinelPath, ".done") + ".perm"
 	}
@@ -115,7 +115,7 @@ func sessionEndFields(eventLogPath string) (sessionID, stopReason string) {
 // writeSentinel writes the completion sentinel file at path using an
 // atomic tmp+rename strategy. Errors are logged to stderr but never affect
 // the caller's exit code.
-func writeSentinel(path string, exitCode int, sessionID, stopReason, runID string, stderr io.Writer) {
+func WriteSentinel(path string, exitCode int, sessionID, stopReason, runID string, stderr io.Writer) {
 	content := sentinelContent(exitCode, sessionID, stopReason, runID)
 
 	dir := filepath.Dir(path)

@@ -1,0 +1,726 @@
+package control
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/sdougbrown/avenor/internal/events"
+)
+
+const subscriberBuffer = 256
+
+type PermissionAnswer struct {
+	RequestID string `json:"request_id"`
+	OptionID  string `json:"option_id"`
+}
+
+type ControlServer struct {
+	state *ControlState
+
+	mu       sync.Mutex
+	listener net.Listener
+	path     string
+	stopped  bool
+
+	conns map[*connState]struct{}
+	subs  map[*subscriber]struct{}
+	owner *connState
+	watch map[chan events.Event]struct{}
+
+	cancelFn func()
+
+	pendingMu      sync.Mutex
+	pendingRequest string
+	pendingAnswer  chan PermissionAnswer
+
+	promptMu        sync.Mutex
+	promptQueue     []string
+	interruptPrompt string
+
+	interruptMu sync.Mutex
+	interruptCh chan struct{}
+
+	stableHandler StableHandler
+}
+
+type StableHandler interface {
+	Spawn(params json.RawMessage) (any, error)
+	List() any
+	Shutdown(mode string) error
+	RuntimeStatus(runtimeID string) (any, error)
+	RuntimeCancel(runtimeID string) error
+	RuntimePrompt(runtimeID, text string) error
+	RuntimeAnswerPermission(runtimeID, requestID, optionID string) error
+	RuntimeInterruptAndPrompt(runtimeID, text string, keepQueue bool) error
+}
+
+type connState struct {
+	id      uint64
+	server  *ControlServer
+	conn    net.Conn
+	wmu     sync.Mutex
+	closed  bool
+	isOwner bool
+}
+
+type subscriber struct {
+	conn    *connState
+	ch      chan events.Event
+	dropped int
+	mu      sync.Mutex // guards ch from concurrent close+send
+	closed  bool
+}
+
+func NewServer(state *ControlState) *ControlServer {
+	return &ControlServer{state: state, conns: map[*connState]struct{}{}, subs: map[*subscriber]struct{}{}, watch: map[chan events.Event]struct{}{}}
+}
+
+func (s *ControlServer) SetStableHandler(h StableHandler) { s.stableHandler = h }
+
+func runtimeIDFromParams(params json.RawMessage) string {
+	if len(params) == 0 {
+		return ""
+	}
+	var p struct {
+		RuntimeID string `json:"runtime_id"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return ""
+	}
+	return p.RuntimeID
+}
+
+func (s *ControlServer) SetCancelFunc(fn func()) { s.cancelFn = fn }
+
+func (s *ControlServer) Start(socketPath string) error {
+	if socketPath == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		return fmt.Errorf("create control socket dir: %w", err)
+	}
+	if _, err := os.Stat(socketPath); err == nil {
+		if c, dialErr := net.DialTimeout("unix", socketPath, 250*time.Millisecond); dialErr == nil {
+			_ = c.Close()
+			return fmt.Errorf("control socket already in use: %s", socketPath)
+		}
+		_ = os.Remove(socketPath)
+	}
+	oldMask := syscall.Umask(0o077)
+	l, err := net.Listen("unix", socketPath)
+	syscall.Umask(oldMask)
+	if err != nil {
+		return err
+	}
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		_ = l.Close()
+		return fmt.Errorf("chmod control socket: %w", err)
+	}
+
+	s.mu.Lock()
+	s.listener = l
+	s.path = socketPath
+	s.mu.Unlock()
+
+	go s.acceptLoop()
+	return nil
+}
+
+func (s *ControlServer) Stop() {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	s.stopped = true
+	l := s.listener
+	path := s.path
+	conns := make([]*connState, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+
+	if l != nil {
+		_ = l.Close()
+	}
+	for _, c := range conns {
+		_ = c.conn.Close()
+	}
+	if path != "" {
+		_ = os.Remove(path)
+	}
+}
+
+// HasClients reports whether the control plane has at least one connected
+// client capable of answering control RPCs. Returns false when no socket is
+// bound (e.g. --http-debug without --control-socket) or when no client has
+// dialed in yet. Used to gate features that should defer to fallbacks
+// (file-handler permissions) when nothing on the socket can answer.
+func (s *ControlServer) HasClients() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.path != "" && len(s.conns) > 0
+}
+
+func (s *ControlServer) SubscribeEvents(ctx context.Context) <-chan events.Event {
+	ch := make(chan events.Event, subscriberBuffer)
+	s.mu.Lock()
+	s.watch[ch] = struct{}{}
+	s.mu.Unlock()
+	go func() {
+		<-ctx.Done()
+		s.mu.Lock()
+		delete(s.watch, ch)
+		s.mu.Unlock()
+		close(ch)
+	}()
+	return ch
+}
+
+func (s *ControlServer) PublishEvent(event events.Event) {
+	s.state.Update(func(ss *Snapshot) {
+		ss.LastEvent = event.Event
+		if event.SessionID != "" {
+			ss.SessionID = event.SessionID
+		}
+		if event.Event == "agent.status" {
+			if phase, _ := event.Fields["phase"].(string); phase != "" {
+				ss.Phase = phase
+			}
+			if label, _ := event.Fields["label"].(string); label != "" {
+				ss.PhaseLabel = label
+			}
+		}
+		if event.Event == "permission.request" {
+			ss.PendingPermission = true
+			ss.Permission = map[string]any{}
+			for k, v := range event.Fields {
+				ss.Permission[k] = v
+			}
+		}
+		if event.Event == "permission.response" {
+			ss.PendingPermission = false
+			ss.Permission = nil
+		}
+		switch event.Event {
+		case "session.start":
+			ss.TurnState = "starting"
+		case "tool.call", "agent.thought_chunk", "agent.message_chunk":
+			if ss.TurnState == "starting" || ss.TurnState == "" {
+				ss.TurnState = "running"
+			}
+		case "session.end":
+			if ss.TurnState != "idle" && ss.TurnState != "cancelling" {
+				ss.TurnState = "ended"
+			}
+		}
+	})
+
+	s.mu.Lock()
+	subs := make([]*subscriber, 0, len(s.subs))
+	for sub := range s.subs {
+		subs = append(subs, sub)
+	}
+	watch := make([]chan events.Event, 0, len(s.watch))
+	for ch := range s.watch {
+		watch = append(watch, ch)
+	}
+	s.mu.Unlock()
+
+	for _, sub := range subs {
+		sub.enqueue(event)
+	}
+	for _, ch := range watch {
+		// Best-effort deliver to in-process watchers: drain one stale
+		// event if full, then retry. Under concurrent load, events may
+		// be silently dropped.
+		select {
+		case ch <- event:
+		default:
+			select {
+			case <-ch:
+			default:
+			}
+			select {
+			case ch <- event:
+			default:
+			}
+		}
+	}
+}
+
+// BeginPermissionClaim registers a new permission claim for requestID and
+// returns the answer channel plus true. If a claim is already in flight it
+// returns nil, false — the caller must not overwrite an active claim.
+func (s *ControlServer) BeginPermissionClaim(requestID string) (<-chan PermissionAnswer, bool) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if s.pendingRequest != "" {
+		// Another claim is still registered; refuse to clobber it.
+		return nil, false
+	}
+	s.pendingRequest = requestID
+	s.pendingAnswer = make(chan PermissionAnswer, 1)
+	return s.pendingAnswer, true
+}
+
+func (s *ControlServer) EndPermissionClaim(requestID string) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if s.pendingRequest == requestID {
+		s.pendingRequest = ""
+		s.pendingAnswer = nil
+	}
+}
+
+// HasPendingPermission reports whether a permission claim is currently
+// registered. Used by tests to verify claims are cleaned up after timeout.
+func (s *ControlServer) HasPendingPermission() bool {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	return s.pendingRequest != ""
+}
+
+func (s *ControlServer) QueuePrompt(text string) {
+	s.promptMu.Lock()
+	s.promptQueue = append(s.promptQueue, text)
+	s.promptMu.Unlock()
+}
+
+func (s *ControlServer) DequeuePrompt() string {
+	s.promptMu.Lock()
+	defer s.promptMu.Unlock()
+	if len(s.promptQueue) == 0 {
+		return ""
+	}
+	text := s.promptQueue[0]
+	s.promptQueue = s.promptQueue[1:]
+	return text
+}
+
+func (s *ControlServer) InterruptPrompt(text string, keepQueue bool) {
+	s.promptMu.Lock()
+	s.interruptPrompt = text
+	if !keepQueue {
+		s.promptQueue = nil
+	}
+	s.promptMu.Unlock()
+	s.signalInterrupt()
+}
+
+func (s *ControlServer) ConsumeInterrupt() string {
+	s.promptMu.Lock()
+	defer s.promptMu.Unlock()
+	text := s.interruptPrompt
+	s.interruptPrompt = ""
+	return text
+}
+
+// InterruptChan returns the channel that closes when an interrupt fires.
+// Idempotent: returns the same channel until ResetInterrupt is called.
+func (s *ControlServer) InterruptChan() <-chan struct{} {
+	s.interruptMu.Lock()
+	defer s.interruptMu.Unlock()
+	if s.interruptCh == nil {
+		s.interruptCh = make(chan struct{})
+	}
+	return s.interruptCh
+}
+
+// ResetInterrupt closes the current interrupt channel (if any) and creates a
+// fresh one. Call this between turns to re-arm the interrupt signal.
+func (s *ControlServer) ResetInterrupt() {
+	s.interruptMu.Lock()
+	defer s.interruptMu.Unlock()
+	if s.interruptCh != nil {
+		select {
+		case <-s.interruptCh:
+		default:
+			close(s.interruptCh)
+		}
+	}
+	s.interruptCh = make(chan struct{})
+}
+
+func (s *ControlServer) signalInterrupt() {
+	s.interruptMu.Lock()
+	ch := s.interruptCh
+	s.interruptMu.Unlock()
+	if ch != nil {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+}
+
+func (s *ControlServer) acceptLoop() {
+	var seq uint64
+	for {
+		s.mu.Lock()
+		l := s.listener
+		stopped := s.stopped
+		s.mu.Unlock()
+		if stopped || l == nil {
+			return
+		}
+		conn, err := l.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			continue
+		}
+		seq++
+		cs := &connState{id: seq, server: s, conn: conn}
+		s.mu.Lock()
+		s.conns[cs] = struct{}{}
+		s.mu.Unlock()
+		go s.handleConn(cs)
+	}
+}
+
+func (s *ControlServer) handleConn(c *connState) {
+	defer s.disconnect(c)
+	scanner := bufio.NewScanner(c.conn)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 4*1024*1024)
+	for scanner.Scan() {
+		var req Request
+		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+			_ = c.writeJSON(failure(nil, -32700, "parse error", nil))
+			continue
+		}
+		if req.JSONRPC != "2.0" {
+			_ = c.writeJSON(failure(req.ID, -32600, "invalid request", nil))
+			continue
+		}
+		res := s.dispatch(c, req)
+		if req.ID != nil {
+			_ = c.writeJSON(res)
+		}
+	}
+}
+
+func (s *ControlServer) dispatch(c *connState, req Request) Response {
+	switch req.Method {
+	case "status":
+		if rtID := runtimeIDFromParams(req.Params); rtID != "" {
+			if s.stableHandler == nil {
+				return failure(req.ID, -32601, "method not found", nil)
+			}
+			result, err := s.stableHandler.RuntimeStatus(rtID)
+			if err != nil {
+				return failure(req.ID, -32000, err.Error(), nil)
+			}
+			return success(req.ID, result)
+		}
+		return success(req.ID, s.state.Snapshot())
+	case "subscribe":
+		sub := &subscriber{conn: c, ch: make(chan events.Event, subscriberBuffer)}
+		s.mu.Lock()
+		s.subs[sub] = struct{}{}
+		s.mu.Unlock()
+		go sub.loop()
+		return success(req.ID, map[string]any{"subscribed": true})
+	case "cancel":
+		if rtID := runtimeIDFromParams(req.Params); rtID != "" {
+			if s.stableHandler == nil {
+				return failure(req.ID, -32601, "method not found", nil)
+			}
+			if !s.ensureOwner(c) {
+				return failure(req.ID, -32010, "permission_denied", nil)
+			}
+			if err := s.stableHandler.RuntimeCancel(rtID); err != nil {
+				return failure(req.ID, -32000, err.Error(), nil)
+			}
+			return success(req.ID, map[string]any{"ok": true})
+		}
+		if !s.ensureOwner(c) {
+			return failure(req.ID, -32010, "permission_denied", nil)
+		}
+		if s.cancelFn != nil {
+			s.cancelFn()
+		}
+		return success(req.ID, map[string]any{"ok": true})
+	case "answer_permission":
+		if rtID := runtimeIDFromParams(req.Params); rtID != "" {
+			if s.stableHandler == nil {
+				return failure(req.ID, -32601, "method not found", nil)
+			}
+			if !s.ensureOwner(c) {
+				return failure(req.ID, -32010, "permission_denied", nil)
+			}
+			var p struct {
+				RequestID string `json:"request_id"`
+				OptionID  string `json:"option_id"`
+			}
+			if len(req.Params) > 0 {
+				if err := json.Unmarshal(req.Params, &p); err != nil {
+					return failure(req.ID, -32602, "invalid params", map[string]any{"detail": err.Error()})
+				}
+			}
+			if p.RequestID == "" || p.OptionID == "" {
+				return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"request_id", "option_id"}})
+			}
+			if err := s.stableHandler.RuntimeAnswerPermission(rtID, p.RequestID, p.OptionID); err != nil {
+				return failure(req.ID, -32000, err.Error(), nil)
+			}
+			return success(req.ID, map[string]any{"accepted": true})
+		}
+		if !s.ensureOwner(c) {
+			return failure(req.ID, -32010, "permission_denied", nil)
+		}
+		var p PermissionAnswer
+		if len(req.Params) > 0 {
+			if err := json.Unmarshal(req.Params, &p); err != nil {
+				return failure(req.ID, -32602, "invalid params", nil)
+			}
+		}
+		if p.RequestID == "" || p.OptionID == "" {
+			return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"request_id", "option_id"}})
+		}
+		s.pendingMu.Lock()
+		pendingReq := s.pendingRequest
+		pending := s.pendingAnswer
+		s.pendingMu.Unlock()
+		if pending == nil || pendingReq != p.RequestID {
+			return failure(req.ID, -32001, "no_pending_permission", nil)
+		}
+		select {
+		case pending <- p:
+		default:
+		}
+		return success(req.ID, map[string]any{"accepted": true})
+	case "prompt":
+		if rtID := runtimeIDFromParams(req.Params); rtID != "" {
+			if s.stableHandler == nil {
+				return failure(req.ID, -32601, "method not found", nil)
+			}
+			if !s.ensureOwner(c) {
+				return failure(req.ID, -32010, "permission_denied", nil)
+			}
+			var pr struct {
+				Text string `json:"text"`
+			}
+			if len(req.Params) > 0 {
+				if err := json.Unmarshal(req.Params, &pr); err != nil {
+					return failure(req.ID, -32602, "invalid params", map[string]any{"detail": err.Error()})
+				}
+			}
+			if pr.Text == "" {
+				return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"text"}})
+			}
+			if err := s.stableHandler.RuntimePrompt(rtID, pr.Text); err != nil {
+				return failure(req.ID, -32000, err.Error(), nil)
+			}
+			return success(req.ID, map[string]any{"accepted": true})
+		}
+		if !s.ensureOwner(c) {
+			return failure(req.ID, -32010, "permission_denied", nil)
+		}
+		var pr struct {
+			Text string `json:"text"`
+		}
+		if len(req.Params) > 0 {
+			if err := json.Unmarshal(req.Params, &pr); err != nil {
+				return failure(req.ID, -32602, "invalid params", map[string]any{"detail": err.Error()})
+			}
+		}
+		if pr.Text == "" {
+			return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"text"}})
+		}
+		s.QueuePrompt(pr.Text)
+		s.state.Update(func(ss *Snapshot) { ss.TurnState = "idle" })
+		return success(req.ID, map[string]any{"accepted": true})
+	case "interrupt_and_prompt":
+		if rtID := runtimeIDFromParams(req.Params); rtID != "" {
+			if s.stableHandler == nil {
+				return failure(req.ID, -32601, "method not found", nil)
+			}
+			if !s.ensureOwner(c) {
+				return failure(req.ID, -32010, "permission_denied", nil)
+			}
+			var ip struct {
+				Text      string `json:"text"`
+				KeepQueue bool   `json:"keep_queue"`
+			}
+			if len(req.Params) > 0 {
+				if err := json.Unmarshal(req.Params, &ip); err != nil {
+					return failure(req.ID, -32602, "invalid params", map[string]any{"detail": err.Error()})
+				}
+			}
+			if ip.Text == "" {
+				return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"text"}})
+			}
+			if err := s.stableHandler.RuntimeInterruptAndPrompt(rtID, ip.Text, ip.KeepQueue); err != nil {
+				return failure(req.ID, -32000, err.Error(), nil)
+			}
+			return success(req.ID, map[string]any{"accepted": true})
+		}
+		if !s.ensureOwner(c) {
+			return failure(req.ID, -32010, "permission_denied", nil)
+		}
+		var ip struct {
+			Text      string `json:"text"`
+			KeepQueue bool   `json:"keep_queue"`
+		}
+		if len(req.Params) > 0 {
+			if err := json.Unmarshal(req.Params, &ip); err != nil {
+				return failure(req.ID, -32602, "invalid params", map[string]any{"detail": err.Error()})
+			}
+		}
+		if ip.Text == "" {
+			return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"text"}})
+		}
+		s.InterruptPrompt(ip.Text, ip.KeepQueue)
+		s.state.Update(func(ss *Snapshot) { ss.TurnState = "cancelling" })
+		return success(req.ID, map[string]any{"accepted": true})
+	case "spawn":
+		if !s.ensureOwner(c) {
+			return failure(req.ID, -32010, "permission_denied", nil)
+		}
+		if s.stableHandler == nil {
+			return failure(req.ID, -32601, "method not found", nil)
+		}
+		result, err := s.stableHandler.Spawn(req.Params)
+		if err != nil {
+			return failure(req.ID, -32000, err.Error(), nil)
+		}
+		return success(req.ID, result)
+	case "list":
+		if s.stableHandler == nil {
+			return failure(req.ID, -32601, "method not found", nil)
+		}
+		return success(req.ID, s.stableHandler.List())
+	case "shutdown":
+		if !s.ensureOwner(c) {
+			return failure(req.ID, -32010, "permission_denied", nil)
+		}
+		if s.stableHandler == nil {
+			return failure(req.ID, -32601, "method not found", nil)
+		}
+		var sd struct {
+			Mode string `json:"mode"`
+		}
+		if len(req.Params) > 0 {
+			_ = json.Unmarshal(req.Params, &sd)
+		}
+		if sd.Mode == "" {
+			sd.Mode = "graceful"
+		}
+		if err := s.stableHandler.Shutdown(sd.Mode); err != nil {
+			return failure(req.ID, -32000, err.Error(), nil)
+		}
+		return success(req.ID, map[string]any{"shutting_down": true})
+	default:
+		return failure(req.ID, -32601, "method not found", nil)
+	}
+}
+
+// ensureOwner implements first-come-first-served ownership: the first connected
+// client to issue a mutating command becomes the owner. When the owner
+// disconnects, ownership is released and the next client to call a mutating
+// method inherits it. This relies on Unix socket permissions (0600) for
+// process-level isolation.
+func (s *ControlServer) ensureOwner(c *connState) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.owner == nil {
+		s.owner = c
+		c.isOwner = true
+		return true
+	}
+	return s.owner == c
+}
+
+func (s *ControlServer) disconnect(c *connState) {
+	s.mu.Lock()
+	delete(s.conns, c)
+	for sub := range s.subs {
+		if sub.conn == c {
+			delete(s.subs, sub)
+			sub.mu.Lock()
+			sub.closed = true
+			close(sub.ch)
+			sub.mu.Unlock()
+		}
+	}
+	if s.owner == c {
+		s.owner = nil
+	}
+	s.mu.Unlock()
+	_ = c.conn.Close()
+}
+
+func (c *connState) writeJSON(v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.closed {
+		return net.ErrClosed
+	}
+	_, err = c.conn.Write(b)
+	if err != nil {
+		c.closed = true
+	}
+	return err
+}
+
+func (s *subscriber) enqueue(ev events.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	select {
+	case s.ch <- ev:
+	default:
+		<-s.ch
+		s.dropped++
+		s.ch <- ev
+	}
+}
+
+func (s *subscriber) loop() {
+	pendingLag := 0
+	for ev := range s.ch {
+		s.mu.Lock()
+		if s.dropped > 0 {
+			pendingLag += s.dropped
+			s.dropped = 0
+		}
+		s.mu.Unlock()
+		if pendingLag > 0 {
+			_ = s.conn.writeJSON(Notification{JSONRPC: "2.0", Method: "event", Params: map[string]any{"event": "subscriber.lagged", "dropped_count": pendingLag, "ts": time.Now().UnixMilli()}})
+			pendingLag = 0
+		}
+		_ = s.conn.writeJSON(Notification{JSONRPC: "2.0", Method: "event", Params: eventToMap(ev)})
+	}
+}
+
+func eventToMap(ev events.Event) map[string]any {
+	fields := map[string]any{"event": ev.Event}
+	if ev.SessionID != "" {
+		fields["session_id"] = ev.SessionID
+	}
+	for k, v := range ev.Fields {
+		fields[k] = v
+	}
+	return fields
+}
