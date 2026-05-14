@@ -109,7 +109,12 @@ func (s *Supervisor) Run() int {
 	defer s.control.Stop()
 
 	if s.config.HTTPDebug != "" {
-		s.httpServer = control.NewHTTPDebugServer(s.config.HTTPDebug, s.control)
+		var err error
+		s.httpServer, err = control.NewHTTPDebugServer(s.config.HTTPDebug, s.control)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "avenor stable: start http debug: %v\n", err)
+			return 1
+		}
 		if err := s.httpServer.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "avenor stable: start http debug: %v\n", err)
 			return 1

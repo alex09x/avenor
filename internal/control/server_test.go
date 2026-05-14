@@ -242,7 +242,10 @@ func readResp(t *testing.T, c net.Conn) Response {
 func TestHTTPDebugStatusAndCancel(t *testing.T) {
 	state := NewState("run_1", "", 0)
 	s := NewServer(state)
-	h := NewHTTPDebugServer("127.0.0.1:0", s)
+	h, err := NewHTTPDebugServer("127.0.0.1:0", s)
+	if err != nil {
+		t.Fatalf("NewHTTPDebugServer: %v", err)
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)

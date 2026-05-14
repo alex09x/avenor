@@ -19,10 +19,10 @@ type HTTPDebugServer struct {
 	token   string
 }
 
-func NewHTTPDebugServer(addr string, control *ControlServer) *HTTPDebugServer {
+func NewHTTPDebugServer(addr string, control *ControlServer) (*HTTPDebugServer, error) {
 	resolved, err := resolveDebugAddr(addr)
 	if err != nil {
-		panic(err.Error())
+		return nil, err
 	}
 	tokenBytes := make([]byte, 16)
 	if _, err := rand.Read(tokenBytes); err != nil {
@@ -36,8 +36,16 @@ func NewHTTPDebugServer(addr string, control *ControlServer) *HTTPDebugServer {
 	mux.HandleFunc("/cancel", h.handleCancel)
 	mux.HandleFunc("/answer-permission", h.handleAnswerPermission)
 	h.server = &http.Server{Addr: resolved, Handler: mux}
-	fmt.Fprintf(os.Stderr, "avenor: http debug token: %s\n", token)
-	return h
+	// Only print the token when stderr is an interactive terminal.  When stderr
+	// is redirected to a file, pipe, or captured by a service manager (journald,
+	// systemd, etc.) the token would persist in logs for the lifetime of the
+	// process and could be read by anything with access to those logs.  Skipping
+	// the print in non-TTY environments is intentional; operators that need the
+	// token in non-interactive setups should inject it via another channel.
+	if stat, serr := os.Stderr.Stat(); serr == nil && (stat.Mode()&os.ModeCharDevice) != 0 {
+		fmt.Fprintf(os.Stderr, "avenor: http debug token: %s\n", token)
+	}
+	return h, nil
 }
 
 // resolveDebugAddr normalises addr and rejects anything that would bind on a
