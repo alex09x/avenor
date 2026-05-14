@@ -27,6 +27,9 @@ const defaultBackend = "opencode-acp"
 // the file-handler (or the no-resolver path). This bounds the TOCTOU window
 // where HasClients() was true at the gate but the client disconnects or goes
 // silent before answering. Declared as a var so tests can shorten it.
+//
+// WARNING: tests mutate this variable. Do NOT run permission-claim tests with
+// t.Parallel() — sequential execution is required to avoid data races.
 var permissionClaimTimeout = 30 * time.Second
 
 type ServerDiscovery struct {
@@ -166,7 +169,11 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			controlServer = control.NewServer(state)
 			writer = newFanoutWriter(writer, controlServer)
 		}
-		httpServer = control.NewHTTPDebugServer(*httpDebug, controlServer)
+		httpServer, err = control.NewHTTPDebugServer(*httpDebug, controlServer)
+		if err != nil {
+			fmt.Fprintf(stderr, "avenor: start http debug server: %v\n", err)
+			return exitWithSentinel(1)
+		}
 		if err := httpServer.Start(); err != nil {
 			fmt.Fprintf(stderr, "avenor: start http debug server: %v\n", err)
 			return exitWithSentinel(1)
@@ -579,7 +586,11 @@ func resolvePermission(
 	// permissionClaimTimeout so that on disconnect or a silent client we fall
 	// through to the file-handler rather than blocking until SIGINT.
 	if controlServer != nil && controlServer.HasClients() {
-		answerCh := controlServer.BeginPermissionClaim(requestID)
+		answerCh, ok := controlServer.BeginPermissionClaim(requestID)
+		if !ok {
+			// Another claim is already in flight; fall through to file-handler.
+			goto fileHandlerFallback
+		}
 		claimTimer := time.NewTimer(permissionClaimTimeout)
 		select {
 		case ans := <-answerCh:
@@ -592,15 +603,49 @@ func resolvePermission(
 			return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
 		case <-ctx.Done():
 			claimTimer.Stop()
+			// EndPermissionClaim clears pendingAnswer so the server's next
+			// ownership check sees no claim. Drain the channel afterwards to
+			// catch any answer the server sent in the window between reading
+			// pendingAnswer (under its lock) and our clear landing.
+			// Residual window: a send completing after the drain (between
+			// EndPermissionClaim's unlock and select{default}) is silently
+			// lost — no sleep added per policy.
 			controlServer.EndPermissionClaim(requestID)
+			select {
+			case ans := <-answerCh:
+				resp := runtime.PermissionResponse{Outcome: "selected", OptionID: ans.OptionID}
+				if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
+					return permissionResult{err: err}
+				}
+				return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
+			default:
+			}
 			return permissionResult{err: ctx.Err()}
 		case <-claimTimer.C:
 			// Client disconnected or went silent after HasClients() gate.
-			// Release the claim and fall through to the file-handler.
+			// EndPermissionClaim first: clears pendingAnswer so the server's
+			// ownership check sees no active claim and won't accept new sends.
+			// Then drain to catch any answer already queued in the buffered
+			// channel before or during our clear.
+			// Residual window: a send completing after the drain (between
+			// EndPermissionClaim's unlock and select{default}) is silently
+			// lost — the server already replied "accepted: true" to the client
+			// in that case. No sleep added per policy.
 			controlServer.EndPermissionClaim(requestID)
+			select {
+			case ans := <-answerCh:
+				resp := runtime.PermissionResponse{Outcome: "selected", OptionID: ans.OptionID}
+				if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
+					return permissionResult{err: err}
+				}
+				return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
+			default:
+				// Nothing in the channel; fall through to the file-handler.
+			}
 		}
 	}
 
+fileHandlerFallback:
 	if fileHandler != nil {
 		res, err := fileHandler.Handle(ctx, provider, event, emit)
 		if err != nil {

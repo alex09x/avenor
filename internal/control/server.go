@@ -259,12 +259,19 @@ func (s *ControlServer) PublishEvent(event events.Event) {
 	}
 }
 
-func (s *ControlServer) BeginPermissionClaim(requestID string) <-chan PermissionAnswer {
+// BeginPermissionClaim registers a new permission claim for requestID and
+// returns the answer channel plus true. If a claim is already in flight it
+// returns nil, false — the caller must not overwrite an active claim.
+func (s *ControlServer) BeginPermissionClaim(requestID string) (<-chan PermissionAnswer, bool) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
+	if s.pendingRequest != "" {
+		// Another claim is still registered; refuse to clobber it.
+		return nil, false
+	}
 	s.pendingRequest = requestID
 	s.pendingAnswer = make(chan PermissionAnswer, 1)
-	return s.pendingAnswer
+	return s.pendingAnswer, true
 }
 
 func (s *ControlServer) EndPermissionClaim(requestID string) {
