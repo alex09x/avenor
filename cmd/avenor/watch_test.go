@@ -14,10 +14,10 @@ import (
 
 func TestReadCursor(t *testing.T) {
 	tests := []struct {
-		name        string
-		setup       func(t *testing.T, dir string) string // returns path
-		wantOffset  int64
-		wantErrSub  string // non-empty: error must contain this substring
+		name       string
+		setup      func(t *testing.T, dir string) string // returns path
+		wantOffset int64
+		wantErrSub string // non-empty: error must contain this substring
 	}{
 		{
 			name: "file missing returns zero",
@@ -149,11 +149,11 @@ type fakeFileInfo struct {
 	size int64
 }
 
-func (f fakeFileInfo) Name() string      { return f.name }
-func (f fakeFileInfo) Size() int64       { return f.size }
-func (f fakeFileInfo) Mode() os.FileMode { return 0o644 }
-func (f fakeFileInfo) IsDir() bool       { return false }
-func (f fakeFileInfo) Sys() any          { return nil }
+func (f fakeFileInfo) Name() string       { return f.name }
+func (f fakeFileInfo) Size() int64        { return f.size }
+func (f fakeFileInfo) Mode() os.FileMode  { return 0o644 }
+func (f fakeFileInfo) IsDir() bool        { return false }
+func (f fakeFileInfo) Sys() any           { return nil }
 func (f fakeFileInfo) ModTime() time.Time { return time.Time{} }
 
 // validateCursorAgainstLogTests covers the three meaningful cases.

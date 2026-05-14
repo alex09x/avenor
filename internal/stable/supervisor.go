@@ -73,28 +73,28 @@ type childRuntime struct {
 }
 
 type Supervisor struct {
-	config     Config
-	runID      string
-	control    *control.ControlServer
-	state      *control.ControlState
-	controlMu  sync.Mutex
-	runtimes   map[string]*childRuntime
-	nextID     int
-	shutdownCh chan struct{}
+	config          Config
+	runID           string
+	control         *control.ControlServer
+	state           *control.ControlState
+	controlMu       sync.Mutex
+	runtimes        map[string]*childRuntime
+	nextID          int
+	shutdownCh      chan struct{}
 	runtimeActivity chan struct{}
-	httpServer *control.HTTPDebugServer
+	httpServer      *control.HTTPDebugServer
 }
 
 func NewSupervisor(cfg Config) *Supervisor {
 	runID := cli.GenerateRunID()
 	state := control.NewState(runID, "", 0)
 	sup := &Supervisor{
-		config:     cfg,
-		runID:      runID,
-		state:      state,
-		control:    control.NewServer(state),
-		runtimes:   map[string]*childRuntime{},
-		shutdownCh: make(chan struct{}),
+		config:          cfg,
+		runID:           runID,
+		state:           state,
+		control:         control.NewServer(state),
+		runtimes:        map[string]*childRuntime{},
+		shutdownCh:      make(chan struct{}),
 		runtimeActivity: make(chan struct{}),
 	}
 	sup.control.SetStableHandler(sup)
