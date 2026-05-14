@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1018,6 +1019,8 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 // client is connected at the HasClients() gate but never sends answer_permission,
 // resolvePermission times out and falls through to the file-handler rather than
 // blocking until SIGINT.
+//
+// NOTE: mutates package-level permissionClaimTimeout — do not run with t.Parallel().
 func TestControlPermissionClaimTimeoutFallsThrough(t *testing.T) {
 	// Shorten the claim window so the test completes quickly.
 	old := permissionClaimTimeout
@@ -1076,7 +1079,11 @@ func TestControlPermissionClaimTimeoutFallsThrough(t *testing.T) {
 	res := resolvePermission(context.Background(), provider, nil, cs, event, "ses_timeout", "req_timeout", false, emit)
 	elapsed := time.Since(start)
 
-	// Should have returned in roughly the claim timeout, not blocked indefinitely.
+	// Lower bound: must have waited at least the claim timeout (80ms gives 20ms slack).
+	if elapsed < 80*time.Millisecond {
+		t.Fatalf("resolvePermission returned too quickly (%v); expected to wait ~%v for the claim timer", elapsed, permissionClaimTimeout)
+	}
+	// Upper bound: should not have blocked indefinitely.
 	if elapsed > 5*time.Second {
 		t.Fatalf("resolvePermission blocked for %v, want ~%v", elapsed, permissionClaimTimeout)
 	}
@@ -1091,11 +1098,17 @@ func TestControlPermissionClaimTimeoutFallsThrough(t *testing.T) {
 	if cs.HasPendingPermission() {
 		t.Fatal("permission claim still registered after timeout")
 	}
+	// Control path timed out without answering — AnswerPermission must NOT have been called.
+	if provider.answerRequestID != "" {
+		t.Fatalf("provider.AnswerPermission was called with requestID=%q, want no call (control path should not answer on timeout)", provider.answerRequestID)
+	}
 }
 
 // TestControlPermissionClaimTimeoutFallsToFileHandler verifies that when the
 // claim times out and a file-handler is configured, resolvePermission routes to
 // the file-handler rather than returning source "none".
+//
+// NOTE: mutates package-level permissionClaimTimeout — do not run with t.Parallel().
 func TestControlPermissionClaimTimeoutFallsToFileHandler(t *testing.T) {
 	old := permissionClaimTimeout
 	permissionClaimTimeout = 100 * time.Millisecond
@@ -1137,12 +1150,25 @@ func TestControlPermissionClaimTimeoutFallsToFileHandler(t *testing.T) {
 	fh.Timeout = 5 * time.Second
 	fh.PollInterval = 20 * time.Millisecond
 
-	// The file handler deletes any pre-existing response file before polling.
-	// Write the response asynchronously after a short delay so the handler
-	// finds it on its first or second poll tick.
+	// The file handler writes <base>.req then removes any pre-existing
+	// <base>.req.response before polling for a new one. Write the response
+	// only after the .req file appears — this eliminates the race where
+	// os.Remove in the file handler deletes a response written too early
+	// (which would cause the handler to wait the full fh.Timeout).
+	reqPath := base + ".req"
 	respPath := base + ".req.response"
 	go func() {
-		time.Sleep(200 * time.Millisecond) // after claim timeout, during handler poll
+		// Poll for the request file with a generous deadline.
+		pollDeadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, statErr := os.Stat(reqPath); statErr == nil {
+				break
+			}
+			if time.Now().After(pollDeadline) {
+				return // test will fail via fh.Timeout; no need to panic here
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 		_ = os.WriteFile(respPath, []byte(`{"outcome":"selected","option_id":"allow_fh"}`+"\n"), 0o600)
 	}()
 
@@ -1171,5 +1197,123 @@ func TestControlPermissionClaimTimeoutFallsToFileHandler(t *testing.T) {
 	}
 	if res.optionID != "allow_fh" {
 		t.Fatalf("optionID = %q, want \"allow_fh\"", res.optionID)
+	}
+	// File handler called provider.AnswerPermission — verify the fields.
+	if provider.answerRequestID != "req_fh" {
+		t.Fatalf("provider.answerRequestID = %q, want \"req_fh\"", provider.answerRequestID)
+	}
+	if provider.answerResponse.OptionID != "allow_fh" {
+		t.Fatalf("provider.answerResponse.OptionID = %q, want \"allow_fh\"", provider.answerResponse.OptionID)
+	}
+}
+
+// TestControlPermissionClaimContextCancelReleasesClaim verifies that when the
+// context is cancelled while resolvePermission is waiting on the control-plane
+// claim channel, the claim is cleaned up (HasPendingPermission returns false)
+// and the result carries the context error.
+//
+// NOTE: mutates package-level permissionClaimTimeout — do not run with t.Parallel().
+func TestControlPermissionClaimContextCancelReleasesClaim(t *testing.T) {
+	// Use a long claim timeout so we know the ctx.Done() branch fires, not the timer.
+	old := permissionClaimTimeout
+	permissionClaimTimeout = 30 * time.Second
+	t.Cleanup(func() { permissionClaimTimeout = old })
+
+	// Use /tmp to keep socket path under the 104-byte macOS limit.
+	sockDir, err := os.MkdirTemp("", "av-pcx-*")
+	if err != nil {
+		t.Fatalf("mkdirtemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+
+	state := control.NewState("run_cancel", "label", 0)
+	cs := control.NewServer(state)
+	socketPath := filepath.Join(sockDir, "x.sock")
+	if err := cs.Start(socketPath); err != nil {
+		t.Fatalf("start control server: %v", err)
+	}
+	defer cs.Stop()
+
+	// Silent client — never sends answer_permission, just keeps HasClients() true.
+	silentConn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("dial silent client: %v", err)
+	}
+	defer silentConn.Close()
+
+	// Wait until the server registers the client.
+	deadline := time.Now().Add(2 * time.Second)
+	for !cs.HasClients() {
+		if time.Now().After(deadline) {
+			t.Fatal("HasClients() never became true")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	event := events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_cancel",
+		Fields: map[string]any{
+			"request_id": "req_cancel",
+			"options": []any{
+				map[string]any{"optionId": "deny", "kind": "reject"},
+				map[string]any{"optionId": "allow_c", "kind": "allow"},
+			},
+		},
+	}
+
+	provider := &cliFakeProvider{}
+	emit := func(events.Event) error { return nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Channel closed once resolvePermission has registered the claim.
+	claimRegistered := make(chan struct{})
+	go func() {
+		// Poll until HasPendingPermission becomes true, then signal.
+		for {
+			if cs.HasPendingPermission() {
+				close(claimRegistered)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	resultCh := make(chan permissionResult, 1)
+	go func() {
+		resultCh <- resolvePermission(ctx, provider, nil, cs, event, "ses_cancel", "req_cancel", false, emit)
+	}()
+
+	// Wait for the claim to be registered before cancelling.
+	select {
+	case <-claimRegistered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("claim was never registered within 2 seconds")
+	}
+
+	cancel()
+
+	var res permissionResult
+	select {
+	case res = <-resultCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("resolvePermission did not return within 5 seconds after context cancel")
+	}
+
+	// The result must carry the context error.
+	if res.err == nil {
+		t.Fatal("expected non-nil error from context cancellation, got nil")
+	}
+	if !errors.Is(res.err, context.Canceled) {
+		t.Fatalf("res.err = %v, want context.Canceled", res.err)
+	}
+	// The claim must have been released.
+	if cs.HasPendingPermission() {
+		t.Fatal("HasPendingPermission() = true after context cancel; claim was not cleaned up")
+	}
+	// AnswerPermission must NOT have been called (ctx was cancelled before any answer).
+	if provider.answerRequestID != "" {
+		t.Fatalf("provider.AnswerPermission called with requestID=%q, want no call", provider.answerRequestID)
 	}
 }
