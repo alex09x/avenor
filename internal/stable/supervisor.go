@@ -19,11 +19,12 @@ import (
 )
 
 type Config struct {
-	ControlSocket   string
-	HTTPDebug       string
-	MaxRuntimes     int
-	IdleTimeout     time.Duration
-	ShutdownTimeout time.Duration
+	ControlSocket          string
+	HTTPDebug              string
+	MaxRuntimes            int
+	IdleTimeout            time.Duration
+	ShutdownTimeout        time.Duration
+	PermissionClaimTimeout time.Duration
 }
 
 type SpawnParams struct {
@@ -50,26 +51,27 @@ type SpawnResult struct {
 }
 
 type childRuntime struct {
-	id           string
-	label        string
-	provider     runtime.Provider
-	session      runtime.Session
-	eventWriter  cli.EventSink
-	fileHandler  *permission.FileHandler
-	autoApprove  bool
-	runID        string
-	dir          string
-	onEvent      string
-	sentinelFile string
-	cancelFn     func()
-	interruptFn  func()
-	done         chan struct{}
-	exitCode     int
-	completed    bool
-	active       bool
-	promptCh     chan struct{}
-	promptQueue  []string
-	mu           sync.Mutex
+	id               string
+	label            string
+	provider         runtime.Provider
+	session          runtime.Session
+	eventWriter      cli.EventSink
+	fileHandler      *permission.FileHandler
+	autoApprove      bool
+	permClaimTimeout time.Duration
+	runID            string
+	dir              string
+	onEvent          string
+	sentinelFile     string
+	cancelFn         func()
+	interruptFn      func()
+	done             chan struct{}
+	exitCode         int
+	completed        bool
+	active           bool
+	promptCh         chan struct{}
+	promptQueue      []string
+	mu               sync.Mutex
 }
 
 type Supervisor struct {
@@ -115,6 +117,7 @@ func (s *Supervisor) Run() int {
 			fmt.Fprintf(os.Stderr, "avenor stable: start http debug: %v\n", err)
 			return 1
 		}
+		s.httpServer.SetStableAdapter(s)
 		if err := s.httpServer.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "avenor stable: start http debug: %v\n", err)
 			return 1
@@ -277,6 +280,10 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 	child.eventWriter = writer
 	child.fileHandler = fileHandler
 	child.autoApprove = params.AutoApprove
+	child.permClaimTimeout = s.config.PermissionClaimTimeout
+	if child.permClaimTimeout == 0 {
+		child.permClaimTimeout = cli.DefaultPermissionClaimTimeout
+	}
 	child.runID = s.runID
 	child.dir = params.Dir
 	child.onEvent = onEvent
@@ -495,7 +502,7 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 		runtimeID: child.id,
 		control:   s.control,
 	}
-	exitCode := cli.WaitForSession(turnCtx, child.provider, taggedWriter, child.fileHandler, nil, eventCh, promptDone, nil, session.SessionID, s.runID, child.label, child.autoApprove, timer, os.Stderr)
+	exitCode := cli.WaitForSession(turnCtx, child.provider, taggedWriter, child.fileHandler, nil, eventCh, promptDone, nil, session.SessionID, s.runID, child.label, child.autoApprove, child.permClaimTimeout, timer, os.Stderr)
 	return childAttemptResult{exitCode: exitCode, sessionID: session.SessionID}
 }
 
@@ -769,4 +776,22 @@ func backoffDelay(attempt int) time.Duration {
 		seconds = 30
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+// StableAdapter implementation — used by HTTPDebugServer for per-runtime HTTP endpoints.
+
+// HTTPRuntimeStatus implements control.StableAdapter.  Returns the runtime
+// snapshot and true when runtimeID is known; nil, false when not found.
+func (s *Supervisor) HTTPRuntimeStatus(runtimeID string) (any, bool) {
+	snap, err := s.RuntimeStatus(runtimeID)
+	if err != nil {
+		return nil, false
+	}
+	return snap, true
+}
+
+// HTTPCancelRuntime implements control.StableAdapter.  Delegates to the
+// existing cancelRuntime helper; returns a non-nil error when the ID is unknown.
+func (s *Supervisor) HTTPCancelRuntime(runtimeID string) error {
+	return s.cancelRuntime(runtimeID)
 }
