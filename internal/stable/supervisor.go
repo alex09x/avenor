@@ -625,7 +625,7 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 	if rt == nil {
 		return fmt.Errorf("runtime %q not found", rtID)
 	}
-	return rt.provider.AnswerPermission(context.Background(), rt.session.SessionID, requestID, runtime.PermissionResponse{
+	return rt.provider.AnswerPermission(context.Background(), rt.sessionID(), requestID, runtime.PermissionResponse{
 		Outcome:  "selected",
 		OptionID: optionID,
 	})
