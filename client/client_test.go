@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bufio"
 	"encoding/json"
 	"net"
 	"os"
@@ -202,6 +203,71 @@ func TestClientSubscribe(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for event")
 	}
+}
+
+// TestLaggedOrdering verifies that client.lagged arrives *before* the
+// post-drop event — matching the server's subscriber.loop() guarantee.
+func TestLaggedOrdering(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+
+	// Small channel so we can provoke back-pressure without sending 256 events.
+	c := &Client{
+		conn:    clientConn,
+		scan:    bufio.NewScanner(clientConn),
+		pending: map[int]chan Response{},
+		eventCh: make(chan Event, 2),
+	}
+
+	sendEvent := func(name string) {
+		n := Notification{JSONRPC: "2.0", Method: "event"}
+		n.Params, _ = json.Marshal(map[string]any{"event": name})
+		data, _ := json.Marshal(n)
+		data = append(data, '\n')
+		serverConn.Write(data)
+	}
+
+	ch := c.Events() // starts readLoop
+
+	// Fill the channel buffer without consuming, then send more to force drops.
+	sendEvent("first")
+	sendEvent("second")
+	// Give readLoop time to place both events before we send a third.
+	time.Sleep(20 * time.Millisecond)
+	// third and fourth arrive while the buffer is full — both dropped.
+	sendEvent("third")
+	sendEvent("fourth")
+	// fifth arrives while buffer is still full — also dropped.
+	sendEvent("fifth")
+	// sixth arrives while buffer is still full — also dropped.
+	sendEvent("sixth")
+	// Drain to unblock and send the recovery event.
+	<-ch // "first"
+	<-ch // "second"
+	// Give readLoop time to retry the lagged notification and enqueue "seventh".
+	time.Sleep(20 * time.Millisecond)
+	sendEvent("seventh")
+	time.Sleep(20 * time.Millisecond)
+
+	var got []string
+	deadline := time.After(2 * time.Second)
+	for len(got) < 2 {
+		select {
+		case ev := <-ch:
+			got = append(got, ev.Event)
+		case <-deadline:
+			t.Fatalf("timeout; collected so far: %v", got)
+		}
+	}
+
+	if got[0] != "client.lagged" {
+		t.Errorf("got[0] = %q, want client.lagged (lag notification must precede recovery events)", got[0])
+	}
+	if got[1] == "client.lagged" {
+		t.Errorf("got[1] = client.lagged again; expected a real event after the lag notification")
+	}
+
+	serverConn.Close()
 }
 
 func TestClientStatusWithRuntimeID(t *testing.T) {

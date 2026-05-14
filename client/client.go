@@ -210,20 +210,24 @@ func (c *Client) readLoop() {
 		if err := json.Unmarshal(n.Params, &ev); err != nil {
 			continue
 		}
-		// Non-blocking send: if the consumer falls behind, drop the event and
-		// surface a synthetic client.lagged event so the response dispatch path
-		// never wedges (mirrors the server's subscriber.lagged backpressure).
+		// Non-blocking send: mirrors the server's subscriber.loop() ordering —
+		// emit client.lagged *before* the next real event so consumers see the
+		// lag notification before post-drop events (not after).
+		// If the lagged notification itself can't be sent, leave dropped
+		// accumulating; we do not drop the real event because of it.
+		if c.dropped > 0 {
+			lag := c.dropped
+			c.dropped = 0
+			select {
+			case c.eventCh <- Event{Event: "client.lagged", Raw: map[string]any{"event": "client.lagged", "dropped_count": lag}}:
+			default:
+				// Channel still full; roll the count back so it accumulates
+				// and we retry on the next successful delivery.
+				c.dropped += lag
+			}
+		}
 		select {
 		case c.eventCh <- ev:
-			if c.dropped > 0 {
-				lag := c.dropped
-				c.dropped = 0
-				select {
-				case c.eventCh <- Event{Event: "client.lagged", Raw: map[string]any{"event": "client.lagged", "dropped_count": lag}}:
-				default:
-					c.dropped += lag
-				}
-			}
 		default:
 			c.dropped++
 		}
