@@ -299,7 +299,7 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 		}
 
 		releaseReservation = nil
-		go s.runLoopChild(childCtx, child, cfg, params.Timeout, params.MaxRetries, params.Agent, params.Model, params.ServerURL)
+		go s.runLoopChild(childCtx, child, cfg, params.MaxRetries, params.Agent, params.Model, params.ServerURL)
 
 		return result, nil
 	}
@@ -457,7 +457,7 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 	}
 }
 
-func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg *looprunner.LoopConfig, timeoutSecs, maxRetries int, agent, model, serverURL string) {
+func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg *looprunner.LoopConfig, maxRetries int, agent, model, serverURL string) {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Fprintf(os.Stderr, "avenor stable: child %s panic: %v\n", child.id, r)

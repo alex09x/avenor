@@ -264,7 +264,7 @@ func TestRunLoopChildCleansUpOnLooprunnerError(t *testing.T) {
 		MaxIterations: 1,
 		Pre:           []looprunner.Phase{{Name: "broken", Prompt: "{{"}},
 	}
-	sup.runLoopChild(context.Background(), child, cfg, 0, 0, "", "", "")
+	sup.runLoopChild(context.Background(), child, cfg, 0, "", "", "")
 
 	select {
 	case <-child.done:
