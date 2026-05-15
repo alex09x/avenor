@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/sdougbrown/avenor/internal/looprunner"
 	"github.com/sdougbrown/avenor/internal/runtime"
 )
 
@@ -225,10 +226,68 @@ func TestShutdownTimeoutDoesNotHangWithMultipleStuckRuntimes(t *testing.T) {
 	}
 }
 
+func TestRunLoopChildCleansUpOnLooprunnerError(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-loop-cleanup.sock",
+		MaxRuntimes:   1,
+	})
+	sink := &closeRecordingSink{}
+	cancelled := false
+	child := &childRuntime{
+		id:          "rt_loop",
+		done:        make(chan struct{}),
+		promptCh:    make(chan struct{}, 1),
+		eventWriter: sink,
+		cancelFn:    func() { cancelled = true },
+	}
+	sup.runtimes[child.id] = child
+
+	cfg := &looprunner.LoopConfig{
+		MaxIterations: 1,
+		Pre:           []looprunner.Phase{{Name: "broken", Prompt: "{{"}},
+	}
+	sup.runLoopChild(context.Background(), child, cfg, 0, 0, "", "", "")
+
+	select {
+	case <-child.done:
+	default:
+		t.Fatal("loop child done channel was not closed")
+	}
+	if !sink.closed {
+		t.Fatal("loop child event writer was not closed")
+	}
+	if !cancelled {
+		t.Fatal("loop child cancel function was not called")
+	}
+	child.mu.Lock()
+	completed := child.completed
+	exitCode := child.exitCode
+	child.mu.Unlock()
+	if !completed {
+		t.Fatal("loop child was not marked completed")
+	}
+	if exitCode != 1 {
+		t.Fatalf("loop child exitCode = %d, want 1", exitCode)
+	}
+	if _, ok := sup.runtimes[child.id]; ok {
+		t.Fatal("loop child was not removed from supervisor runtimes")
+	}
+}
+
 type stableTestSink struct{}
 
 func (stableTestSink) Write(events.Event) error { return nil }
 func (stableTestSink) Close() error             { return nil }
+
+type closeRecordingSink struct {
+	closed bool
+}
+
+func (s *closeRecordingSink) Write(events.Event) error { return nil }
+func (s *closeRecordingSink) Close() error {
+	s.closed = true
+	return nil
+}
 
 type stableFakeProvider struct {
 	events     chan events.Event

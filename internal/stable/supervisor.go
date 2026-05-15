@@ -457,8 +457,19 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 }
 
 func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg *looprunner.LoopConfig, timeoutSecs, maxRetries int, agent, model, serverURL string) {
-	defer child.cancelFn()
 	defer func() {
+		if child.cancelFn != nil {
+			child.cancelFn()
+		}
+	}()
+	defer func() {
+		if child.eventWriter != nil {
+			_ = child.eventWriter.Close()
+		}
+		child.mu.Lock()
+		child.completed = true
+		child.mu.Unlock()
+		close(child.done)
 		s.controlMu.Lock()
 		delete(s.runtimes, child.id)
 		s.controlMu.Unlock()
@@ -529,11 +540,18 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 
 	result, err := looprunner.Run(ctx, opts)
 	if err != nil {
+		child.mu.Lock()
+		child.exitCode = 1
+		child.mu.Unlock()
 		if child.sentinelFile != "" {
-			cli.WriteSentinel(child.sentinelFile, 1, "", "end_turn", s.runID, os.Stderr)
+			cli.WriteSentinel(child.sentinelFile, 1, "", "error", s.runID, os.Stderr)
 		}
 		return
 	}
+
+	child.mu.Lock()
+	child.exitCode = result.ExitCode
+	child.mu.Unlock()
 
 	if child.sentinelFile != "" {
 		if result.Reason != "" {

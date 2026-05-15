@@ -228,7 +228,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		cfg, err := looprunner.LoadLoopConfig(*loopFile)
 		if err != nil {
 			fmt.Fprintf(stderr, "avenor: load loop config: %v\n", err)
-			os.Exit(2)
+			return exitWithSentinel(2)
 		}
 
 		if len(promptText) > 0 {
@@ -271,17 +271,21 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			},
 		}
 
-		lrCtx, lrCancel := context.WithCancel(context.Background())
+		lrCtx, lrCancel := context.WithCancel(ctx)
 		defer lrCancel()
 
 		result, err := looprunner.Run(lrCtx, opts)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "avenor: loop run: %v\n", err)
+			fmt.Fprintf(stderr, "avenor: loop run: %v\n", err)
+			if *sentinelFile != "" {
+				WriteSentinel(*sentinelFile, 1, result.SessionID, "error", runID, stderr)
+			}
+			return 1
 		}
 
-		writeSentinelForResult(result, *sentinelFile, runID, os.Stderr)
+		writeSentinelForResult(result, *sentinelFile, runID, stderr)
 
-		os.Exit(result.ExitCode)
+		return result.ExitCode
 	}
 
 	resumeID := *resume

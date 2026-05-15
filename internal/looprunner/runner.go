@@ -94,8 +94,8 @@ func Run(ctx context.Context, opts RunOptions) (RunResult, error) {
 
 		for phaseIdx, phase := range opts.Config.Loop {
 			prevSessionID := ""
-			if phase.ResumeFromPrevious && iteration > 1 && phaseIdx > 0 {
-				prevSessionID = lastSessionIDs[phaseIdx-1]
+			if phase.ResumeFromPrevious && phaseIdx > 0 {
+				prevSessionID = prevSessionIDs[phaseIdx-1]
 			}
 
 			result, err := executePhase(ctx, opts, phase, iteration, prevSessionID, prevPhaseCommit)

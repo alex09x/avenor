@@ -301,6 +301,38 @@ func TestRunCleansSentinelFilesBetweenRetries(t *testing.T) {
 	}
 }
 
+func TestRunLoopFileReturnsFailureOnLooprunnerError(t *testing.T) {
+	dir := t.TempDir()
+	loopPath := filepath.Join(dir, "loop.json")
+	eventsPath := filepath.Join(dir, "events.ndjson")
+	sentinelPath := filepath.Join(dir, "run.done")
+	if err := os.WriteFile(loopPath, []byte(`{"pre":[{"name":"broken","prompt":"{{"}]}`), 0o600); err != nil {
+		t.Fatalf("write loop config: %v", err)
+	}
+
+	var stderr strings.Builder
+	exitCode := run([]string{
+		"--loop-file", loopPath,
+		"--on-event", eventsPath,
+		"--sentinel-file", sentinelPath,
+		"--run-id", "run_1",
+	}, func(string) string { return "" }, &stderr)
+	if exitCode != 1 {
+		t.Fatalf("run() = %d, want 1; stderr=%s", exitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "avenor: loop run:") {
+		t.Fatalf("stderr = %q, want loop run error", stderr.String())
+	}
+	sentinel, err := os.ReadFile(sentinelPath)
+	if err != nil {
+		t.Fatalf("read sentinel: %v", err)
+	}
+	want := "FAILED\nSESSION=\nSTOP_REASON=error\nEXIT_CODE=1\nRUN=run_1\n"
+	if string(sentinel) != want {
+		t.Fatalf("sentinel = %q, want %q", string(sentinel), want)
+	}
+}
+
 func TestWriteRetryEventReturnsWriterError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.ndjson")
 	writer, err := NewEventWriter(path)
