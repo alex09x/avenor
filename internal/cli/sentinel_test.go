@@ -71,6 +71,7 @@ func TestSentinelContent(t *testing.T) {
 		sessionID  string
 		stopReason string
 		runID      string
+		reason     string
 		want       string
 	}{
 		{
@@ -183,14 +184,54 @@ func TestSentinelContent(t *testing.T) {
 			stopReason: "end_turn",
 			want:       "DONE\nSESSION=\nSTOP_REASON=end_turn\n",
 		},
+		{
+			name:       "exit 5 blocked without reason",
+			exitCode:   5,
+			sessionID:  "ses_b",
+			stopReason: "blocked",
+			want:       "BLOCKED\nSESSION=ses_b\nSTOP_REASON=blocked\n",
+		},
+		{
+			name:       "exit 5 blocked with reason",
+			exitCode:   5,
+			sessionID:  "ses_b",
+			stopReason: "blocked",
+			reason:     "architectural issue: layering violation in pkg/db",
+			want:       "BLOCKED\nSESSION=ses_b\nSTOP_REASON=blocked\nREASON=architectural issue: layering violation in pkg/db\n",
+		},
+		{
+			name:       "exit 5 blocked with reason and run id",
+			exitCode:   5,
+			sessionID:  "ses_b",
+			stopReason: "blocked",
+			runID:      "deadbeefcafe0004",
+			reason:     "loop limit exceeded",
+			want:       "BLOCKED\nSESSION=ses_b\nSTOP_REASON=blocked\nREASON=loop limit exceeded\nRUN=deadbeefcafe0004\n",
+		},
+		{
+			name:       "exit 5 blocked with run id but no reason",
+			exitCode:   5,
+			sessionID:  "ses_b",
+			stopReason: "blocked",
+			runID:      "deadbeefcafe0005",
+			want:       "BLOCKED\nSESSION=ses_b\nSTOP_REASON=blocked\nRUN=deadbeefcafe0005\n",
+		},
+		{
+			name:       "exit 5 reason newlines are sanitized",
+			exitCode:   5,
+			sessionID:  "ses_b",
+			stopReason: "blocked",
+			reason:     "bad\nREASON=injected\rstuff",
+			want:       "BLOCKED\nSESSION=ses_b\nSTOP_REASON=blocked\nREASON=bad REASON=injected stuff\n",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := sentinelContent(tt.exitCode, tt.sessionID, tt.stopReason, tt.runID)
+			got := sentinelContent(tt.exitCode, tt.sessionID, tt.stopReason, tt.runID, tt.reason)
 			if got != tt.want {
-				t.Errorf("sentinelContent(%d, %q, %q, %q):\n got: %q\nwant: %q",
-					tt.exitCode, tt.sessionID, tt.stopReason, tt.runID, got, tt.want)
+				t.Errorf("sentinelContent(%d, %q, %q, %q, %q):\n got: %q\nwant: %q",
+					tt.exitCode, tt.sessionID, tt.stopReason, tt.runID, tt.reason, got, tt.want)
 			}
 		})
 	}
@@ -347,6 +388,97 @@ func TestWriteSentinel(t *testing.T) {
 		}
 		if _, err := os.Stat(sentPath); !os.IsNotExist(err) {
 			t.Error("expected no sentinel file to exist after failed write")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// WriteSentinelWithReason
+// ---------------------------------------------------------------------------
+
+func TestWriteSentinelWithReason(t *testing.T) {
+	t.Run("exit 5 blocked without reason writes BLOCKED sentinel", func(t *testing.T) {
+		dir := t.TempDir()
+		sentPath := filepath.Join(dir, "run.done")
+
+		var stderr strings.Builder
+		WriteSentinelWithReason(sentPath, 5, "ses_b", "blocked", "", "", &stderr)
+
+		if stderr.Len() > 0 {
+			t.Errorf("unexpected stderr: %s", stderr.String())
+		}
+
+		content, err := os.ReadFile(sentPath)
+		if err != nil {
+			t.Fatalf("read sentinel: %v", err)
+		}
+		const want = "BLOCKED\nSESSION=ses_b\nSTOP_REASON=blocked\n"
+		if got := string(content); got != want {
+			t.Errorf("sentinel content:\n got: %q\nwant: %q", got, want)
+		}
+	})
+
+	t.Run("exit 5 blocked with reason includes REASON line", func(t *testing.T) {
+		dir := t.TempDir()
+		sentPath := filepath.Join(dir, "run.done")
+
+		var stderr strings.Builder
+		reason := "architectural issue: layering violation in pkg/db"
+		WriteSentinelWithReason(sentPath, 5, "ses_b", "blocked", "", reason, &stderr)
+
+		if stderr.Len() > 0 {
+			t.Errorf("unexpected stderr: %s", stderr.String())
+		}
+
+		content, err := os.ReadFile(sentPath)
+		if err != nil {
+			t.Fatalf("read sentinel: %v", err)
+		}
+		want := "BLOCKED\nSESSION=ses_b\nSTOP_REASON=blocked\nREASON=architectural issue: layering violation in pkg/db\n"
+		if got := string(content); got != want {
+			t.Errorf("sentinel content:\n got: %q\nwant: %q", got, want)
+		}
+	})
+
+	t.Run("exit 5 blocked with reason and run id", func(t *testing.T) {
+		dir := t.TempDir()
+		sentPath := filepath.Join(dir, "run.done")
+
+		var stderr strings.Builder
+		WriteSentinelWithReason(sentPath, 5, "ses_b", "blocked", "deadbeefcafe0004", "loop limit exceeded", &stderr)
+
+		if stderr.Len() > 0 {
+			t.Errorf("unexpected stderr: %s", stderr.String())
+		}
+
+		content, err := os.ReadFile(sentPath)
+		if err != nil {
+			t.Fatalf("read sentinel: %v", err)
+		}
+		want := "BLOCKED\nSESSION=ses_b\nSTOP_REASON=blocked\nREASON=loop limit exceeded\nRUN=deadbeefcafe0004\n"
+		if got := string(content); got != want {
+			t.Errorf("sentinel content:\n got: %q\nwant: %q", got, want)
+		}
+	})
+
+	t.Run("WriteSentinel still writes BLOCKED for exit 5 backward compat", func(t *testing.T) {
+		dir := t.TempDir()
+		sentPath := filepath.Join(dir, "run.done")
+
+		var stderr strings.Builder
+		WriteSentinel(sentPath, 5, "ses_b", "blocked", "", &stderr)
+
+		if stderr.Len() > 0 {
+			t.Errorf("unexpected stderr: %s", stderr.String())
+		}
+
+		content, err := os.ReadFile(sentPath)
+		if err != nil {
+			t.Fatalf("read sentinel: %v", err)
+		}
+		const want = "BLOCKED\nSESSION=ses_b\nSTOP_REASON=blocked\n"
+		if got := string(content); got != want {
+			t.Errorf("sentinel content:\n got: %q\nwant: %q", got, want)
 		}
 	})
 }
