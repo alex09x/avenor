@@ -13,6 +13,7 @@ import (
 	"github.com/sdougbrown/avenor/internal/cli"
 	"github.com/sdougbrown/avenor/internal/control"
 	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/sdougbrown/avenor/internal/looprunner"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/runtime"
 	"github.com/sdougbrown/avenor/internal/runtime/opencodeacp"
@@ -41,6 +42,7 @@ type SpawnParams struct {
 	AutoApprove       bool   `json:"auto_approve,omitempty"`
 	Timeout           int    `json:"timeout,omitempty"`
 	MaxRetries        int    `json:"max_retries,omitempty"`
+	LoopFile          string `json:"loop_file,omitempty"`
 }
 
 type SpawnResult struct {
@@ -195,7 +197,7 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 
 	// Clean up reserved slot on failure.
 	defer func() {
-		if child.provider == nil {
+		if child.provider == nil && params.LoopFile == "" {
 			s.controlMu.Lock()
 			delete(s.runtimes, rtID)
 			s.controlMu.Unlock()
@@ -214,8 +216,8 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 		}
 		promptText = string(data)
 	}
-	if promptText == "" {
-		return SpawnResult{}, fmt.Errorf("prompt or prompt_file is required")
+	if promptText == "" && params.LoopFile == "" {
+		return SpawnResult{}, fmt.Errorf("prompt, prompt_file, or loop_file is required")
 	}
 
 	// Per-runtime artifact directory.
@@ -251,6 +253,55 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 			return SpawnResult{}, fmt.Errorf("permission handler: %w", err)
 		}
 		fileHandler = fh
+	}
+
+	// Loop spawn path — uses looprunner instead of a single provider/session.
+	if params.LoopFile != "" {
+		cfg, err := looprunner.LoadLoopConfig(params.LoopFile)
+		if err != nil {
+			_ = writer.Close()
+			return SpawnResult{}, fmt.Errorf("spawn: load loop config: %w", err)
+		}
+		if promptText != "" {
+			cfg.InsertInitialPrompt(promptText)
+		}
+
+		// For loop spawns, skip the normal provider/session pre-start.
+		// SpawnResult.SessionID is empty — phase session IDs are in events.
+		result := SpawnResult{
+			RuntimeID:    rtID,
+			OnEvent:      onEvent,
+			SentinelFile: sentinelFile,
+		}
+
+		childCtx, childCancel := context.WithCancel(context.Background())
+		if params.Timeout > 0 {
+			childCtx, childCancel = context.WithTimeout(childCtx, time.Duration(params.Timeout)*time.Second)
+		}
+
+		child.label = params.Label
+		child.cancelFn = childCancel
+		child.autoApprove = params.AutoApprove
+		child.permClaimTimeout = s.config.PermissionClaimTimeout
+		if child.permClaimTimeout == 0 {
+			child.permClaimTimeout = cli.DefaultPermissionClaimTimeout
+		}
+		child.eventWriter = writer
+		child.fileHandler = fileHandler
+		child.runID = s.runID
+		child.dir = params.Dir
+		child.onEvent = onEvent
+		child.sentinelFile = sentinelFile
+		// provider and session remain zero-valued for loop children
+
+		select {
+		case s.runtimeActivity <- struct{}{}:
+		default:
+		}
+
+		go s.runLoopChild(childCtx, child, cfg, params.Timeout, params.MaxRetries, params.Agent, params.Model, params.ServerURL)
+
+		return result, nil
 	}
 
 	// Start provider and session.
@@ -401,6 +452,94 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 		case <-time.After(backoffDelay(attempt)):
 		case <-ctx.Done():
 			return
+		}
+	}
+}
+
+func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg *looprunner.LoopConfig, timeoutSecs, maxRetries int, agent, model, serverURL string) {
+	defer child.cancelFn()
+	defer func() {
+		s.controlMu.Lock()
+		delete(s.runtimes, child.id)
+		s.controlMu.Unlock()
+	}()
+
+	opts := looprunner.RunOptions{
+		WorkDir:    child.dir,
+		RunID:      s.runID,
+		EventSink:  child.eventWriter,
+		Config:     cfg,
+		MaxRetries: maxRetries,
+		PhaseAttempt: func(ctx context.Context, phase looprunner.Phase, attemptNum int, iteration int, prevSessionID string) (looprunner.PhaseAttemptResult, error) {
+			startOpts := runtime.StartOptions{
+				Agent:     agent,
+				Model:     model,
+				Dir:       child.dir,
+				ServerURL: serverURL,
+			}
+
+			var resumeID string
+			if prevSessionID != "" {
+				resumeID = prevSessionID
+			}
+
+			provider := opencodeacp.NewWithOptions(startOpts)
+			defer func() {
+				if closer, ok := provider.(interface{ Close() error }); ok {
+					_ = closer.Close()
+				}
+			}()
+
+			session, err := cli.StartSession(ctx, provider, startOpts, resumeID)
+			if err != nil {
+				return looprunner.PhaseAttemptResult{ExitCode: 1}, fmt.Errorf("start session: %w", err)
+			}
+
+			eventCtx, cancelEvents := context.WithCancel(ctx)
+			defer cancelEvents()
+
+			eventCh, err := provider.Events(eventCtx, session.SessionID)
+			if err != nil {
+				return looprunner.PhaseAttemptResult{ExitCode: 1}, fmt.Errorf("subscribe events: %w", err)
+			}
+
+			promptDone := make(chan error, 1)
+			go func() {
+				promptDone <- provider.Prompt(context.Background(), session.SessionID, phase.Prompt)
+			}()
+
+			result := cli.WaitForSession(
+				ctx, provider, child.eventWriter,
+				child.fileHandler, nil,
+				eventCh, promptDone, nil,
+				session.SessionID, s.runID, child.label,
+				child.autoApprove, child.permClaimTimeout,
+				nil,
+				os.Stderr,
+			)
+
+			return looprunner.PhaseAttemptResult{
+				ExitCode:      result.ExitCode,
+				SessionID:     session.SessionID,
+				LoopDirective: result.LoopDirective,
+				LoopLabel:     result.LoopLabel,
+			}, nil
+		},
+	}
+
+	result, err := looprunner.Run(ctx, opts)
+	if err != nil {
+		if child.sentinelFile != "" {
+			cli.WriteSentinel(child.sentinelFile, 1, "", "end_turn", s.runID, os.Stderr)
+		}
+		return
+	}
+
+	if child.sentinelFile != "" {
+		if result.Reason != "" {
+			cli.WriteSentinelWithReason(child.sentinelFile, result.ExitCode, result.SessionID, result.StopReason, s.runID, result.Reason, os.Stderr)
+		} else {
+			cli.WriteSentinel(child.sentinelFile, result.ExitCode, result.SessionID, result.StopReason, s.runID, os.Stderr)
 		}
 	}
 }
