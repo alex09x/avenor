@@ -36,6 +36,7 @@ type SpawnParams struct {
 	Label             string `json:"label,omitempty"`
 	Model             string `json:"model,omitempty"`
 	ServerURL         string `json:"server_url,omitempty"`
+	Backend           string `json:"backend,omitempty"`
 	OnEvent           string `json:"on_event,omitempty"`
 	SentinelFile      string `json:"sentinel_file,omitempty"`
 	PermissionHandler string `json:"permission_handler,omitempty"`
@@ -314,7 +315,11 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 	discovery := cli.DiscoverServer(params.ServerURL, os.Getenv)
 	startOpts.ServerURL = discovery.URL
 
-	provider, err := factory.NewProvider(startOpts, "opencode-acp")
+	backend := params.Backend
+	if backend == "" {
+		backend = "opencode-acp"
+	}
+	provider, err := factory.NewProvider(startOpts, backend)
 	if err != nil {
 		_ = writer.Close()
 		return SpawnResult{}, fmt.Errorf("create provider: %w", err)
