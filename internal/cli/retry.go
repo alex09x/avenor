@@ -15,8 +15,10 @@ import (
 
 // attemptResult holds the outcome of a single session attempt.
 type attemptResult struct {
-	exitCode  int
-	sessionID string
+	exitCode      int
+	sessionID     string
+	loopDirective string
+	loopLabel     string
 }
 
 // resumeSession resumes an existing session after cancellation so a follow-up
@@ -74,6 +76,9 @@ func runSingleAttempt(
 		}
 	}
 
+	var accDirective string
+	var accLabel string
+
 	for {
 		// Fresh event context per turn so interrupt_and_prompt cancels
 		// the subscription cleanly.
@@ -102,13 +107,18 @@ func runSingleAttempt(
 		exitCode := result.ExitCode
 		cancelEvents()
 
+		if loopDirectiveSeverity(result.LoopDirective) > loopDirectiveSeverity(accDirective) {
+			accDirective = result.LoopDirective
+			accLabel = result.LoopLabel
+		}
+
 		if controlServer != nil {
 			// Check interrupt first (priority over queued prompts) to avoid
 			// losing the interrupt when exitCode==0 overlaps with a queued prompt.
 			if interruptText := controlServer.ConsumeInterrupt(); interruptText != "" {
 				if _, err := resumeSession(ctx, provider, session.SessionID); err != nil {
 					fmt.Fprintf(stderr, "avenor: resume after cancel: %v\n", err)
-					return attemptResult{exitCode: 1, sessionID: session.SessionID}
+					return attemptResult{exitCode: 1, sessionID: session.SessionID, loopDirective: accDirective, loopLabel: accLabel}
 				}
 				prompt = interruptText
 				continue
@@ -117,7 +127,7 @@ func runSingleAttempt(
 				if nextPrompt := controlServer.DequeuePrompt(); nextPrompt != "" {
 					if _, err := resumeSession(ctx, provider, session.SessionID); err != nil {
 						fmt.Fprintf(stderr, "avenor: resume after end_turn: %v\n", err)
-						return attemptResult{exitCode: 1, sessionID: session.SessionID}
+						return attemptResult{exitCode: 1, sessionID: session.SessionID, loopDirective: accDirective, loopLabel: accLabel}
 					}
 					prompt = nextPrompt
 					continue
@@ -125,7 +135,7 @@ func runSingleAttempt(
 			}
 		}
 
-		return attemptResult{exitCode: exitCode, sessionID: session.SessionID}
+		return attemptResult{exitCode: exitCode, sessionID: session.SessionID, loopDirective: accDirective, loopLabel: accLabel}
 	}
 }
 
