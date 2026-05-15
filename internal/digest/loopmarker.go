@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-var loopMarkerRe = regexp.MustCompile(`(?i)\[loop:\s*(\w+)(?:\s*\|\s*([^\]]*))?\]`)
+var loopMarkerRe = regexp.MustCompile(`(?i)^\s*\[loop:\s*(\w+)(?:\s*\|\s*([^\]]*))?\]\s*$`)
 
 func loopDirectiveSeverity(directive string) int {
 	switch directive {
@@ -21,11 +21,23 @@ func loopDirectiveSeverity(directive string) int {
 }
 
 func ExtractLoopMarker(text string) (directive, label string, ok bool) {
-	matches := loopMarkerRe.FindAllStringSubmatch(text, -1)
 	var bestDir string
 	var bestLabel string
 	bestSev := 0
-	for _, m := range matches {
+	inFence := false
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue
+		}
+		m := loopMarkerRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
 		dir := strings.ToLower(m[1])
 		sev := loopDirectiveSeverity(dir)
 		if sev == 0 {

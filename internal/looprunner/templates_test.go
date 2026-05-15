@@ -80,15 +80,18 @@ func TestTemplateCaptureGitDelta(t *testing.T) {
 		t.Skip("git not installed")
 	}
 
-	workDir, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
+	workDir := t.TempDir()
+	runGitForTest(t, workDir, "init")
+	runGitForTest(t, workDir, "config", "user.email", "test@example.com")
+	runGitForTest(t, workDir, "config", "user.name", "Test User")
+	if err := os.WriteFile(workDir+"/tracked.txt", []byte("before\n"), 0o600); err != nil {
+		t.Fatalf("write tracked file: %v", err)
 	}
-
-	cmd := exec.Command("git", "rev-parse", "--is-inside-work-tree")
-	cmd.Dir = workDir
-	if err := cmd.Run(); err != nil {
-		t.Skip("not in a git repository")
+	runGitForTest(t, workDir, "add", "tracked.txt")
+	runGitForTest(t, workDir, "commit", "-m", "initial")
+	prevCommit := strings.TrimSpace(runGitForTest(t, workDir, "rev-parse", "HEAD"))
+	if err := os.WriteFile(workDir+"/tracked.txt", []byte("after\n"), 0o600); err != nil {
+		t.Fatalf("modify tracked file: %v", err)
 	}
 
 	t.Run("empty prevCommit", func(t *testing.T) {
@@ -105,22 +108,26 @@ func TestTemplateCaptureGitDelta(t *testing.T) {
 	})
 
 	t.Run("valid commit SHA", func(t *testing.T) {
-		cmd := exec.Command("git", "log", "--oneline", "-1", "--format=%H")
-		cmd.Dir = workDir
-		out, err := cmd.Output()
-		if err != nil {
-			t.Fatal(err)
-		}
-		prevCommit := strings.TrimSpace(string(out))
-		if prevCommit == "" {
-			t.Skip("no commits in repository")
-		}
-
 		diffStat, changedFiles, err := CaptureGitDelta(workDir, prevCommit)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		_ = diffStat
-		_ = changedFiles
+		if !strings.Contains(diffStat, "tracked.txt") {
+			t.Fatalf("diffStat = %q, want tracked.txt", diffStat)
+		}
+		if strings.TrimSpace(changedFiles) != "tracked.txt" {
+			t.Fatalf("changedFiles = %q, want tracked.txt", changedFiles)
+		}
 	})
+}
+
+func runGitForTest(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return string(out)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/sdougbrown/avenor/internal/events"
 )
@@ -50,6 +51,77 @@ func TestRunResumeFromPreviousUsesImmediatePriorPhase(t *testing.T) {
 	}
 }
 
+func TestRunPhaseWithRetryOnlyRetriesTransientFailure(t *testing.T) {
+	attempts := 0
+	result, err := runPhaseWithRetry(context.Background(), func(ctx context.Context) (PhaseAttemptResult, error) {
+		attempts++
+		return PhaseAttemptResult{ExitCode: 5, SessionID: "ses_blocked"}, nil
+	}, 3)
+	if err != nil {
+		t.Fatalf("runPhaseWithRetry() error = %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+	if result.ExitCode != 5 || result.SessionID != "ses_blocked" {
+		t.Fatalf("result = %+v, want blocked result", result)
+	}
+}
+
+func TestRunEmitsRetryEventBeforeRetry(t *testing.T) {
+	oldRetryAfter := phaseRetryAfter
+	phaseRetryAfter = func(time.Duration) <-chan time.Time {
+		ch := make(chan time.Time, 1)
+		ch <- time.Now()
+		return ch
+	}
+	t.Cleanup(func() { phaseRetryAfter = oldRetryAfter })
+
+	sink := &recordingEventWriter{}
+	attempts := 0
+	result, err := Run(context.Background(), RunOptions{
+		WorkDir:    t.TempDir(),
+		RunID:      "run_1",
+		EventSink:  sink,
+		Config:     &LoopConfig{Pre: []Phase{{Name: "build", Prompt: "build"}}, MaxIterations: 1},
+		MaxRetries: 1,
+		PhaseAttempt: func(ctx context.Context, phase Phase, attemptNum int, iteration int, prevSessionID string) (PhaseAttemptResult, error) {
+			attempts++
+			if attempts == 1 {
+				return PhaseAttemptResult{ExitCode: 1, SessionID: "ses_1"}, nil
+			}
+			return PhaseAttemptResult{ExitCode: 0, SessionID: "ses_2"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0", result.ExitCode)
+	}
+	retries := 0
+	for _, ev := range sink.events {
+		if ev.Event == "avenor.retry" {
+			retries++
+			if ev.Fields["attempt"] != 1 {
+				t.Fatalf("retry attempt = %v, want 1", ev.Fields["attempt"])
+			}
+		}
+	}
+	if retries != 1 {
+		t.Fatalf("retry events = %d, want 1; events=%+v", retries, sink.events)
+	}
+}
+
 type discardEventWriter struct{}
 
 func (discardEventWriter) Write(events.Event) error { return nil }
+
+type recordingEventWriter struct {
+	events []events.Event
+}
+
+func (w *recordingEventWriter) Write(ev events.Event) error {
+	w.events = append(w.events, ev)
+	return nil
+}

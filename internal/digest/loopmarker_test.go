@@ -4,11 +4,11 @@ import "testing"
 
 func TestExtractLoopMarker(t *testing.T) {
 	tests := []struct {
-		name         string
-		text         string
-		wantDir      string
-		wantLabel    string
-		wantOK       bool
+		name      string
+		text      string
+		wantDir   string
+		wantLabel string
+		wantOK    bool
 	}{
 		{
 			name:    "exit directive only",
@@ -43,21 +43,21 @@ func TestExtractLoopMarker(t *testing.T) {
 			wantOK:    true,
 		},
 		{
-			name:    "abort wins over exit",
-			text:    "[loop: exit | minor] [loop: abort | critical]",
-			wantDir: "abort",
+			name:      "abort wins over exit",
+			text:      "[loop: exit | minor]\n[loop: abort | critical]",
+			wantDir:   "abort",
 			wantLabel: "critical",
-			wantOK:  true,
+			wantOK:    true,
 		},
 		{
 			name:    "exit wins over continue",
-			text:    "[loop: continue] [loop: exit]",
+			text:    "[loop: continue]\n[loop: exit]",
 			wantDir: "exit",
 			wantOK:  true,
 		},
 		{
 			name:    "abort wins over continue",
-			text:    "[loop: continue] [loop: abort]",
+			text:    "[loop: continue]\n[loop: abort]",
 			wantDir: "abort",
 			wantOK:  true,
 		},
@@ -85,11 +85,21 @@ func TestExtractLoopMarker(t *testing.T) {
 			wantOK:    true,
 		},
 		{
-			name:    "same severity first wins",
-			text:    "[loop: exit | first] [loop: exit | second]",
-			wantDir: "exit",
+			name:      "same severity first wins",
+			text:      "[loop: exit | first]\n[loop: exit | second]",
+			wantDir:   "exit",
 			wantLabel: "first",
-			wantOK:  true,
+			wantOK:    true,
+		},
+		{
+			name:   "inline marker ignored",
+			text:   "quoted output says [loop: exit]",
+			wantOK: false,
+		},
+		{
+			name:   "code fence marker ignored",
+			text:   "```\n[loop: exit]\n```",
+			wantOK: false,
 		},
 		{
 			name:   "no marker",

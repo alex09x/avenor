@@ -84,7 +84,6 @@ func Run(ctx context.Context, opts RunOptions) (RunResult, error) {
 	}
 
 	prevSessionIDs := make(map[int]string)
-	var lastSessionIDs map[int]string
 	iterationsCompleted := 0
 
 	for iteration := 1; iteration <= opts.Config.MaxIterations; iteration++ {
@@ -141,11 +140,6 @@ func Run(ctx context.Context, opts RunOptions) (RunResult, error) {
 			}
 		}
 
-		lastSessionIDs = make(map[int]string, len(prevSessionIDs))
-		for k, v := range prevSessionIDs {
-			lastSessionIDs[k] = v
-		}
-
 		iterationsCompleted = iteration
 	}
 
@@ -194,7 +188,7 @@ func executePhase(ctx context.Context, opts RunOptions, phase Phase, iteration i
 	var retryCount int
 
 	wrappedAttempt := func(ctx context.Context) (PhaseAttemptResult, error) {
-		if retryCount > 0 && retryCount < opts.MaxRetries {
+		if retryCount > 0 && retryCount <= opts.MaxRetries {
 			emitRetry(opts.EventSink, opts.RunID, retryCount, opts.MaxRetries)
 		}
 		r, err := opts.PhaseAttempt(ctx, renderedPhase, retryCount, iteration, prevSessionID)
@@ -216,14 +210,14 @@ func runPhaseWithRetry(ctx context.Context, attemptFn func(ctx context.Context) 
 	}
 
 	for retry := 1; retry <= maxRetries; retry++ {
-		if result.ExitCode == 0 {
+		if result.ExitCode != 1 {
 			return result, nil
 		}
 
 		select {
 		case <-ctx.Done():
 			return result, nil
-		case <-time.After(backoffDuration(retry - 1)):
+		case <-phaseRetryAfter(backoffDuration(retry - 1)):
 		}
 
 		result, err = attemptFn(ctx)
@@ -234,6 +228,8 @@ func runPhaseWithRetry(ctx context.Context, attemptFn func(ctx context.Context) 
 
 	return result, nil
 }
+
+var phaseRetryAfter = time.After
 
 func cancelledRunResult(ctx context.Context, opts RunOptions, iterationsCompleted int) (RunResult, error) {
 	exitReason := "cancelled"

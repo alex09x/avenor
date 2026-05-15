@@ -228,7 +228,10 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		cfg, err := looprunner.LoadLoopConfig(*loopFile)
 		if err != nil {
 			fmt.Fprintf(stderr, "avenor: load loop config: %v\n", err)
-			return exitWithSentinel(2)
+			if *sentinelFile != "" {
+				WriteSentinel(*sentinelFile, 1, finalSessionID, "error", runID, stderr)
+			}
+			return 1
 		}
 
 		if len(promptText) > 0 {

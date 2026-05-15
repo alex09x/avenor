@@ -195,12 +195,14 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 	s.runtimes[rtID] = child
 	s.controlMu.Unlock()
 
-	// Clean up reserved slot on failure.
+	releaseReservation := func() {
+		s.controlMu.Lock()
+		delete(s.runtimes, rtID)
+		s.controlMu.Unlock()
+	}
 	defer func() {
-		if child.provider == nil && params.LoopFile == "" {
-			s.controlMu.Lock()
-			delete(s.runtimes, rtID)
-			s.controlMu.Unlock()
+		if releaseReservation != nil {
+			releaseReservation()
 		}
 	}()
 
@@ -299,6 +301,7 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 		default:
 		}
 
+		releaseReservation = nil
 		go s.runLoopChild(childCtx, child, cfg, params.Timeout, params.MaxRetries, params.Agent, params.Model, params.ServerURL)
 
 		return result, nil
@@ -345,6 +348,7 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 	child.cancelFn = childCancel
 
 	// Start the child event loop in a goroutine.
+	releaseReservation = nil
 	go s.runChild(childCtx, child, promptText, params.Timeout, params.MaxRetries)
 
 	select {
@@ -475,10 +479,16 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 		s.controlMu.Unlock()
 	}()
 
+	taggedWriter := &runtimeFanoutWriter{
+		base:      child.eventWriter,
+		runtimeID: child.id,
+		control:   s.control,
+	}
+
 	opts := looprunner.RunOptions{
 		WorkDir:    child.dir,
 		RunID:      s.runID,
-		EventSink:  child.eventWriter,
+		EventSink:  taggedWriter,
 		Config:     cfg,
 		MaxRetries: maxRetries,
 		PhaseAttempt: func(ctx context.Context, phase looprunner.Phase, attemptNum int, iteration int, prevSessionID string) (looprunner.PhaseAttemptResult, error) {
@@ -505,6 +515,20 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 			if err != nil {
 				return looprunner.PhaseAttemptResult{ExitCode: 1}, fmt.Errorf("start session: %w", err)
 			}
+			child.mu.Lock()
+			child.provider = provider
+			child.session = session
+			child.active = true
+			child.mu.Unlock()
+			defer func() {
+				child.mu.Lock()
+				if child.provider == provider {
+					child.provider = nil
+					child.session = runtime.Session{}
+				}
+				child.active = false
+				child.mu.Unlock()
+			}()
 
 			eventCtx, cancelEvents := context.WithCancel(ctx)
 			defer cancelEvents()
@@ -520,7 +544,7 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 			}()
 
 			result := cli.WaitForSession(
-				ctx, provider, child.eventWriter,
+				ctx, provider, taggedWriter,
 				child.fileHandler, nil,
 				eventCh, promptDone, nil,
 				session.SessionID, s.runID, child.label,
@@ -824,7 +848,14 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 	if rt == nil {
 		return fmt.Errorf("runtime %q not found", rtID)
 	}
-	return rt.provider.AnswerPermission(context.Background(), rt.sessionID(), requestID, runtime.PermissionResponse{
+	rt.mu.Lock()
+	provider := rt.provider
+	sessionID := rt.session.SessionID
+	rt.mu.Unlock()
+	if provider == nil || sessionID == "" {
+		return fmt.Errorf("runtime %q has no active session for permission response", rtID)
+	}
+	return provider.AnswerPermission(context.Background(), sessionID, requestID, runtime.PermissionResponse{
 		Outcome:  "selected",
 		OptionID: optionID,
 	})
