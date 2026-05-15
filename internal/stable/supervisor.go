@@ -16,7 +16,7 @@ import (
 	"github.com/sdougbrown/avenor/internal/looprunner"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/opencodeacp"
+	"github.com/sdougbrown/avenor/internal/runtime/factory"
 )
 
 type Config struct {
@@ -314,7 +314,11 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 	discovery := cli.DiscoverServer(params.ServerURL, os.Getenv)
 	startOpts.ServerURL = discovery.URL
 
-	provider := opencodeacp.NewWithOptions(startOpts)
+	provider, err := factory.NewProvider(startOpts, "opencode-acp")
+	if err != nil {
+		_ = writer.Close()
+		return SpawnResult{}, fmt.Errorf("create provider: %w", err)
+	}
 	session, err := cli.StartSession(context.Background(), provider, startOpts, "")
 	if err != nil {
 		if closer, ok := provider.(interface{ Close() error }); ok {

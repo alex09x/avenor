@@ -10,7 +10,7 @@ import (
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/opencodeacp"
+	"github.com/sdougbrown/avenor/internal/runtime/factory"
 )
 
 // attemptResult holds the outcome of a single session attempt.
@@ -38,6 +38,7 @@ func resumeSession(ctx context.Context, provider runtime.Provider, sessionID str
 func runSingleAttempt(
 	ctx context.Context,
 	startOptions runtime.StartOptions,
+	backend string,
 	resumeID string,
 	writer EventSink,
 	fileHandler *permission.FileHandler,
@@ -50,7 +51,11 @@ func runSingleAttempt(
 	timer <-chan time.Time,
 	stderr io.Writer,
 ) attemptResult {
-	provider := opencodeacp.NewWithOptions(startOptions)
+	provider, err := factory.NewProvider(startOptions, backend)
+	if err != nil {
+		fmt.Fprintf(stderr, "avenor: create provider: %v\n", err)
+		return attemptResult{exitCode: 1}
+	}
 	defer func() {
 		if closer, ok := provider.(interface{ Close() error }); ok {
 			_ = closer.Close()

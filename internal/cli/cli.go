@@ -112,8 +112,14 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		return code
 	}
 
-	if *backend != defaultBackend {
+	switch *backend {
+	case "opencode-acp", "opencode-http":
+	default:
 		fmt.Fprintf(stderr, "avenor: unknown backend %q\n", *backend)
+		return exitWithSentinel(1)
+	}
+	if *backend == "opencode-http" && *serverURL == "" {
+		fmt.Fprintf(stderr, "avenor: --server-url is required for backend opencode-http\n")
 		return exitWithSentinel(1)
 	}
 	if *prompt != "" && *promptFile != "" {
@@ -297,7 +303,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		if controlServer != nil {
 			state.Update(func(s *control.Snapshot) { s.RetryAttempt = attempt })
 		}
-		result = runAttempt(ctx, startOptions, resumeID, writer, fileHandler, controlServer, string(promptText), runID, *label, *autoApprove, *permClaimTimeout, timer, stderr)
+		result = runAttempt(ctx, startOptions, *backend, resumeID, writer, fileHandler, controlServer, string(promptText), runID, *label, *autoApprove, *permClaimTimeout, timer, stderr)
 		finalSessionID = result.sessionID
 
 		if result.exitCode != 1 || attempt > *maxRetries {

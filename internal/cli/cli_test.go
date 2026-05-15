@@ -246,6 +246,7 @@ func TestRunCleansSentinelFilesBetweenRetries(t *testing.T) {
 	runAttempt = func(
 		ctx context.Context,
 		startOptions runtime.StartOptions,
+		backend string,
 		resumeID string,
 		writer EventSink,
 		fileHandler *permission.FileHandler,
@@ -1363,5 +1364,126 @@ func TestControlPermissionClaimContextCancelReleasesClaim(t *testing.T) {
 	// AnswerPermission must NOT have been called (ctx was cancelled before any answer).
 	if provider.answerRequestID != "" {
 		t.Fatalf("provider.AnswerPermission called with requestID=%q, want no call", provider.answerRequestID)
+	}
+}
+
+func TestRunBackendOpenCodeACP(t *testing.T) {
+	oldRunAttempt := runAttempt
+	oldRetryAfter := retryAfter
+	t.Cleanup(func() {
+		runAttempt = oldRunAttempt
+		retryAfter = oldRetryAfter
+	})
+
+	called := false
+	runAttempt = func(
+		ctx context.Context,
+		startOptions runtime.StartOptions,
+		backend string,
+		resumeID string,
+		writer EventSink,
+		fileHandler *permission.FileHandler,
+		controlServer *control.ControlServer,
+		prompt string,
+		runID string,
+		runLabel string,
+		autoApprove bool,
+		permClaimTimeout time.Duration,
+		timer <-chan time.Time,
+		stderr io.Writer,
+	) attemptResult {
+		called = true
+		return attemptResult{exitCode: 0}
+	}
+	retryAfter = func(time.Duration) <-chan time.Time { return make(chan time.Time) }
+
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+
+	var stderr strings.Builder
+	code := run([]string{
+		"--prompt-file", promptPath,
+		"--backend", "opencode-acp",
+	}, func(string) string { return "" }, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !called {
+		t.Fatal("runAttempt was not called; backend opencode-acp was rejected")
+	}
+}
+
+func TestRunBackendOpenCodeHTTPWithServerURL(t *testing.T) {
+	oldRunAttempt := runAttempt
+	oldRetryAfter := retryAfter
+	t.Cleanup(func() {
+		runAttempt = oldRunAttempt
+		retryAfter = oldRetryAfter
+	})
+
+	called := false
+	runAttempt = func(
+		ctx context.Context,
+		startOptions runtime.StartOptions,
+		backend string,
+		resumeID string,
+		writer EventSink,
+		fileHandler *permission.FileHandler,
+		controlServer *control.ControlServer,
+		prompt string,
+		runID string,
+		runLabel string,
+		autoApprove bool,
+		permClaimTimeout time.Duration,
+		timer <-chan time.Time,
+		stderr io.Writer,
+	) attemptResult {
+		called = true
+		return attemptResult{exitCode: 0}
+	}
+	retryAfter = func(time.Duration) <-chan time.Time { return make(chan time.Time) }
+
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+
+	var stderr strings.Builder
+	code := run([]string{
+		"--prompt-file", promptPath,
+		"--backend", "opencode-http",
+		"--server-url", "http://localhost:8080",
+	}, func(string) string { return "" }, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !called {
+		t.Fatal("runAttempt was not called; backend opencode-http with --server-url was rejected")
+	}
+}
+
+func TestRunUnknownBackend(t *testing.T) {
+	var stderr strings.Builder
+	code := run([]string{"--backend", "bogus"}, nil, &stderr)
+	if code != 1 {
+		t.Fatalf("run() = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), `avenor: unknown backend "bogus"`) {
+		t.Fatalf("stderr = %q, want unknown backend message", stderr.String())
+	}
+}
+
+func TestRunOpenCodeHTTPWithoutServerURL(t *testing.T) {
+	var stderr strings.Builder
+	code := run([]string{"--backend", "opencode-http"}, nil, &stderr)
+	if code != 1 {
+		t.Fatalf("run() = %d, want 1", code)
+	}
+	if stderr.String() != "avenor: --server-url is required for backend opencode-http\n" {
+		t.Fatalf("stderr = %q, want exact --server-url message", stderr.String())
 	}
 }
