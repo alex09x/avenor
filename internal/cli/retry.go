@@ -98,7 +98,8 @@ func runSingleAttempt(
 			promptDone <- provider.Prompt(context.Background(), session.SessionID, prompt)
 		}()
 
-		exitCode := WaitForSession(ctx, provider, writer, fileHandler, controlServer, eventCh, promptDone, interruptCh, session.SessionID, runID, runLabel, autoApprove, permClaimTimeout, timer, stderr)
+		result := WaitForSession(ctx, provider, writer, fileHandler, controlServer, eventCh, promptDone, interruptCh, session.SessionID, runID, runLabel, autoApprove, permClaimTimeout, timer, stderr)
+		exitCode := result.ExitCode
 		cancelEvents()
 
 		if controlServer != nil {

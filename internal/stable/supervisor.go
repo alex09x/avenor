@@ -498,7 +498,8 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 		runtimeID: child.id,
 		control:   s.control,
 	}
-	exitCode := cli.WaitForSession(turnCtx, child.provider, taggedWriter, child.fileHandler, nil, eventCh, promptDone, nil, session.SessionID, s.runID, child.label, child.autoApprove, child.permClaimTimeout, timer, os.Stderr)
+	result := cli.WaitForSession(turnCtx, child.provider, taggedWriter, child.fileHandler, nil, eventCh, promptDone, nil, session.SessionID, s.runID, child.label, child.autoApprove, child.permClaimTimeout, timer, os.Stderr)
+	exitCode := result.ExitCode
 	return childAttemptResult{exitCode: exitCode, sessionID: session.SessionID}
 }
 

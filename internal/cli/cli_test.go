@@ -164,12 +164,12 @@ func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) 
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "review", true, DefaultPermissionClaimTimeout, nil, &stderr)
+	result := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "review", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
 	}
-	if code != 0 {
-		t.Fatalf("WaitForSession() = %d, want 0; stderr=%s", code, stderr.String())
+	if result.ExitCode != 0 {
+		t.Fatalf("WaitForSession() = %d, want 0; stderr=%s", result.ExitCode, stderr.String())
 	}
 	if provider.answerSessionID != "ses_1" || provider.answerRequestID != "req_1" {
 		t.Fatalf("answered session=%q request=%q", provider.answerSessionID, provider.answerRequestID)
@@ -468,10 +468,10 @@ func TestAutoAnswerGoroutineDoesNotBlockEventLoop(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	var exitCode int
+	var result sessionResult
 	go func() {
 		defer wg.Done()
-		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
+		result = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
 	}()
 
 	// Wait until AnswerPermission has been called (goroutine is now blocked inside it).
@@ -520,8 +520,8 @@ func TestAutoAnswerGoroutineDoesNotBlockEventLoop(t *testing.T) {
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
-	if exitCode != 0 {
-		t.Fatalf("WaitForSession() = %d, want 0", exitCode)
+	if result.ExitCode != 0 {
+		t.Fatalf("WaitForSession() = %d, want 0", result.ExitCode)
 	}
 }
 
@@ -561,12 +561,12 @@ func TestAutoAnswerMissingRequestIDEmitsErrorNotWorking(t *testing.T) {
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, &stderr)
+	result := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
-	if code != 0 {
-		t.Fatalf("WaitForSession() = %d, want 0", code)
+	if result.ExitCode != 0 {
+		t.Fatalf("WaitForSession() = %d, want 0", result.ExitCode)
 	}
 	// AnswerPermission must NOT have been called.
 	if provider.answerRequestID != "" {
@@ -628,12 +628,12 @@ func TestAutoAnswerEmitsPermissionResponse(t *testing.T) {
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "mylabel", true, DefaultPermissionClaimTimeout, nil, &stderr)
+	result := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "mylabel", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
-	if code != 0 {
-		t.Fatalf("WaitForSession() = %d, want 0; stderr=%s", code, stderr.String())
+	if result.ExitCode != 0 {
+		t.Fatalf("WaitForSession() = %d, want 0; stderr=%s", result.ExitCode, stderr.String())
 	}
 
 	got := readEventLogForTest(t, eventsPath)
@@ -707,12 +707,12 @@ func TestAutoAnswerAnswerPermissionErrorEmitsError(t *testing.T) {
 
 	provider := &errorFakeProvider{answerErr: fmt.Errorf("backend unavailable")}
 	var stderr strings.Builder
-	code := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, &stderr)
+	result := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
 	}
-	if code != 1 {
-		t.Fatalf("WaitForSession() = %d, want 1 (error exit)", code)
+	if result.ExitCode != 1 {
+		t.Fatalf("WaitForSession() = %d, want 1 (error exit)", result.ExitCode)
 	}
 
 	got := readEventLogForTest(t, eventsPath)
@@ -759,10 +759,10 @@ func TestAutoAnswerWorkingStatusEmittedOnPermissionResume(t *testing.T) {
 	promptDone := make(chan error, 1)
 	var wg sync.WaitGroup
 	wg.Add(1)
-	var exitCode int
+	var result sessionResult
 	go func() {
 		defer wg.Done()
-		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
+		result = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
 	}()
 
 	// Wait until AnswerPermission is called, then unblock it so the
@@ -807,8 +807,8 @@ func TestAutoAnswerWorkingStatusEmittedOnPermissionResume(t *testing.T) {
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
 	}
-	if exitCode != 0 {
-		t.Fatalf("WaitForSession() = %d, want 0", exitCode)
+	if result.ExitCode != 0 {
+		t.Fatalf("WaitForSession() = %d, want 0", result.ExitCode)
 	}
 
 	got := readEventLogForTest(t, eventsPath)
@@ -892,10 +892,10 @@ func TestControlPermissionResolution(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	var exitCode int
+	var result sessionResult
 	go func() {
 		defer wg.Done()
-		exitCode = WaitForSession(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_ctrl", "run_1", "mylabel", false, 5*time.Second, nil, io.Discard)
+		result = WaitForSession(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_ctrl", "run_1", "mylabel", false, 5*time.Second, nil, io.Discard)
 	}()
 
 	// Wait for the permission.request to be processed by the event loop
@@ -928,8 +928,8 @@ func TestControlPermissionResolution(t *testing.T) {
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
-	if exitCode != 0 {
-		t.Fatalf("WaitForSession() = %d, want 0", exitCode)
+	if result.ExitCode != 0 {
+		t.Fatalf("WaitForSession() = %d, want 0", result.ExitCode)
 	}
 	if provider.answerRequestID != "req_ctrl" {
 		t.Fatalf("answerRequestID = %q, want req_ctrl", provider.answerRequestID)
@@ -966,10 +966,10 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 	promptDone := make(chan error, 1)
 	var wg sync.WaitGroup
 	wg.Add(1)
-	var exitCode int
+	var result sessionResult
 	go func() {
 		defer wg.Done()
-		exitCode = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
+		result = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
 	}()
 
 	// Wait until the first AnswerPermission call is in-flight (blocking).
@@ -997,8 +997,8 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
 	}
-	if exitCode != 1 {
-		t.Fatalf("WaitForSession() = %d, want 1 (duplicate permission guard)", exitCode)
+	if result.ExitCode != 1 {
+		t.Fatalf("WaitForSession() = %d, want 1 (duplicate permission guard)", result.ExitCode)
 	}
 
 	got := readEventLogForTest(t, eventsPath)
