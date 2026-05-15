@@ -277,9 +277,6 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 		}
 
 		childCtx, childCancel := context.WithCancel(context.Background())
-		if params.Timeout > 0 {
-			childCtx, childCancel = context.WithTimeout(childCtx, time.Duration(params.Timeout)*time.Second)
-		}
 
 		child.label = params.Label
 		child.cancelFn = childCancel
@@ -462,6 +459,13 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 
 func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg *looprunner.LoopConfig, timeoutSecs, maxRetries int, agent, model, serverURL string) {
 	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "avenor stable: child %s panic: %v\n", child.id, r)
+			s.emitChildError(child, fmt.Sprintf("panic: %v", r), "error")
+			if child.sentinelFile != "" {
+				cli.WriteSentinel(child.sentinelFile, 1, "", "error", s.runID, os.Stderr)
+			}
+		}
 		if child.cancelFn != nil {
 			child.cancelFn()
 		}

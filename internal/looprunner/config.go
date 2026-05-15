@@ -53,9 +53,6 @@ func (c *LoopConfig) Validate() error {
 		if c.Pre[i].Name == "" {
 			return fmt.Errorf("loop config: phase[index %d]: name must not be empty", i)
 		}
-	}
-
-	for i := range c.Pre {
 		if c.Pre[i].Prompt == "" {
 			return fmt.Errorf("loop config: phase[name %s]: prompt must not be empty", c.Pre[i].Name)
 		}
@@ -65,9 +62,6 @@ func (c *LoopConfig) Validate() error {
 		if c.Loop[i].Name == "" {
 			return fmt.Errorf("loop config: phase[index %d]: name must not be empty", i)
 		}
-	}
-
-	for i := range c.Loop {
 		if c.Loop[i].Prompt == "" {
 			return fmt.Errorf("loop config: phase[name %s]: prompt must not be empty", c.Loop[i].Name)
 		}

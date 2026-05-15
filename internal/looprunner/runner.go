@@ -3,12 +3,12 @@ package looprunner
 import (
 	"context"
 	"fmt"
-	"math"
 	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/sdougbrown/avenor/internal/runtime"
 )
 
 type EventWriter interface {
@@ -43,12 +43,25 @@ type loopMarker struct {
 	label     string
 }
 
+func loopDirectiveSeverity(d string) int {
+	switch d {
+	case "abort":
+		return 3
+	case "exit":
+		return 2
+	case "continue":
+		return 1
+	default:
+		return 0
+	}
+}
+
 func Run(ctx context.Context, opts RunOptions) (RunResult, error) {
 	if err := emitLoopStart(opts.EventSink, opts.RunID, opts.Config.MaxIterations, len(opts.Config.Pre), len(opts.Config.Loop)); err != nil {
 		return RunResult{}, err
 	}
 
-	prevPhaseCommit, _ := captureHeadCommit(opts.WorkDir)
+	prevPhaseCommit := captureHeadCommit(opts.WorkDir)
 
 	for _, phase := range opts.Config.Pre {
 		if err := ctx.Err(); err != nil {
@@ -61,13 +74,23 @@ func Run(ctx context.Context, opts RunOptions) (RunResult, error) {
 			return RunResult{}, err
 		}
 
-		prevPhaseCommit, _ = captureHeadCommit(opts.WorkDir)
+		prevPhaseCommit = captureHeadCommit(opts.WorkDir)
 
 		if err := ctx.Err(); err != nil {
 			return cancelledRunResult(ctx, opts, 0)
 		}
 
-		sr := stopReasonFromExitCode(result.ExitCode)
+		if result.LoopDirective == "abort" {
+			_ = emitLoopEnd(opts.EventSink, opts.RunID, "abort", result.LoopLabel, 0)
+			return RunResult{
+				ExitCode:   5,
+				StopReason: "blocked",
+				SessionID:  result.SessionID,
+				Reason:     result.LoopLabel,
+			}, nil
+		}
+
+		sr := runtime.StopReasonForExitCode(result.ExitCode)
 		if sr != "end_turn" {
 			_ = emitLoopEnd(opts.EventSink, opts.RunID, "phase_failure", "", 0)
 			return RunResult{
@@ -104,13 +127,13 @@ func Run(ctx context.Context, opts RunOptions) (RunResult, error) {
 			}
 
 			prevSessionIDs[phaseIdx] = result.SessionID
-			prevPhaseCommit, _ = captureHeadCommit(opts.WorkDir)
+			prevPhaseCommit = captureHeadCommit(opts.WorkDir)
 
 			if err := ctx.Err(); err != nil {
 				return cancelledRunResult(ctx, opts, iterationsCompleted)
 			}
 
-			sr := stopReasonFromExitCode(result.ExitCode)
+			sr := runtime.StopReasonForExitCode(result.ExitCode)
 
 			switch result.LoopDirective {
 			case "abort":
@@ -178,14 +201,13 @@ func executePhase(ctx context.Context, opts RunOptions, phase Phase, iteration i
 		return PhaseAttemptResult{}, err
 	}
 
-	started := true
 	defer func() {
-		if started {
-			_ = emitPhaseEnd(opts.EventSink, opts.RunID, phase.Name, iteration, stopReasonFromExitCode(result.ExitCode), markerFromResult(result))
-		}
+		_ = emitPhaseEnd(opts.EventSink, opts.RunID, phase.Name, iteration, runtime.StopReasonForExitCode(result.ExitCode), markerFromResult(result))
 	}()
 
 	var retryCount int
+	var accDirective string
+	var accLabel string
 
 	wrappedAttempt := func(ctx context.Context) (PhaseAttemptResult, error) {
 		if retryCount > 0 && retryCount <= opts.MaxRetries {
@@ -196,6 +218,12 @@ func executePhase(ctx context.Context, opts RunOptions, phase Phase, iteration i
 		if err != nil {
 			return r, err
 		}
+		if loopDirectiveSeverity(r.LoopDirective) > loopDirectiveSeverity(accDirective) {
+			accDirective = r.LoopDirective
+			accLabel = r.LoopLabel
+		}
+		r.LoopDirective = accDirective
+		r.LoopLabel = accLabel
 		return r, nil
 	}
 
@@ -343,38 +371,17 @@ func emitLoopEnd(w EventWriter, runID string, exitReason, exitLabel string, iter
 	})
 }
 
-func captureHeadCommit(workDir string) (string, error) {
+func captureHeadCommit(workDir string) string {
 	cmd := exec.Command("git", "-C", workDir, "rev-parse", "HEAD")
 	out, err := cmd.Output()
 	if err != nil {
-		return "", nil
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-func stopReasonFromExitCode(code int) string {
-	switch code {
-	case 0:
-		return "end_turn"
-	case 2:
-		return "refusal"
-	case 3:
-		return "max_tokens"
-	case 4:
-		return "max_turn_requests"
-	case 5:
-		return "blocked"
-	case 124:
-		return "timeout"
-	case 130:
-		return "cancelled"
-	default:
 		return ""
 	}
+	return strings.TrimSpace(string(out))
 }
 
 func backoffDuration(retry int) time.Duration {
-	d := time.Duration(math.Pow(2, float64(retry+1))) * time.Second
+	d := time.Duration(1<<uint(retry+1)) * time.Second
 	if d > 30*time.Second {
 		d = 30 * time.Second
 	}
