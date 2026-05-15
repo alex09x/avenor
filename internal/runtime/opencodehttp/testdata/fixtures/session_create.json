@@ -1,0 +1,23 @@
+{
+    "id": "ses_1d64e1b8effexnkgkIzBz8nD2V",
+    "slug": "glowing-sailor",
+    "projectID": "01c609a803a410ee7f7493ce535df0a839b03ca6",
+    "directory": "/Users/douglasbrown/Code/avenor",
+    "path": "",
+    "cost": 0,
+    "tokens": {
+        "input": 0,
+        "output": 0,
+        "reasoning": 0,
+        "cache": {
+            "read": 0,
+            "write": 0
+        }
+    },
+    "title": "New session - 2026-05-15T03:33:04.753Z",
+    "version": "1.14.50",
+    "time": {
+        "created": 1778815984753,
+        "updated": 1778815984753
+    }
+}

@@ -1,0 +1,67 @@
+{
+    "info": {
+        "parentID": "msg_e29b1e8fb001F09f77oDpdJWf0",
+        "role": "assistant",
+        "mode": "jockey",
+        "agent": "jockey",
+        "path": {
+            "cwd": "/Users/douglasbrown/Code/avenor",
+            "root": "/Users/douglasbrown/Code/avenor"
+        },
+        "cost": 0,
+        "tokens": {
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "cache": {
+                "read": 0,
+                "write": 0
+            }
+        },
+        "modelID": "deepseek-v4-pro",
+        "providerID": "deepseek",
+        "time": {
+            "created": 1778815985919,
+            "completed": 1778815987966
+        },
+        "error": {
+            "name": "MessageAbortedError",
+            "data": {
+                "message": "Aborted"
+            }
+        },
+        "id": "msg_e29b1e8ff001FWf515cn3i11nl",
+        "sessionID": "ses_1d64e1b8effexnkgkIzBz8nD2V"
+    },
+    "parts": [
+        {
+            "snapshot": "b657fe2dcf31ca5a31a9d49349f1758a079ef5e0",
+            "type": "step-start",
+            "id": "prt_e29b1eba2001zohJEo0RBwwtrQ",
+            "sessionID": "ses_1d64e1b8effexnkgkIzBz8nD2V",
+            "messageID": "msg_e29b1e8ff001FWf515cn3i11nl"
+        },
+        {
+            "type": "reasoning",
+            "text": "The user wants me to count from 1 to 20, one number per line. Let me do that.",
+            "time": {
+                "start": 1778815986995,
+                "end": 1778815987785
+            },
+            "id": "prt_e29b1ed33001mgYNTal5f939fY",
+            "sessionID": "ses_1d64e1b8effexnkgkIzBz8nD2V",
+            "messageID": "msg_e29b1e8ff001FWf515cn3i11nl"
+        },
+        {
+            "type": "text",
+            "text": "1\n2\n3",
+            "time": {
+                "start": 1778815987786,
+                "end": 1778815987965
+            },
+            "id": "prt_e29b1f04a0016PM4iSKhBu5VvS",
+            "sessionID": "ses_1d64e1b8effexnkgkIzBz8nD2V",
+            "messageID": "msg_e29b1e8ff001FWf515cn3i11nl"
+        }
+    ]
+}
