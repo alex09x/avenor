@@ -165,13 +165,33 @@ func (p *Provider) Events(ctx context.Context, sessionID string) (<-chan events.
 }
 
 func (p *Provider) AnswerPermission(ctx context.Context, sessionID string, requestID string, response runtime.PermissionResponse) error {
-	return errors.New("permissions not yet implemented for opencode-http backend")
+	c, err := p.clientLocked()
+	if err != nil {
+		return err
+	}
+	if requestID == "" {
+		return errors.New("permission request id is required")
+	}
+	outcome := response.Outcome
+	if outcome == "" {
+		outcome = "selected"
+	}
+	payload := map[string]any{
+		"outcome": outcome,
+	}
+	if response.OptionID != "" {
+		payload["option_id"] = response.OptionID
+	}
+	if response.Message != "" {
+		payload["message"] = response.Message
+	}
+	return c.AnswerPermission(ctx, sessionID, requestID, payload)
 }
 
 func (p *Provider) Capabilities(ctx context.Context) (runtime.Capabilities, error) {
 	return runtime.Capabilities{
 		Backend:             backendID,
-		Permissions:         false,
+		Permissions:         true,
 		Resume:              true,
 		ExternalServerURL:   true,
 		SubprocessDiscovery: false,

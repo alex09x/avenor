@@ -6,16 +6,35 @@ import (
 	"encoding/json"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/sdougbrown/avenor/internal/events"
 )
 
-// readSSEEvents reads SSE frames from r and sends parsed events to out.
-// It returns when ctx is cancelled or r reaches EOF/error.
+// sseEvent is a raw event from the opencode SSE stream.
+type sseEvent struct {
+	ID         string         `json:"id"`
+	Type       string         `json:"type"`
+	Properties map[string]any `json:"properties"`
+}
+
+// readSSEEvents reads SSE frames from r and sends mapped avenor events to out.
+// It maintains per-session state to detect session end transitions.
 func readSSEEvents(ctx context.Context, r io.Reader, out chan<- events.Event) {
 	defer close(out)
+
+	var mu sync.Mutex
+	sessionErrors := map[string]string{} // sessionID → last error name
+	sessionBusy := map[string]bool{}     // sessionID → is busy
+
+	emit := func(evt events.Event) {
+		select {
+		case out <- evt:
+		case <-ctx.Done():
+		}
+	}
+
 	scanner := bufio.NewScanner(r)
-	// SSE frames can be large; bump the buffer.
 	scanner.Buffer(make([]byte, 4096), 1<<20)
 
 	for scanner.Scan() {
@@ -24,39 +43,110 @@ func readSSEEvents(ctx context.Context, r io.Reader, out chan<- events.Event) {
 			return
 		default:
 		}
+
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
 		payload := line[6:]
-		var raw struct {
-			Type       string         `json:"type"`
-			Properties map[string]any `json:"properties"`
-		}
+
+		var raw sseEvent
 		if err := json.Unmarshal([]byte(payload), &raw); err != nil {
 			continue
 		}
-		evt := mapHTTPEvent(raw.Type, raw.Properties)
-		if evt.Event != "" {
-			out <- evt
+		sid, _ := raw.Properties["sessionID"].(string)
+
+		switch raw.Type {
+		case "message.part.delta":
+			field, _ := raw.Properties["field"].(string)
+			delta, _ := raw.Properties["delta"].(string)
+			messageID, _ := raw.Properties["messageID"].(string)
+			partID, _ := raw.Properties["partID"].(string)
+
+			eventName := "agent.message_chunk"
+			if field == "reasoning" {
+				eventName = "agent.thought_chunk"
+			}
+			emit(events.Event{
+				Event:     eventName,
+				SessionID: sid,
+				Fields: map[string]any{
+					"delta":      delta,
+					"message_id": messageID,
+					"part_id":    partID,
+				},
+			})
+
+		case "session.status":
+			status, _ := raw.Properties["status"].(map[string]any)
+			if status == nil {
+				continue
+			}
+			statusType, _ := status["type"].(string)
+			mu.Lock()
+			switch statusType {
+			case "busy":
+				sessionBusy[sid] = true
+			case "idle":
+				if sessionBusy[sid] {
+					delete(sessionBusy, sid)
+					// Emit session.end with appropriate stop_reason.
+					stopReason := "end_turn"
+					if errName, ok := sessionErrors[sid]; ok {
+						delete(sessionErrors, sid)
+						stopReason = mapErrorToStopReason(errName)
+					}
+					emit(events.Event{
+						Event:     "session.end",
+						SessionID: sid,
+						Fields: map[string]any{
+							"stop_reason": stopReason,
+						},
+					})
+				}
+			}
+			mu.Unlock()
+
+		case "session.error":
+			errObj, _ := raw.Properties["error"].(map[string]any)
+			if errObj != nil {
+				errName, _ := errObj["name"].(string)
+				mu.Lock()
+				sessionErrors[sid] = errName
+				mu.Unlock()
+			}
+
+		case "permission.request":
+			// Emit permission.request with fields from properties.
+			fields := map[string]any{}
+			for k, v := range raw.Properties {
+				if k != "sessionID" {
+					fields[k] = v
+				}
+			}
+			emit(events.Event{
+				Event:     "permission.request",
+				SessionID: sid,
+				Fields:    fields,
+			})
+
+		default:
+			// Passthrough unknown events for debugging.
+			emit(events.Event{
+				Event:     "http." + raw.Type,
+				SessionID: sid,
+				Fields:    raw.Properties,
+			})
 		}
 	}
 }
 
-// mapHTTPEvent converts a raw opencode HTTP event into an avenor events.Event.
-// Phase D will expand this with full event mapping.
-func mapHTTPEvent(eventType string, props map[string]any) events.Event {
-	switch eventType {
-	case "server.connected", "server.heartbeat":
-		// Server-level events — skip for now.
-		return events.Event{}
+// mapErrorToStopReason converts an opencode error name to an avenor stop_reason.
+func mapErrorToStopReason(errName string) string {
+	switch errName {
+	case "MessageAbortedError":
+		return "cancelled"
 	default:
-		// Pass through unknown events for debugging.
-		sessionID, _ := props["sessionID"].(string)
-		return events.Event{
-			Event:     "http." + eventType,
-			SessionID: sessionID,
-			Fields:    props,
-		}
+		return errName
 	}
 }

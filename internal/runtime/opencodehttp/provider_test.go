@@ -43,8 +43,8 @@ func TestCapabilities(t *testing.T) {
 	if caps.Backend != "opencode-http" {
 		t.Errorf("Backend = %q, want %q", caps.Backend, "opencode-http")
 	}
-	if caps.Permissions {
-		t.Error("Permissions should be false initially")
+	if !caps.Permissions {
+		t.Error("Permissions should be true")
 	}
 	if !caps.Resume {
 		t.Error("Resume should be true")
@@ -82,14 +82,14 @@ func TestEventsFailsBeforeStart(t *testing.T) {
 	}
 }
 
-func TestAnswerPermissionNotImplemented(t *testing.T) {
+func TestAnswerPermissionFailsBeforeStart(t *testing.T) {
 	p, err := NewWithOptions(runtime.StartOptions{})
 	if err != nil {
 		t.Fatalf("NewWithOptions error = %v", err)
 	}
 	err = p.AnswerPermission(context.Background(), "ses_test", "req_1", runtime.PermissionResponse{})
 	if err == nil {
-		t.Fatal("AnswerPermission should return not-implemented error")
+		t.Fatal("AnswerPermission before Start should fail")
 	}
 }
 
