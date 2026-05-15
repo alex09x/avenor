@@ -319,6 +319,10 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 	if backend == "" {
 		backend = "opencode-acp"
 	}
+	if backend == "opencode-http" && startOpts.ServerURL == "" {
+		_ = writer.Close()
+		return SpawnResult{}, fmt.Errorf("--server-url is required for backend opencode-http")
+	}
 	provider, err := factory.NewProvider(startOpts, backend)
 	if err != nil {
 		_ = writer.Close()

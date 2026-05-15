@@ -47,6 +47,23 @@
 //	session.status {type:"idle"}
 //	session.idle
 //
+// # Duplicate session.end guard
+//
+// The session.end event can arrive from two sources: the SSE idle transition
+// and the synchronous POST /message response. The provider tracks
+// endedSessions to suppress the second emission. This avoids duplicate
+// session.end events in the NDJSON log.
+//
+// # Reconnect behavior
+//
+// The SSE stream reconnects with exponential backoff (100ms → 1s cap). On
+// reconnect, the per-session busy/error state tracked by the SSE reader is
+// reset. If a session was mid-execution during disconnect, the post-reconnect
+// idle event will not produce a session.end (no prior busy was observed).
+// The response-derived session.end from Prompt() covers this gap in practice;
+// if the response-derived path is ever removed, the busy/error maps must be
+// lifted to the Provider to survive reconnects.
+//
 // # Stop-reason mapping
 //
 // The HTTP API uses `info.finish` on the POST /session/:id/message response

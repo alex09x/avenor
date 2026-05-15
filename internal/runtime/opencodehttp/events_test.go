@@ -183,6 +183,24 @@ func TestPermissionRequestMapping(t *testing.T) {
 	}
 }
 
+func TestPermissionRequestMappingCamelCaseID(t *testing.T) {
+	// opencode server sends camelCase "requestID" — mapper normalizes to snake_case.
+	feed := sseFeed(
+		`{"type":"permission.request","properties":{"sessionID":"ses_1","requestID":"req_camel","tool":"bash","options":[{"optionId":"allow","kind":"allow"}]}}`,
+	)
+	evts := collectEvents(t, feed)
+	if len(evts) != 1 {
+		t.Fatalf("got %d events, want 1: %+v", len(evts), evts)
+	}
+	if evts[0].Fields["request_id"] != "req_camel" {
+		t.Errorf("request_id = %v, want req_camel", evts[0].Fields["request_id"])
+	}
+	// Verify the raw camelCase key is not leaked.
+	if _, ok := evts[0].Fields["requestID"]; ok {
+		t.Error("requestID field should be normalized to request_id, not passed through")
+	}
+}
+
 func TestPermissionRequestWithoutSessionIDIsSkipped(t *testing.T) {
 	feed := sseFeed(
 		`{"type":"permission.request","properties":{"request_id":"req_abc","tool":"bash","options":[{"optionId":"allow","kind":"allow"}]}}`,

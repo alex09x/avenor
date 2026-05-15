@@ -19,12 +19,13 @@ const backendID = "opencode-http"
 type Provider struct {
 	opts runtime.StartOptions
 
-	mu           sync.Mutex
-	client       *Client
-	events       chan events.Event
-	streamCancel context.CancelFunc
-	sessions     map[string]sessionState
-	subscribers  map[chan events.Event]string
+	mu            sync.Mutex
+	client        *Client
+	events        chan events.Event
+	streamCancel  context.CancelFunc
+	sessions      map[string]sessionState
+	subscribers   map[chan events.Event]string
+	endedSessions map[string]bool // guards double-emit of session.end
 }
 
 type sessionState struct {
@@ -41,9 +42,10 @@ func New() (runtime.Provider, error) {
 // NewWithOptions creates a Provider with the given options.
 func NewWithOptions(opts runtime.StartOptions) (runtime.Provider, error) {
 	return &Provider{
-		opts:        opts,
-		sessions:    make(map[string]sessionState),
-		subscribers: make(map[chan events.Event]string),
+		opts:          opts,
+		sessions:      make(map[string]sessionState),
+		subscribers:   make(map[chan events.Event]string),
+		endedSessions: make(map[string]bool),
 	}, nil
 }
 
@@ -58,10 +60,6 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	if err != nil {
 		return runtime.Session{}, err
 	}
-	// Persist ServerURL so Resume works after Start-only URL provision.
-	p.mu.Lock()
-	p.opts.ServerURL = merged.ServerURL
-	p.mu.Unlock()
 
 	sessionID, err := c.CreateSession(ctx)
 	if err != nil {
@@ -82,7 +80,10 @@ func (p *Provider) Resume(ctx context.Context, sessionID string) (runtime.Sessio
 	if sessionID == "" {
 		return runtime.Session{}, errors.New("session id is required")
 	}
-	if p.opts.ServerURL == "" {
+	p.mu.Lock()
+	serverURL := p.opts.ServerURL
+	p.mu.Unlock()
+	if serverURL == "" {
 		return runtime.Session{}, errors.New("server URL is required for opencode-http backend")
 	}
 	c, err := p.ensureClient(ctx, p.opts)
@@ -130,7 +131,7 @@ func (p *Provider) Prompt(ctx context.Context, sessionID string, prompt string) 
 		return err
 	}
 	if evt, ok := messageResultEndEvent(sessionID, result); ok {
-		p.publish(evt)
+		p.publishSessionEnd(evt)
 	}
 	return nil
 }
@@ -271,7 +272,11 @@ func (p *Provider) streamEvents(ctx context.Context, c *Client) {
 					body.Close()
 					goto reconnect
 				}
-				p.publish(evt)
+				if evt.Event == "session.end" {
+					p.publishSessionEnd(evt)
+				} else {
+					p.publish(evt)
+				}
 			case <-ctx.Done():
 				body.Close()
 				return
@@ -315,6 +320,20 @@ func (p *Provider) publish(event events.Event) {
 			}
 		}
 	}
+}
+
+// publishSessionEnd emits a session.end event, skipping if the session has
+// already ended (guards against duplicate emits from the SSE idle transition
+// and the synchronous POST /message response).
+func (p *Provider) publishSessionEnd(evt events.Event) {
+	p.mu.Lock()
+	if p.endedSessions[evt.SessionID] {
+		p.mu.Unlock()
+		return
+	}
+	p.endedSessions[evt.SessionID] = true
+	p.mu.Unlock()
+	p.publish(evt)
 }
 
 func sleepOrDone(ctx context.Context, d time.Duration) bool {
@@ -400,20 +419,20 @@ func mapModel(model string) map[string]string {
 // clientOptionsFromURL extracts credentials from the URL userinfo and returns
 // ClientOptions with a credential-free base URL plus a safe URL for logging.
 func clientOptionsFromURL(rawURL string) (ClientOptions, string) {
-	co := ClientOptions{BaseURL: rawURL}
-	safeURL := rawURL
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return co, safeURL
+		// Parse failure: return a generic placeholder to avoid leaking
+		// rawURL (which may contain credentials) into error messages.
+		return ClientOptions{BaseURL: rawURL}, "(invalid url)"
 	}
+	co := ClientOptions{}
 	if u.User != nil {
 		co.Username = u.User.Username()
 		co.Password, _ = u.User.Password()
 		u.User = nil
 	}
 	co.BaseURL = u.String()
-	safeURL = u.Redacted()
-	return co, safeURL
+	return co, u.Redacted()
 }
 
 func mergeStartOptions(base, override runtime.StartOptions) runtime.StartOptions {
