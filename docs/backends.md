@@ -1,38 +1,102 @@
 # Backends
 
-Stage 2 ships one backend: `opencode-acp`.
+Avenor supports two backends: `opencode-acp` (subprocess) and `opencode-http` (remote server).
 
-## Discovery
+## Backend selection
 
-The default CLI resolves the requested opencode ACP source in this order:
+Pass `--backend` to choose the runtime:
+
+```sh
+avenor --backend opencode-acp --prompt "say hi"
+avenor --backend opencode-http --server-url http://127.0.0.1:4096 --prompt "say hi"
+```
+
+## opencode-acp
+
+The default backend. Uses OpenCode's ACP JSON-RPC protocol over stdio. Spawns `opencode acp --pure` as a subprocess.
+
+### Discovery
 
 1. `--server-url <url>`
 2. `AVENOR_OPENCODE_URL`
 3. Spawn `opencode acp --pure` for this Avenor invocation
 
-The flag wins over the environment variable. If neither is set, Avenor uses the subprocess fallback.
+If a URL is provided, the ACP backend fails cleanly — it does not support network transport.
 
-The Stage 2 opencode provider implements the documented ACP stdio transport. If a URL is selected, the provider fails cleanly because no network ACP transport is defined by the current opencode ACP documentation.
+### Capabilities
 
-## opencode-acp
+| Capability | Supported |
+|---|---|
+| New sessions | ✓ |
+| Session resume | ✓ |
+| Prompt execution | ✓ |
+| Cancel | ✓ |
+| Event streaming | ✓ |
+| Permission relay | ✓ |
+| Model selection | ✓ (via `SetSessionMode`/`SetSessionModel`) |
+| External server URL | ✗ |
+| Subprocess discovery | ✓ (subprocess fallback) |
 
-The backend uses OpenCode's ACP JSON-RPC protocol and the Stage 1 event mapper. Subprocess mode starts `opencode acp --pure --log-level WARN --cwd <dir>` and communicates over stdin/stdout.
+## opencode-http
 
-Resumability depends on server lifetime:
+Talks to `opencode serve` over its HTTP API. Requires `--server-url` pointing at a running `opencode serve` instance.
 
-External server mode is intended for long-lived harnesses. The backend can resume a persisted session ID when the same OpenCode data store is available.
+### Starting the server
 
-Subprocess fallback mode is a convenience path for direct CLI use. It may not survive process exit or server restart unless OpenCode has persisted enough session state for a later process to resume it.
+```sh
+opencode serve --port 4096 --pure
+```
 
-## Capabilities
+### Basic usage
 
-`opencode-acp` supports:
+```sh
+avenor \
+  --backend opencode-http \
+  --server-url http://127.0.0.1:4096 \
+  --agent jockey \
+  --model deepseek/deepseek-v4-pro \
+  --prompt "say ok" \
+  --on-event /tmp/avenor-http.ndjson \
+  --sentinel-file /tmp/avenor-http.env
+```
 
-- New sessions
-- Session resume
-- Prompt execution
-- Client-side cancellation
-- Event streaming
-- Permission request relay when ACP emits `session/request_permission`
+### Auth
 
-Stage 2 does not add a second backend. `--backend` accepts only `opencode-acp`.
+The server supports HTTP basic auth. Pass credentials via the URL:
+
+```sh
+--server-url http://user:pass@127.0.0.1:4096
+```
+
+Or set `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD` environment variables (future support).
+
+### Agent and model
+
+Agent and model are forwarded on every prompt. The `--model` string uses `providerID/modelID` format:
+
+```sh
+--model deepseek/deepseek-v4-pro
+```
+
+This is split and sent as `{"providerID":"deepseek","modelID":"deepseek-v4-pro"}` to the server.
+
+### Capabilities
+
+| Capability | Supported |
+|---|---|
+| New sessions | ✓ |
+| Session resume | ✓ (via `GET /session/:id`) |
+| Prompt execution | ✓ |
+| Cancel | ✓ (via `POST /session/:id/abort`) |
+| Event streaming | ✓ (SSE over `GET /event`) |
+| Permission relay | ✓ |
+| Model selection | ✓ (set per prompt) |
+| External server URL | ✓ (required) |
+| Subprocess discovery | ✗ |
+
+### Known differences from ACP
+
+- **Event stream is global.** The SSE `/event` endpoint delivers events for all sessions on the server. The provider filters by session ID locally.
+- **Session end detection.** Uses `session.status {idle}` + `session.idle` events (ACP uses `session/prompt` response `stopReason`).
+- **Resume.** Checks `GET /session/:id` for existence. No dedicated resume endpoint.
+- **Permissions.** Permission support is mapped from HTTP events when available. The server may auto-approve tools depending on configuration.

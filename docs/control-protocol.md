@@ -177,6 +177,8 @@ These work with `avenor stable` and require `runtime_id` for scoped operations:
     "prompt":"Review PR #42",
     "dir":"/repo/A",
     "label":"review-42",
+    "backend":"opencode-http",
+    "server_url":"http://127.0.0.1:4096",
     "auto_approve":true
   }
 }
@@ -192,7 +194,7 @@ Returns:
 }
 ```
 
-Required: `prompt` or `prompt_file`. Optional: `dir` (defaults to `.`), `agent`, `label`, `model`, `server_url`, `on_event`, `sentinel_file`, `permission_handler`, `auto_approve`, `timeout`, `max_retries`.
+Required: `prompt` or `prompt_file`. Optional: `dir` (defaults to `.`), `agent`, `label`, `model`, `server_url`, `backend` (defaults to `"opencode-acp"`), `on_event`, `sentinel_file`, `permission_handler`, `auto_approve`, `timeout`, `max_retries`.
 
 If `on_event` or `sentinel_file` is omitted, stable mode creates per-runtime files under `$TMPDIR/avenor-stable/<supervisor_run_id>/<runtime_id>/`.
 
