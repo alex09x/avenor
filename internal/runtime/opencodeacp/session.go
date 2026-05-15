@@ -17,10 +17,7 @@ type Session struct {
 }
 
 func (c *Client) NewSession(ctx context.Context) (*Session, error) {
-	result, err := c.request(ctx, "session/new", map[string]any{
-		"cwd":        c.dir,
-		"mcpServers": []any{},
-	})
+	result, err := c.request(ctx, "session/new", sessionOpenParams(c.dir))
 	if err != nil {
 		return nil, err
 	}
@@ -38,12 +35,24 @@ func (c *Client) NewSession(ctx context.Context) (*Session, error) {
 	return &Session{Client: c, SessionID: payload.SessionID}, nil
 }
 
+func (c *Client) SetSessionMode(ctx context.Context, sessionID string, modeID string) error {
+	if modeID == "" {
+		return nil
+	}
+	_, err := c.request(ctx, "session/set_mode", setSessionModeParams(sessionID, modeID))
+	return err
+}
+
+func (c *Client) SetSessionModel(ctx context.Context, sessionID string, modelID string) error {
+	if modelID == "" {
+		return nil
+	}
+	_, err := c.request(ctx, "session/set_config_option", setSessionModelParams(sessionID, modelID))
+	return err
+}
+
 func (c *Client) LoadSession(ctx context.Context, sessionID string) (*Session, error) {
-	_, err := c.request(ctx, "session/load", map[string]any{
-		"sessionId":  sessionID,
-		"cwd":        c.dir,
-		"mcpServers": []any{},
-	})
+	_, err := c.request(ctx, "session/load", sessionOpenParams(c.dir, "sessionId", sessionID))
 	if err != nil {
 		return nil, err
 	}
@@ -51,11 +60,7 @@ func (c *Client) LoadSession(ctx context.Context, sessionID string) (*Session, e
 }
 
 func (c *Client) ResumeSession(ctx context.Context, sessionID string) (*Session, error) {
-	_, err := c.request(ctx, "session/resume", map[string]any{
-		"sessionId":  sessionID,
-		"cwd":        c.dir,
-		"mcpServers": []any{},
-	})
+	_, err := c.request(ctx, "session/resume", sessionOpenParams(c.dir, "sessionId", sessionID))
 	if err != nil {
 		return nil, err
 	}
@@ -89,6 +94,36 @@ func (s *Session) Close(ctx context.Context) error {
 		"sessionId": s.SessionID,
 	})
 	return err
+}
+
+func sessionOpenParams(dir string, extra ...any) map[string]any {
+	params := map[string]any{
+		"cwd":        dir,
+		"mcpServers": []any{},
+	}
+	for i := 0; i+1 < len(extra); i += 2 {
+		key, ok := extra[i].(string)
+		if !ok || key == "" {
+			continue
+		}
+		params[key] = extra[i+1]
+	}
+	return params
+}
+
+func setSessionModeParams(sessionID string, modeID string) map[string]any {
+	return map[string]any{
+		"sessionId": sessionID,
+		"modeId":    modeID,
+	}
+}
+
+func setSessionModelParams(sessionID string, modelID string) map[string]any {
+	return map[string]any{
+		"sessionId": sessionID,
+		"configId":  "model",
+		"value":     modelID,
+	}
 }
 
 func RunProbe(ctx context.Context, dir string) ([]events.Event, error) {

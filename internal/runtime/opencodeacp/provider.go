@@ -46,6 +46,9 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	if err != nil {
 		return runtime.Session{}, err
 	}
+	if err := p.configureSession(ctx, session, merged); err != nil {
+		return runtime.Session{}, err
+	}
 
 	p.mu.Lock()
 	p.sessions[session.SessionID] = session
@@ -68,6 +71,9 @@ func (p *Provider) Resume(ctx context.Context, sessionID string) (runtime.Sessio
 
 	session, err := p.client.ResumeSession(ctx, sessionID)
 	if err != nil {
+		return runtime.Session{}, err
+	}
+	if err := p.configureSession(ctx, session, p.opts); err != nil {
 		return runtime.Session{}, err
 	}
 
@@ -151,7 +157,7 @@ func (p *Provider) Capabilities(ctx context.Context) (runtime.Capabilities, erro
 		Resume:              true,
 		ExternalServerURL:   false,
 		SubprocessDiscovery: true,
-		ModelSelection:      false,
+		ModelSelection:      true,
 	}, nil
 }
 
@@ -217,6 +223,20 @@ func (p *Provider) publish(event events.Event) {
 		return
 	}
 	out <- event
+}
+
+func (p *Provider) configureSession(ctx context.Context, session *Session, opts runtime.StartOptions) error {
+	if opts.Model != "" {
+		if err := session.Client.SetSessionModel(ctx, session.SessionID, opts.Model); err != nil {
+			return fmt.Errorf("set session model %q: %w", opts.Model, err)
+		}
+	}
+	if opts.Agent != "" {
+		if err := session.Client.SetSessionMode(ctx, session.SessionID, opts.Agent); err != nil {
+			return fmt.Errorf("set session agent %q: %w", opts.Agent, err)
+		}
+	}
+	return nil
 }
 
 func (p *Provider) session(sessionID string) (*Session, error) {
