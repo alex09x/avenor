@@ -37,4 +37,7 @@ func TestNewProviderUnknown(t *testing.T) {
 	if err == nil {
 		t.Fatal("NewProvider(unknown) expected error")
 	}
+	if err.Error() != `unknown backend "unknown"` {
+		t.Fatalf("NewProvider(unknown) error = %q, want %q", err.Error(), `unknown backend "unknown"`)
+	}
 }

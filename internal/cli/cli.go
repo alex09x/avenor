@@ -21,7 +21,11 @@ import (
 	"github.com/sdougbrown/avenor/internal/runtime"
 )
 
-const defaultBackend = "opencode-acp"
+const (
+	defaultBackend    = "opencode-acp"
+	backendOpenCodeACP = "opencode-acp"
+	backendOpenCodeHTTP = "opencode-http"
+)
 
 // DefaultPermissionClaimTimeout is the default value for --permission-claim-timeout:
 // how long resolvePermission will wait for a connected socket client to send
@@ -113,13 +117,14 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	}
 
 	switch *backend {
-	case "opencode-acp", "opencode-http":
+	case backendOpenCodeACP:
+	case backendOpenCodeHTTP:
+		if *serverURL == "" {
+			fmt.Fprintf(stderr, "avenor: --server-url is required for backend opencode-http\n")
+			return exitWithSentinel(1)
+		}
 	default:
 		fmt.Fprintf(stderr, "avenor: unknown backend %q\n", *backend)
-		return exitWithSentinel(1)
-	}
-	if *backend == "opencode-http" && *serverURL == "" {
-		fmt.Fprintf(stderr, "avenor: --server-url is required for backend opencode-http\n")
 		return exitWithSentinel(1)
 	}
 	if *prompt != "" && *promptFile != "" {

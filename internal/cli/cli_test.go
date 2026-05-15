@@ -1375,7 +1375,7 @@ func TestRunBackendOpenCodeACP(t *testing.T) {
 		retryAfter = oldRetryAfter
 	})
 
-	called := false
+	var gotBackend string
 	runAttempt = func(
 		ctx context.Context,
 		startOptions runtime.StartOptions,
@@ -1392,7 +1392,7 @@ func TestRunBackendOpenCodeACP(t *testing.T) {
 		timer <-chan time.Time,
 		stderr io.Writer,
 	) attemptResult {
-		called = true
+		gotBackend = backend
 		return attemptResult{exitCode: 0}
 	}
 	retryAfter = func(time.Duration) <-chan time.Time { return make(chan time.Time) }
@@ -1411,8 +1411,8 @@ func TestRunBackendOpenCodeACP(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("run() = %d, want 0; stderr=%s", code, stderr.String())
 	}
-	if !called {
-		t.Fatal("runAttempt was not called; backend opencode-acp was rejected")
+	if gotBackend != "opencode-acp" {
+		t.Fatalf("runAttempt backend = %q, want %q", gotBackend, "opencode-acp")
 	}
 }
 
@@ -1424,7 +1424,7 @@ func TestRunBackendOpenCodeHTTPWithServerURL(t *testing.T) {
 		retryAfter = oldRetryAfter
 	})
 
-	called := false
+	var gotBackend string
 	runAttempt = func(
 		ctx context.Context,
 		startOptions runtime.StartOptions,
@@ -1441,7 +1441,7 @@ func TestRunBackendOpenCodeHTTPWithServerURL(t *testing.T) {
 		timer <-chan time.Time,
 		stderr io.Writer,
 	) attemptResult {
-		called = true
+		gotBackend = backend
 		return attemptResult{exitCode: 0}
 	}
 	retryAfter = func(time.Duration) <-chan time.Time { return make(chan time.Time) }
@@ -1461,8 +1461,8 @@ func TestRunBackendOpenCodeHTTPWithServerURL(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("run() = %d, want 0; stderr=%s", code, stderr.String())
 	}
-	if !called {
-		t.Fatal("runAttempt was not called; backend opencode-http with --server-url was rejected")
+	if gotBackend != "opencode-http" {
+		t.Fatalf("runAttempt backend = %q, want %q", gotBackend, "opencode-http")
 	}
 }
 
