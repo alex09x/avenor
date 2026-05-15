@@ -18,14 +18,11 @@ func TestNewProviderAcp(t *testing.T) {
 
 func TestNewProviderHTTP(t *testing.T) {
 	p, err := NewProvider(runtime.StartOptions{}, "opencode-http")
-	if p != nil {
-		t.Fatal("NewProvider(http) expected nil provider")
+	if err != nil {
+		t.Fatalf("NewProvider(http) error = %v", err)
 	}
-	if err == nil {
-		t.Fatal("NewProvider(http) expected error")
-	}
-	if err.Error() != "opencode-http backend not yet implemented" {
-		t.Fatalf("NewProvider(http) error = %q, want %q", err.Error(), "opencode-http backend not yet implemented")
+	if p == nil {
+		t.Fatal("NewProvider(http) provider is nil")
 	}
 }
 
