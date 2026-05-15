@@ -21,7 +21,7 @@ type Provider struct {
 
 	mu            sync.Mutex
 	client        *Client
-	events        chan events.Event
+	started       bool
 	streamCancel  context.CancelFunc
 	sessions      map[string]sessionState
 	subscribers   map[chan events.Event]string
@@ -60,6 +60,10 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	if err != nil {
 		return runtime.Session{}, err
 	}
+	// Persist ServerURL so Resume works after Start-only URL provision.
+	p.mu.Lock()
+	p.opts.ServerURL = merged.ServerURL
+	p.mu.Unlock()
 
 	sessionID, err := c.CreateSession(ctx)
 	if err != nil {
@@ -146,7 +150,7 @@ func (p *Provider) Cancel(ctx context.Context, sessionID string) error {
 
 func (p *Provider) Events(ctx context.Context, sessionID string) (<-chan events.Event, error) {
 	p.mu.Lock()
-	if p.events == nil {
+	if !p.started {
 		p.mu.Unlock()
 		return nil, errors.New("provider has not been started")
 	}
@@ -230,7 +234,7 @@ func (p *Provider) ensureClient(ctx context.Context, opts runtime.StartOptions) 
 		return p.client, nil
 	}
 	p.client = client
-	p.events = make(chan events.Event, 256)
+	p.started = true
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	p.streamCancel = streamCancel
 
@@ -243,8 +247,8 @@ func (p *Provider) streamEvents(ctx context.Context, c *Client) {
 	defer func() {
 		p.mu.Lock()
 		p.streamCancel = nil
+		p.started = false
 		p.closeSubscribersLocked()
-		p.events = nil
 		p.mu.Unlock()
 	}()
 
@@ -421,9 +425,10 @@ func mapModel(model string) map[string]string {
 func clientOptionsFromURL(rawURL string) (ClientOptions, string) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		// Parse failure: return a generic placeholder to avoid leaking
-		// rawURL (which may contain credentials) into error messages.
-		return ClientOptions{BaseURL: rawURL}, "(invalid url)"
+		// Parse failure: return empty BaseURL and placeholder to avoid
+		// leaking rawURL (which may contain credentials) into error
+		// messages or network-level error strings.
+		return ClientOptions{}, "(invalid url)"
 	}
 	co := ClientOptions{}
 	if u.User != nil {

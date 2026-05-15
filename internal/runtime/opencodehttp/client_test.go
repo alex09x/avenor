@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/runtime"
 )
 
@@ -261,7 +260,7 @@ func TestMapModelFromProvider(t *testing.T) {
 	c := NewClient(ClientOptions{BaseURL: srv.URL})
 	prov.mu.Lock()
 	prov.client = c
-	prov.events = make(chan events.Event, 1)
+	prov.started = true
 	prov.mu.Unlock()
 
 	if err := prov.Prompt(context.Background(), "ses_test", "hello"); err != nil {

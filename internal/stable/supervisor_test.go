@@ -100,7 +100,9 @@ func TestSpawnParamsValidation(t *testing.T) {
 	// Dir defaults to ".", so this shouldn't error on validation alone
 	// It might fail on starting the acp session though
 
-	// opencode-http without server_url
+	// opencode-http without server_url — unset env to avoid accidental
+	// resolution via AVENOR_OPENCODE_URL.
+	t.Setenv("AVENOR_OPENCODE_URL", "")
 	_, err = sup.spawn(SpawnParams{
 		Prompt:  "hello",
 		Dir:     "/tmp",

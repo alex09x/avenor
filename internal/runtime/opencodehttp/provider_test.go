@@ -203,7 +203,7 @@ func TestEventsBroadcastToConcurrentSubscribers(t *testing.T) {
 	}
 	prov := p.(*Provider)
 	prov.mu.Lock()
-	prov.events = make(chan events.Event, 1)
+	prov.started = true
 	prov.mu.Unlock()
 
 	ctxA, cancelA := context.WithCancel(context.Background())
@@ -382,7 +382,7 @@ func TestPublishDropsSlowSubscriberWithoutBlocking(t *testing.T) {
 	}
 	prov := p.(*Provider)
 	prov.mu.Lock()
-	prov.events = make(chan events.Event, 1)
+	prov.started = true
 	slow := make(chan events.Event)
 	prov.subscribers[slow] = "ses_test"
 	prov.mu.Unlock()
