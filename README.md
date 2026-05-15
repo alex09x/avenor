@@ -59,6 +59,16 @@ avenor control --socket /tmp/avenor-stable.sock shutdown graceful
 
 The socket also speaks newline-delimited JSON-RPC 2.0 directly, and `--http-debug` can expose loopback-only HTTP/SSE endpoints for debugging. See [docs/control-protocol.md](docs/control-protocol.md) for the full method list, event stream, ownership rules, permission precedence, and HTTP debug surface.
 
+## Phase loops
+
+When a single prompt isn't enough — build once, then test → review → fix until clean — define a loop config and let Avenor run the phases:
+
+```bash
+avenor run --loop-file loop.json --auto-approve --sentinel-file run.done
+```
+
+Phases emit `[loop: exit]` to finish clean or `[loop: abort | reason]` to escalate. Pre phases run once. Loop phases repeat until exit, abort, or `max_iterations`. The same `avenor stable` supervisor spawns loop runs via `loop_file` in the spawn params. See [docs/loop.md](docs/loop.md) for the full config reference, prompt templates, lifecycle events, and abort mechanics.
+
 ## Consumer integration
 
 If you want to see Avenor from the consumer side, [sdougbrown/.botfiles](https://github.com/sdougbrown/.botfiles) is the reference harness. For the surrounding event model and loop mechanics, see [docs/events.md](docs/events.md), [docs/loop.md](docs/loop.md), [docs/plan.md](docs/plan.md), and [docs/backends.md](docs/backends.md).

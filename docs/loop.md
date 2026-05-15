@@ -1,32 +1,21 @@
 # Avenor: Phase Loop
 
-An optional multi-phase execution model where Avenor runs a sequence of agent
-sessions — some once, some repeatedly — until a loop exit condition is met.
-
----
+When you need to run a sequence of agent sessions — some once, some
+repeatedly — and have Avenor manage the iteration, exit conditions, and
+handoff between them.
 
 ## Problem
 
-A single-prompt run is sufficient for simple tasks but inadequate for workflows
-that naturally alternate between phases: build once, then test → review →
-fix until clean. Today this requires an external shell script that calls
-`avenor run` repeatedly and glues the results together with bespoke logic.
-Avenor is already the right place to own that loop because it holds the
-run ID, event log, sentinel, and retry machinery.
+A single `avenor run` handles one task well, but real workflows alternate
+between phases: build once, then test → review → fix until clean. Doing
+this today means an external shell script calling `avenor run` in a loop,
+gluing results together with bespoke logic. Avenor already holds the run
+ID, event log, sentinel, and retry machinery — it's the right place to own
+the loop.
 
----
+## Quick start
 
-## Design Overview
-
-A **loop config file** (JSON) defines a sequence of named phases, split into:
-
-- **`pre`**: phases that run once before the loop starts (e.g. build).
-- **`loop`**: phases that repeat until an exit condition fires.
-
-Each phase is one Avenor agent session. Phases run serially. The same event
-log, run ID, and permission handler are shared across all phases.
-
-### Example config
+Create a loop config file:
 
 ```json
 {
@@ -43,222 +32,184 @@ log, run ID, and permission handler are shared across all phases.
       "prompt": "Run the test suite. If all tests pass, emit [loop: exit | tests green]. Otherwise report the failures."
     },
     {
-      "name": "review",
-      "prompt": "Review all changes made since the initial task. Write a concise findings list to REVIEW_FINDINGS.md."
-    },
-    {
-      "name": "verify",
-      "prompt": "Read REVIEW_FINDINGS.md. If all items are resolved emit [loop: exit | verified clean]. Otherwise leave the file updated with remaining issues."
-    },
-    {
       "name": "fix",
-      "prompt": "Read REVIEW_FINDINGS.md and address each remaining item."
+      "prompt": "Fix the test failures reported in the previous phase."
     }
   ]
 }
 ```
 
-### Minimal invocation
+Run it:
 
 ```bash
-avenor run \
-  --loop-file loop.json \
-  --auto-approve \
-  --sentinel-file run.done
+avenor run --loop-file loop.json --auto-approve --sentinel-file run.done
 ```
 
-`--prompt` / `--prompt-file` are **not required** when `--loop-file` is set.
-They remain valid and, when provided, run as an implicit pre-phase before
-any phases defined in the config.
+That's it. Avenor runs `build` once, then repeats `test` → `fix` until the
+test phase emits `[loop: exit]` or five iterations pass.
 
----
+`--prompt` and `--prompt-file` are optional when `--loop-file` is set. If
+you provide one, it runs as an implicit pre-phase (named `(initial)`)
+before any phases in the config.
 
-## Exit Conditions
+## Loop config file
 
-A loop stops when any of the following fires:
+A JSON file with three top-level keys:
 
-| Condition | Evaluated | Trigger |
-|---|---|---|
-| **Exit marker** | After phase ends | Any phase agent emits `[loop: exit]` or `[loop: exit \| label]` |
-| **Abort marker** | After phase ends | Any phase agent emits `[loop: abort]` or `[loop: abort \| reason]` |
-| **Max iterations** | After last loop phase | `iteration_count >= max_iterations` |
-| **Phase failure** | Immediately | Any phase exits with a non-clean stop reason |
-| **Cancellation / timeout** | Immediately | Existing signal/timer path, unchanged |
+| Key | Type | Required | Description |
+|---|---|---|---|
+| `pre` | `Phase[]` | At least one of `pre` or `loop` must be non-empty | Phases that run once, in order, before the loop |
+| `loop` | `Phase[]` | At least one of `pre` or `loop` must be non-empty | Phases that repeat until an exit condition fires |
+| `max_iterations` | `int` | No — defaults to `10` | Maximum loop iterations. Must be ≥ 1 when `loop` is non-empty |
 
-"Clean" is `stop_reason == "end_turn"`. All other terminal stop reasons
-propagate immediately and stop the loop.
+### Phase fields
 
-Both `exit` and `abort` are evaluated at phase-end (not mid-stream): the
-phase always runs to the natural end of its session before the loop acts on
-the marker. This gives the agent time to write findings, explain its
-reasoning, or clean up before control returns to Avenor. The distinction
-between the two is in the outcome — exit is a success signal, abort is an
-escalation signal.
+Each phase object requires:
 
----
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | `string` | Yes | Unique within the config. Reserved: `(initial)` |
+| `prompt` | `string` | Yes | The prompt sent to the agent. Supports template variables |
+| `resume_from_previous` | `boolean` | No — defaults to `false` | Resume the immediately preceding phase's session instead of starting fresh |
 
-## Loop Markers
+Phase names must be unique across `pre` and `loop`. The name `(initial)` is
+reserved for the implicit pre-phase created when you pass `--prompt` or
+`--prompt-file` alongside `--loop-file`.
 
-Extends the existing `[status: ...]` marker convention in
-`internal/digest/marker.go`.
+## Pre vs loop phases
+
+**Pre phases** run once, before the loop starts. If any pre phase exits
+with a stop reason other than `end_turn`, the entire run fails immediately
+— the loop never begins.
+
+**Loop phases** run in sequence from top to bottom, then repeat from the
+top. The loop stops when:
+
+- A phase agent emits `[loop: exit]` — clean completion
+- A phase agent emits `[loop: abort]` — blocked, needs escalation
+- The iteration count reaches `max_iterations`
+- Any phase exits with a non-clean stop reason
+- The run is cancelled or times out
+
+Phases always run to the natural end of their session before Avenor acts on
+a marker. This gives the agent time to write findings or clean up before
+control returns to the loop runner.
+
+## Loop markers
+
+Agents signal loop control by emitting specially formatted lines in their
+output:
 
 ```
-[loop: exit]                    ← clean completion, stop iterating
-[loop: exit | tests green]      ← with label
-[loop: continue]                ← explicit no-op, for readability in prompts
-[loop: abort]                   ← blocked, needs escalation
+[loop: exit]                    clean completion, stop iterating
+[loop: exit | tests green]      with label
+[loop: continue]                explicit no-op (for readability in prompts)
+[loop: abort]                   blocked, needs escalation
 [loop: abort | architectural issue: layering violation in pkg/db]
 ```
 
-`ExtractLoopMarker(text string) (directive, label string, ok bool)`:
+### Format rules
 
-- `directive` is one of `"exit"`, `"continue"`, `"abort"`.
-- `ok=true` only for known directives; unknown words → `ok=false`, ignored.
-- If multiple markers appear in one chunk the first wins (consistent with
-  status marker behaviour).
+- Case-insensitive directive word (`exit`, `abort`, `continue`)
+- Optional pipe-separated label after the directive
+- The line must match the whole-line pattern — markers embedded in prose are ignored
+- Markers inside fenced code blocks (` ``` ` or `~~~`) are ignored
+- Unknown directive words are silently ignored (not treated as markers)
 
-Extraction is done inside `waitForSession` on the same chunk events already
-scanned for `[status: ...]`. The marker is **not** stripped from the forwarded
-event — raw text consumers still see it.
+### Severity and priority
 
-The most severe marker seen during a phase wins: `abort` > `exit` > `continue`.
-If a phase emits `[loop: exit]` and later `[loop: abort]` in the same session,
-the phase is treated as aborted.
+When multiple markers appear in the same phase session, the most severe
+wins: **abort > exit > continue**. If a phase emits `[loop: exit]` and
+later `[loop: abort]`, the phase is treated as aborted.
 
----
+Avenor extracts loop markers from the same chunk events already scanned for
+`[status: ...]` markers. The marker text is **not** stripped from the
+forwarded event — raw text consumers still see it.
 
-## Phase Abort
+## Abort and escalation
 
-An agent emits `[loop: abort | reason]` when it has discovered something it
-cannot resolve on its own — an architectural constraint violation, a decision
-that requires human judgement, or a dependency on another agent's output that
-isn't available.
+An agent emits `[loop: abort | reason]` when it discovers something it
+cannot resolve on its own — an architectural constraint, a decision
+requiring human judgement, or a dependency on another agent's unavailable
+output.
 
-The abort path diverges from the exit path in three ways:
+When a phase aborts:
 
-**1. Outcome: blocked, not success.**
-The loop stops and Avenor writes a `BLOCKED` sentinel (exit code `5`). The
-harness or orchestrating agent reads the sentinel and decides next steps —
-route to a human, invoke a different agent, or re-invoke Avenor with a
-modified prompt. Avenor does not attempt another iteration or retry.
+1. **The loop stops.** No further iterations or retries.
 
-**2. Reason is preserved.**
-The abort label from the marker is carried through the `avenor.phase.end`
-event and the `avenor.loop.end` event, and into the sentinel as a `REASON=`
-line. Harnesses can gate on this without parsing event logs.
+2. **A `BLOCKED` sentinel is written.** Exit code `5`, stop reason
+   `"blocked"`. The abort label is preserved as a `REASON=` line:
 
-**3. Exit code `5` (blocked).**
-Added to `internal/runtime/exit.go` alongside the existing stop-reason map:
-- `StopReasonForExitCode(5) → "blocked"`
-- `ExitCodeForStopReason("blocked") → 5`
+   ```
+   BLOCKED
+   SESSION=ses_abc123
+   STOP_REASON=blocked
+   REASON=architectural issue: layering violation in pkg/db
+   RUN=a3f9...
+   ```
 
-Sentinel format for a blocked run:
-```
-BLOCKED
-SESSION=ses_abc123
-STOP_REASON=blocked
-REASON=architectural issue: layering violation in pkg/db
-RUN=a3f9...
-```
+   The `REASON=` line is omitted when the marker has no label (`[loop: abort]`
+   with no pipe).
 
-The `REASON` line is omitted when the marker had no label (`[loop: abort]`
-with no pipe).
+3. **The `avenor.loop.end` event** carries `exit_reason: "abort"` and
+   `exit_label` set to the abort reason.
 
 ### Inter-agent escalation pattern
 
-A jockey watching a mule's event log via `--on-event` sees the
-`avenor.loop.end` event with `exit_reason: "abort"` and `exit_label` carrying
-the reason. The jockey can then:
-- Surface the reason to a human via a tool call or message.
-- Invoke a specialist agent with the abort label as its prompt context.
-- Re-invoke the original mule with an amended prompt that addresses the blocker.
+An orchestrating agent (jockey) watching a worker's event log via
+`--on-event` sees the `avenor.loop.end` event with `exit_reason: "abort"`.
+The jockey can:
 
-No new Avenor mechanism is required for the jockey side — reading `exit_reason`
-from the event stream is sufficient.
+- Surface the reason to a human
+- Invoke a specialist agent with the abort label as prompt context
+- Re-invoke the original worker with an amended prompt that addresses the blocker
 
----
+No new Avenor mechanism is needed on the jockey side — reading
+`exit_reason` and `exit_label` from the event stream is enough.
 
-## Phase Execution Model
+## Prompt templates
 
-Each phase is one call to `runSingleAttempt` with a fresh provider. By
-default sessions are independent: the phase prompt is the sole input, and
-context flows through agent-managed artefacts (files the agent writes and
-subsequent agents read).
+Phase prompts support Go `text/template` syntax. Avenor provides the
+values; you decide how to use them. Template rendering happens per phase,
+per iteration — variables reflect the current state at the moment the
+phase begins.
 
-### `resume_from_previous`
-
-An optional per-phase boolean flag:
-
-```json
-{ "name": "verify", "prompt": "...", "resume_from_previous": true }
-```
-
-When set, the loop runner passes the previous phase's session ID as the
-resume ID, using the same `provider.Resume` path as `--resume` today. The
-phase agent starts with full visibility into the preceding phase's message
-history — its reasoning, tool calls, and output — without needing to
-re-read files or reconstruct context from handoff artefacts.
-
-**Default is `false` (fresh session).** Fresh is the right default because
-context accumulates: by iteration 3 of a 4-phase loop a naively resumed
-session carries 7+ phases of history, most of which is noise relative to
-the current task. `resume_from_previous` opts in for phases where the
-reasoning handoff genuinely matters.
-
-Accumulation is bounded by design. Each phase that sets
-`resume_from_previous: true` extends only its immediate predecessor's
-session, not a chain running back to the start of the loop. Phase N resumes
-phase N-1; if phase N+1 also sets the flag it resumes phase N (which
-already incorporated N-1). The context window grows, but only one phase at
-a time, and the prompt author controls which phases participate.
-
-**When to use it:** tightly coupled adjacent phases where agent-managed
-files are a lossy handoff — for example a `review → verify` pair where the
-verify agent benefits from the full reasoning behind each finding, not just
-the summary written to `REVIEW_FINDINGS.md`. Phases with naturally
-self-contained prompts (build, test, fix) rarely need it.
-
-`resume_from_previous` is silently ignored on the first loop iteration and
-on all pre-phases (there is no preceding phase session to resume from).
-
-### Prompt templates
-
-Phase prompts support template variables (Go `text/template` syntax). Avenor
-provides the values; the prompt author decides how to use them.
-
-#### Run context
+### Run context variables
 
 | Variable | Value |
 |---|---|
 | `{{.RunID}}` | The run's correlation ID |
 | `{{.Phase}}` | Current phase name |
-| `{{.Iteration}}` | Current loop iteration (1-indexed; 0 for pre-phases) |
+| `{{.Iteration}}` | Current loop iteration (1-indexed; `0` for pre-phases) |
 | `{{.MaxIterations}}` | Value of `max_iterations` |
 | `{{.WorkDir}}` | Working directory |
 
-#### Delta context
+```json
+{
+  "name": "status",
+  "prompt": "Report progress. (Phase {{.Phase}}, iteration {{.Iteration}} of {{.MaxIterations}})"
+}
+```
 
-These variables are populated only when running inside a git repository and
-only from iteration 2 onwards (empty string on the first iteration).
+### Git delta variables
+
+Populated only when running inside a git repository and only when a
+previous phase commit exists (empty string otherwise):
 
 | Variable | Value |
 |---|---|
-| `{{.PrevPhaseCommit}}` | The git commit SHA at the end of the previous phase |
+| `{{.PrevPhaseCommit}}` | Git commit SHA at the end of the previous phase |
 | `{{.DiffStat}}` | Output of `git diff --stat <prev-commit>..HEAD` |
-| `{{.ChangedFiles}}` | Newline-separated list of files changed since `PrevPhaseCommit` |
+| `{{.ChangedFiles}}` | Newline-separated list of files changed since previous phase |
 
-Avenor snapshots `git rev-parse HEAD` immediately after each phase session
-ends and stores it as the reference point for the next phase. The reference
-moves forward with each phase — it always reflects what the immediately
-preceding phase left behind, not the start of the loop.
+Avenor snapshots `git rev-parse HEAD` after each phase and uses that
+snapshot as the reference point for the next phase. The reference moves
+forward — it reflects what the immediately preceding phase left behind, not
+the start of the loop.
 
-Delta variables are provided as informational context. Avenor does not use
-them to restrict what the agent can see or do. The prompt author decides the
-scoping strategy: they might instruct the agent to focus on changed files,
-to use the diff as a starting point but scan the whole codebase for
-knock-ons, or to ignore the delta entirely. A review prompt that narrows
-purely to changed files risks missing knock-on effects in unmodified code;
-that tradeoff belongs to the prompt, not to Avenor.
+Delta variables are informational context. Avenor does not use them to
+restrict what the agent can see or do. The scoping strategy belongs to your
+prompt:
 
 ```json
 {
@@ -267,15 +218,54 @@ that tradeoff belongs to the prompt, not to Avenor.
 }
 ```
 
----
+## resume_from_previous
 
-## Synthetic Events
+By default each phase starts a fresh session — the phase prompt is the sole
+input, and context flows through agent-managed files that one agent writes
+and the next reads.
 
-All loop events carry `run_id`, `ts`, and `phase` fields.
+`resume_from_previous` opts a phase into resuming the immediately preceding
+phase's session. The phase agent starts with full visibility into that
+session's message history — its reasoning, tool calls, and output — without
+needing to reconstruct context from handoff artefacts.
 
-### `avenor.loop.start`
+```json
+{ "name": "verify", "prompt": "...", "resume_from_previous": true }
+```
 
-Emitted once before the first pre-phase (or loop phase if no pre).
+**Default is `false` (fresh session).** Fresh is the right default because
+context accumulates. `resume_from_previous` is for tightly coupled adjacent
+phases where agent-managed files are a lossy handoff — for example, a
+`review → verify` pair where the verify agent benefits from the full
+reasoning behind each finding, not just the summary written to a file.
+
+Accumulation is bounded: each phase that sets the flag extends only its
+immediate predecessor's session, not a chain running back to the start of
+the loop. Phase N resumes phase N-1; if phase N+1 also sets the flag it
+resumes phase N (which already incorporated N-1). The context window grows,
+but only one phase at a time, and you control which phases participate.
+
+### When not to use it
+
+- Phases with naturally self-contained prompts (build, test, fix) rarely need it.
+- When the flag is set for the first phase of the loop (index 0), it is
+  silently ignored — there is no preceding phase to resume from.
+- When set on a pre phase, it is silently ignored — pre phases always start
+  fresh.
+- On the first loop iteration, only the first phase is affected; subsequent
+  loop phases in the same iteration *can* resume from their predecessor
+  within that iteration.
+
+## Lifecycle events
+
+Avenor emits four synthetic events during a loop run. All carry `run_id`,
+`ts`, and phase-related fields. Subscribe with `--on-event` to receive
+them as NDJSON.
+
+### avenor.loop.start
+
+Emitted once before the first pre-phase (or the first loop phase if there
+are no pre phases).
 
 ```json
 {
@@ -283,11 +273,12 @@ Emitted once before the first pre-phase (or loop phase if no pre).
   "run_id": "a3f9...",
   "ts": 1715000000000,
   "max_iterations": 5,
-  "phase_count": 4
+  "pre_phase_count": 1,
+  "loop_phase_count": 4
 }
 ```
 
-### `avenor.phase.start`
+### avenor.phase.start
 
 Emitted immediately before each phase's session begins.
 
@@ -302,11 +293,12 @@ Emitted immediately before each phase's session begins.
 }
 ```
 
-`kind` is `"pre"` or `"loop"`.
+`kind` is `"pre"` or `"loop"`. `iteration` is 0 for pre-phases, 1-indexed
+for loop phases.
 
-### `avenor.phase.end`
+### avenor.phase.end
 
-Emitted after each phase's session ends (before any backoff/retry).
+Emitted after each phase's session ends (before any backoff or retry).
 
 ```json
 {
@@ -321,7 +313,7 @@ Emitted after each phase's session ends (before any backoff/retry).
 }
 ```
 
-Marker fields present only when a marker fired in this phase:
+Marker fields appear only when a marker fired during the phase:
 
 | Field | Present when |
 |---|---|
@@ -330,13 +322,12 @@ Marker fields present only when a marker fired in this phase:
 | `abort_marker: true` | `[loop: abort]` was seen |
 | `abort_marker_label` | abort marker had a label |
 
-`abort_marker` takes priority: if both appear in the same phase session,
-only the abort fields are set and the loop exits with the blocked outcome.
+If both markers appear in the same phase, only the abort fields are set
+(abort takes priority).
 
-### `avenor.loop.end`
+### avenor.loop.end
 
-Emitted once after the loop (or pre sequence) finishes, regardless of how it
-ended — success, abort, failure, or limit.
+Emitted once after the loop finishes, regardless of how it ended.
 
 ```json
 {
@@ -349,38 +340,36 @@ ended — success, abort, failure, or limit.
 }
 ```
 
-`exit_reason` is one of: `marker`, `abort`, `max_iterations`, `phase_failure`,
-`cancelled`, `timeout`.
+`exit_reason` is one of:
 
-`exit_label` carries the label from the winning marker when `exit_reason` is
-`marker` or `abort`; absent otherwise.
+| Value | Meaning |
+|---|---|
+| `marker` | A phase emitted `[loop: exit]` |
+| `abort` | A phase emitted `[loop: abort]` |
+| `max_iterations` | Loop reached `max_iterations` with no exit marker |
+| `phase_failure` | A phase exited with a non-clean stop reason |
+| `cancelled` | Run was cancelled (SIGINT) |
+| `timeout` | `--timeout` was reached |
+| `end_turn` | Pre phases completed but no loop phases were defined |
 
-### Classify / digest
+`exit_label` carries the label from the winning marker when `exit_reason`
+is `marker` or `abort`; absent otherwise.
 
-| Event | Class | Excerpt |
-|---|---|---|
-| `avenor.loop.start` | MILESTONE | `"loop start, max_iterations=N"` |
-| `avenor.phase.start` | ACTIVITY | `"phase: <name> (iter N)"` |
-| `avenor.phase.end` | MILESTONE | `"phase: <name> → <stop_reason>"` |
-| `avenor.loop.end` | MILESTONE | `"loop end: <exit_reason>"` (e.g. `"loop end: abort"`) |
+## Sentinel outcomes
 
----
-
-## Sentinel Behaviour
-
-`writeSentinel` fires once after the entire loop finishes, not after each
-phase. The exit code reflects the loop's overall outcome:
+A single sentinel is written after the entire loop finishes (not after each
+phase). The exit code reflects the loop's overall outcome:
 
 | Outcome | Status | Exit code |
 |---|---|---|
 | Clean exit (marker or max_iterations) | `DONE` | `0` |
 | Abort marker | `BLOCKED` | `5` |
-| Phase non-clean stop | `FAILED` | phase exit code |
+| Phase non-clean stop | `FAILED` | Phase exit code |
 | Timeout | `TIMEOUT` | `124` |
 | Cancellation | `KILLED` | `130` |
 
-The `BLOCKED` sentinel includes a `REASON=` line when the abort marker carried
-a label:
+For the `BLOCKED` sentinel, a `REASON=` line is included when the abort
+marker carried a label:
 
 ```
 BLOCKED
@@ -390,117 +379,96 @@ REASON=architectural issue: layering violation in pkg/db
 RUN=a3f9...
 ```
 
-Exit code `5` is added to `internal/runtime/exit.go`:
-- `StopReasonForExitCode(5) → "blocked"`
-- `ExitCodeForStopReason("blocked") → 5`
-- `sentinelContent` gains a `case 5:` branch producing the `BLOCKED` prefix.
+If you need per-phase sentinels (for external monitoring), subscribe to
+`avenor.phase.end` events via `--on-event` and write your own markers.
+Avenor does not provide per-phase sentinels.
 
-If a sentinel is wanted per phase (e.g. for external monitoring), the calling
-harness can subscribe to `avenor.phase.end` events via `--on-event` and write
-its own markers. Avenor does not provide per-phase sentinels.
-
----
-
-## Config Validation
-
-On load, before any phase runs:
-
-- `loop` and `pre` may each be empty but both absent is an error.
-- `max_iterations` must be ≥ 1 when `loop` is non-empty. Default: `10`.
-- Each phase must have a non-empty `name` and a non-empty `prompt`.
-- Phase names must be unique within the config.
-- `--prompt` / `--prompt-file` with `--loop-file` inserts an unnamed pre-phase
-  at index 0 with no special name (emitted as `phase: "(initial)"`).
-
----
-
-## CLI Changes
+## CLI invocation
 
 ```
---loop-file <path>   path to loop config JSON (optional; enables multi-phase mode)
+avenor run --loop-file <path> [other flags...]
 ```
 
-Mutual exclusions when `--loop-file` is set:
+### What's required
 
-- `--resume` is rejected (loop manages session lifecycle).
+`--loop-file` is the path to your loop config JSON. When set, `--prompt`
+and `--prompt-file` become optional. If you provide one, it runs as an
+implicit pre-phase named `(initial)` before any config-defined phases.
 
-All other flags (`--agent`, `--dir`, `--model`, `--timeout`, `--max-retries`,
-`--auto-approve`, `--permission-handler`, `--sentinel-file`, `--on-event`,
-`--run-id`) apply uniformly to all phases.
+### Mutual exclusions
 
----
+- `--loop-file` and `--resume` are mutually exclusive. The loop runner
+  manages session lifecycle internally; it rejects external resume requests.
 
-## Implementation Plan
+### Shared flags
 
-### Files to create
+All other `avenor run` flags apply uniformly across every phase:
+`--agent`, `--dir`, `--model`, `--timeout`, `--max-retries`,
+`--auto-approve`, `--permission-handler`, `--sentinel-file`,
+`--on-event`, `--run-id`, `--control-socket`.
 
-| File | Purpose |
-|---|---|
-| `internal/cli/loop.go` | `LoopConfig`, `Phase` structs (including `ResumeFromPrevious bool`); JSON loading; template rendering; git snapshot helper; `runLoop` orchestrator |
-| `internal/digest/loopmarker.go` | `ExtractLoopMarker(text string) (directive, label string, ok bool)` |
+Retries (`--max-retries`) apply per phase: if a phase exits with code 1
+(transient failure), Avenor retries that phase with exponential backoff
+(2 to 30 seconds) before advancing or failing the loop.
 
-### Files to modify
+## Stable spawn
 
-| File | Change |
-|---|---|
-| `internal/cli/cli.go` | `--loop-file` flag; dispatch to `runLoop` when set |
-| `internal/cli/retry.go` | Extend `attemptResult` with `loopDirective string` and `loopLabel string`; `waitForSession` populates these from the chunk scan |
-| `internal/runtime/exit.go` | Exit code `5` for `"blocked"`; `StopReasonForExitCode` and `ExitCodeForStopReason` cases |
-| `internal/cli/sentinel.go` | `sentinelContent` case 5: `BLOCKED` prefix + optional `REASON=` line; `writeSentinel` accepts optional reason string or the loop runner sets stopReason to `"blocked"` and passes the label separately |
-| `internal/digest/marker.go` | Optional: share regex infrastructure with `loopmarker.go` |
-| `internal/digest/classify.go` | Add cases for the four new event types |
-| `internal/digest/digest.go` | Add excerpts for the four new event types |
+When using `avenor stable`, spawn a loop run by setting `loop_file` in the
+spawn parameters:
 
-### Key data flow for abort
-
-```
-waitForSession  ← sees [loop: abort | reason] in chunk
-    │
-    └─► sets attemptResult.loopDirective = "abort"
-            attemptResult.loopLabel    = "reason"
-
-runSingleAttempt returns attemptResult
-
-runLoop checks result.loopDirective == "abort"
-    │
-    ├─► emit avenor.phase.end { abort_marker: true, abort_marker_label: "..." }
-    ├─► emit avenor.loop.end  { exit_reason: "abort", exit_label: "..." }
-    └─► return exit code 5
-
-exitWithSentinel(5) → writeSentinel writes BLOCKED sentinel
+```json
+{
+  "prompt": "Initial instructions",
+  "loop_file": "loop.json",
+  "dir": "/repo/A",
+  "label": "phase-loop-example"
+}
 ```
 
-### Suggested order
+The supervisor detects the `loop_file` field and routes the spawn through
+the loop runner instead of the normal single-session path.
 
-1. **`loopmarker.go`** — pure function, no dependencies, easy to test first.
-2. **`runtime/exit.go`** — add exit code 5; update `sentinel.go` `case 5:`.
-3. **`retry.go`** — extend `attemptResult`; hook `waitForSession` chunk scan.
-4. **`loop.go` config structs + validation** — JSON decode, template expansion,
-   error cases; no execution yet.
-5. **`loop.go` runLoop orchestrator** — calls `runSingleAttempt` per phase,
-   emits lifecycle events, evaluates exit/abort conditions.
-6. **`cli.go` wiring** — `--loop-file` flag + dispatch.
-7. **`classify.go` + `digest.go`** — mechanical additions after events are defined.
+### What's different from a normal spawn
 
-### Testing
+The `SpawnResult` returned by a loop spawn has an empty `SessionID`:
+```json
+{
+  "runtime_id": "rt_1",
+  "session_id": "",
+  "on_event": "/tmp/avenor-stable/.../events.ndjson",
+  "sentinel_file": "/tmp/avenor-stable/.../sentinel.env"
+}
+```
 
-- `internal/digest/loopmarker_test.go` — covers `[loop: exit]`, `[loop: exit | label]`,
-  `[loop: continue]`, `[loop: abort]`, `[loop: abort | reason]`, abort wins over
-  exit when both appear, unknown directive, malformed.
-- `internal/runtime/exit_test.go` — add `blocked`/`5` to existing tables.
-- `internal/cli/sentinel_test.go` — add `BLOCKED` sentinel case with and without reason.
-- `internal/cli/loop_test.go` — config load/validate (table-driven), template
-  rendering, abort-wins-over-exit priority logic.
-- Integration: the existing `runSingleAttempt` mock surface in `retry_test.go`
-  can be extended to exercise phase sequencing without a live OpenCode process.
+Loop phases each get their own session; those session IDs appear in the
+event stream (`avenor.phase.start`, `avenor.phase.end` events) rather than
+in the spawn result. Other stable operations (cancel, prompt, list) work
+on the runtime as a whole — you cancel the entire loop run, not an
+individual phase.
 
----
+## Config validation
 
-## Out of Scope
+On load, before any phase runs, Avenor validates:
 
-- **Parallel phases** — serial execution is sufficient; parallelism creates
-  coordination problems (shared file writes, event ordering) with unclear
-  benefit for the primary use case.
+- At least one of `pre` or `loop` must be non-empty. An entirely empty
+  config is rejected.
+- `max_iterations` must be ≥ 1 when `loop` is non-empty.
+- Every phase must have a non-empty `name` and a non-empty `prompt`.
+- Phase names must be unique across `pre` and `loop`.
+- The name `(initial)` is reserved and cannot be used explicitly.
+- `--prompt` / `--prompt-file` with `--loop-file` inserts an unnamed
+  pre-phase at index 0 (emitted in events as `phase: "(initial)"`).
+
+If validation fails, Avenor logs the error to stderr, writes a `FAILED`
+sentinel (if `--sentinel-file` is set), and exits with code 1.
+
+## Out of scope
+
+Loop is intentionally single-level and serial. Things not supported:
+
+- **Parallel phases** — serial execution avoids coordination problems
+  (shared file writes, event ordering) with unclear benefit for the primary
+  use case.
 - **Conditional phase skipping** — phases always run in order; skip logic
   belongs in the phase prompt ("if X is already clean, emit [loop: exit]").
 - **Per-phase `--max-retries`** — the existing retry flag applies to each
