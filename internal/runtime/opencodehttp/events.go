@@ -117,6 +117,9 @@ func readSSEEvents(ctx context.Context, r io.Reader, out chan<- events.Event) {
 			}
 
 		case "permission.request":
+			if sid == "" {
+				continue
+			}
 			// Emit permission.request with fields from properties.
 			fields := map[string]any{}
 			for k, v := range raw.Properties {

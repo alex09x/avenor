@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,8 +51,8 @@ func TestCapabilities(t *testing.T) {
 	if caps.Backend != "opencode-http" {
 		t.Errorf("Backend = %q, want %q", caps.Backend, "opencode-http")
 	}
-	if !caps.Permissions {
-		t.Error("Permissions should be true")
+	if caps.Permissions {
+		t.Error("Permissions should be false until HTTP permission behavior is verified")
 	}
 	if !caps.Resume {
 		t.Error("Resume should be true")
@@ -311,5 +313,152 @@ func TestStartHealthUsesCallerContext(t *testing.T) {
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Start error = %v, want context.Canceled", err)
+	}
+}
+
+func TestPromptPublishesSessionEndFromMessageResponse(t *testing.T) {
+	var gotPayload map[string]any
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/global/health":
+			w.WriteHeader(http.StatusOK)
+		case "/event":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			<-r.Context().Done()
+		case "/session":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": "ses_test"})
+		case "/session/ses_test/message":
+			if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"info": map[string]any{"finish": "stop"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p, err := NewWithOptions(runtime.StartOptions{})
+	if err != nil {
+		t.Fatalf("NewWithOptions error = %v", err)
+	}
+	session, err := p.Start(context.Background(), runtime.StartOptions{ServerURL: srv.URL})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	defer p.(*Provider).Close()
+
+	eventCtx, cancelEvents := context.WithCancel(context.Background())
+	defer cancelEvents()
+	ch, err := p.Events(eventCtx, session.SessionID)
+	if err != nil {
+		t.Fatalf("Events error = %v", err)
+	}
+	if err := p.Prompt(context.Background(), session.SessionID, "hello"); err != nil {
+		t.Fatalf("Prompt error = %v", err)
+	}
+	if gotPayload == nil {
+		t.Fatal("server did not receive prompt payload")
+	}
+	select {
+	case evt := <-ch:
+		if evt.Event != "session.end" || evt.Fields["stop_reason"] != "end_turn" {
+			t.Fatalf("event = %+v, want session.end end_turn", evt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for response-derived session.end")
+	}
+}
+
+func TestPublishDropsSlowSubscriberWithoutBlocking(t *testing.T) {
+	p, err := NewWithOptions(runtime.StartOptions{})
+	if err != nil {
+		t.Fatalf("NewWithOptions error = %v", err)
+	}
+	prov := p.(*Provider)
+	prov.mu.Lock()
+	prov.events = make(chan events.Event, 1)
+	slow := make(chan events.Event)
+	prov.subscribers[slow] = "ses_test"
+	prov.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		prov.publish(events.Event{Event: "agent.message_chunk", SessionID: "ses_test"})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("publish blocked on slow subscriber")
+	}
+	prov.mu.Lock()
+	_, ok := prov.subscribers[slow]
+	prov.mu.Unlock()
+	if ok {
+		t.Fatal("slow subscriber was not removed")
+	}
+}
+
+func TestStreamEventsReconnectsAfterDisconnect(t *testing.T) {
+	var eventRequests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/global/health":
+			w.WriteHeader(http.StatusOK)
+		case "/session":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": "ses_test"})
+		case "/event":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			n := eventRequests.Add(1)
+			if n == 1 {
+				fmt.Fprint(w, `data: {"type":"server.heartbeat","properties":{}}`+"\n\n")
+				return
+			}
+			fmt.Fprint(w, `data: {"type":"message.part.delta","properties":{"sessionID":"ses_test","messageID":"msg_1","partID":"prt_1","field":"text","delta":"after reconnect"}}`+"\n\n")
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p, err := NewWithOptions(runtime.StartOptions{})
+	if err != nil {
+		t.Fatalf("NewWithOptions error = %v", err)
+	}
+	session, err := p.Start(context.Background(), runtime.StartOptions{ServerURL: srv.URL})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	defer p.(*Provider).Close()
+
+	eventCtx, cancelEvents := context.WithCancel(context.Background())
+	defer cancelEvents()
+	ch, err := p.Events(eventCtx, session.SessionID)
+	if err != nil {
+		t.Fatalf("Events error = %v", err)
+	}
+	select {
+	case evt := <-ch:
+		if evt.Event != "agent.message_chunk" || evt.Fields["delta"] != "after reconnect" {
+			t.Fatalf("event = %+v, want message chunk after reconnect", evt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for reconnected stream event")
 	}
 }

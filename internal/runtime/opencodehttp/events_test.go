@@ -183,6 +183,16 @@ func TestPermissionRequestMapping(t *testing.T) {
 	}
 }
 
+func TestPermissionRequestWithoutSessionIDIsSkipped(t *testing.T) {
+	feed := sseFeed(
+		`{"type":"permission.request","properties":{"request_id":"req_abc","tool":"bash","options":[{"optionId":"allow","kind":"allow"}]}}`,
+	)
+	evts := collectEvents(t, feed)
+	if len(evts) != 0 {
+		t.Fatalf("got %d events, want none: %+v", len(evts), evts)
+	}
+}
+
 func TestDoubleIdleDoesNotDoubleEmitSessionEnd(t *testing.T) {
 	feed := sseFeed(
 		`{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"busy"}}}`,

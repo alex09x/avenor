@@ -125,8 +125,14 @@ func (p *Provider) Prompt(ctx context.Context, sessionID string, prompt string) 
 	if opts.Model != "" {
 		payload["model"] = mapModel(opts.Model)
 	}
-	_, err = c.SendMessage(ctx, sessionID, payload)
-	return err
+	result, err := c.SendMessage(ctx, sessionID, payload)
+	if err != nil {
+		return err
+	}
+	if evt, ok := messageResultEndEvent(sessionID, result); ok {
+		p.publish(evt)
+	}
+	return nil
 }
 
 func (p *Provider) Cancel(ctx context.Context, sessionID string) error {
@@ -181,7 +187,7 @@ func (p *Provider) AnswerPermission(ctx context.Context, sessionID string, reque
 func (p *Provider) Capabilities(ctx context.Context) (runtime.Capabilities, error) {
 	return runtime.Capabilities{
 		Backend:             backendID,
-		Permissions:         true,
+		Permissions:         false,
 		Resume:              true,
 		ExternalServerURL:   true,
 		SubprocessDiscovery: false,
@@ -229,20 +235,15 @@ func (p *Provider) ensureClient(ctx context.Context, opts runtime.StartOptions) 
 	}
 	p.client = client
 	p.events = make(chan events.Event, 256)
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	p.streamCancel = streamCancel
 
 	// Start the SSE event stream in the background.
-	go p.streamEvents(client)
+	go p.streamEvents(streamCtx, client)
 	return client, nil
 }
 
-func (p *Provider) streamEvents(c *Client) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	p.mu.Lock()
-	p.streamCancel = cancel
-	p.mu.Unlock()
-
+func (p *Provider) streamEvents(ctx context.Context, c *Client) {
 	defer func() {
 		p.mu.Lock()
 		p.streamCancel = nil
@@ -251,23 +252,38 @@ func (p *Provider) streamEvents(c *Client) {
 		p.mu.Unlock()
 	}()
 
-	body, err := c.StreamEvents(ctx)
-	if err != nil {
-		return
-	}
-	defer body.Close()
-
-	rawEvents := make(chan events.Event, 64)
-	go readSSEEvents(ctx, body, rawEvents)
-
+	backoff := 100 * time.Millisecond
 	for {
-		select {
-		case evt, ok := <-rawEvents:
-			if !ok {
+		body, err := c.StreamEvents(ctx)
+		if err != nil {
+			if !sleepOrDone(ctx, backoff) {
 				return
 			}
-			p.publish(evt)
-		case <-ctx.Done():
+			if backoff < time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		backoff = 100 * time.Millisecond
+
+		rawEvents := make(chan events.Event, 64)
+		go readSSEEvents(ctx, body, rawEvents)
+
+		for {
+			select {
+			case evt, ok := <-rawEvents:
+				if !ok {
+					body.Close()
+					goto reconnect
+				}
+				p.publish(evt)
+			case <-ctx.Done():
+				body.Close()
+				return
+			}
+		}
+	reconnect:
+		if !sleepOrDone(ctx, backoff) {
 			return
 		}
 	}
@@ -295,9 +311,62 @@ func (p *Provider) publish(event events.Event) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for ch, sessionID := range p.subscribers {
-		if sessionID == "" || event.SessionID == "" || event.SessionID == sessionID {
-			ch <- event
+		if sessionID == "" || event.SessionID == sessionID {
+			select {
+			case ch <- event:
+			default:
+				delete(p.subscribers, ch)
+				close(ch)
+			}
 		}
+	}
+}
+
+func sleepOrDone(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func messageResultEndEvent(sessionID string, result map[string]any) (events.Event, bool) {
+	info, _ := result["info"].(map[string]any)
+	if info == nil {
+		return events.Event{}, false
+	}
+	stopReason := ""
+	if errObj, _ := info["error"].(map[string]any); errObj != nil {
+		errName, _ := errObj["name"].(string)
+		stopReason = mapErrorToStopReason(errName)
+	}
+	if stopReason == "" {
+		finish, _ := info["finish"].(string)
+		stopReason = mapFinishToStopReason(finish)
+	}
+	if stopReason == "" {
+		return events.Event{}, false
+	}
+	return events.Event{
+		Event:     "session.end",
+		SessionID: sessionID,
+		Fields: map[string]any{
+			"stop_reason": stopReason,
+		},
+	}, true
+}
+
+func mapFinishToStopReason(finish string) string {
+	switch finish {
+	case "stop":
+		return "end_turn"
+	case "":
+		return ""
+	default:
+		return finish
 	}
 }
 

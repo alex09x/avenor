@@ -3,6 +3,7 @@ package opencodehttp
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -278,5 +279,67 @@ func TestMapModelFromProvider(t *testing.T) {
 	}
 	if model["modelID"] != "deepseek-v4-pro" {
 		t.Errorf("modelID = %v, want deepseek-v4-pro", model["modelID"])
+	}
+}
+
+func TestSessionIDsArePathEscaped(t *testing.T) {
+	var gotMessageURI string
+	var gotAbortURI string
+	var gotPermissionURI string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/message"):
+			gotMessageURI = r.RequestURI
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"info": map[string]any{"finish": "stop"}})
+		case strings.HasSuffix(r.URL.Path, "/abort"):
+			gotAbortURI = r.RequestURI
+			w.WriteHeader(http.StatusOK)
+		case strings.Contains(r.URL.Path, "/permissions/"):
+			gotPermissionURI = r.RequestURI
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := NewClient(ClientOptions{BaseURL: srv.URL})
+	sessionID := "ses/with?chars"
+	permissionID := "perm/with?chars"
+	if _, err := client.SendMessage(context.Background(), sessionID, map[string]any{"parts": []any{}}); err != nil {
+		t.Fatalf("SendMessage error = %v", err)
+	}
+	if err := client.Abort(context.Background(), sessionID); err != nil {
+		t.Fatalf("Abort error = %v", err)
+	}
+	if err := client.AnswerPermission(context.Background(), sessionID, permissionID, map[string]any{"outcome": "selected"}); err != nil {
+		t.Fatalf("AnswerPermission error = %v", err)
+	}
+	if gotMessageURI != "/session/ses%2Fwith%3Fchars/message" {
+		t.Fatalf("message URI = %q, want escaped session path", gotMessageURI)
+	}
+	if gotAbortURI != "/session/ses%2Fwith%3Fchars/abort" {
+		t.Fatalf("abort URI = %q, want escaped session path", gotAbortURI)
+	}
+	if gotPermissionURI != "/session/ses%2Fwith%3Fchars/permissions/perm%2Fwith%3Fchars" {
+		t.Fatalf("permission URI = %q, want escaped session and permission path", gotPermissionURI)
+	}
+}
+
+func TestSendMessageErrorBodyIsLimited(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, strings.Repeat("x", 70*1024))
+	}))
+	defer srv.Close()
+
+	client := NewClient(ClientOptions{BaseURL: srv.URL})
+	_, err := client.SendMessage(context.Background(), "ses_test", map[string]any{"parts": []any{}})
+	if err == nil {
+		t.Fatal("SendMessage should fail")
+	}
+	if len(err.Error()) > 66*1024 {
+		t.Fatalf("error length = %d, want bounded response body", len(err.Error()))
 	}
 }

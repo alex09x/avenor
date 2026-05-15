@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -74,7 +75,7 @@ func (c *Client) CreateSession(ctx context.Context) (string, error) {
 
 // GetSession fetches session metadata (used for resume).
 func (c *Client) GetSession(ctx context.Context, sessionID string) (map[string]any, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/session/"+sessionID, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.sessionURL(sessionID), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +102,7 @@ func (c *Client) SendMessage(ctx context.Context, sessionID string, payload map[
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/session/"+sessionID+"/message", bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.sessionURL(sessionID)+"/message", bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +114,7 @@ func (c *Client) SendMessage(ctx context.Context, sessionID string, payload map[
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 		return nil, fmt.Errorf("send message: %s: %s", resp.Status, string(body))
 	}
 	var result map[string]any
@@ -125,7 +126,7 @@ func (c *Client) SendMessage(ctx context.Context, sessionID string, payload map[
 
 // Abort cancels a running message on a session.
 func (c *Client) Abort(ctx context.Context, sessionID string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/session/"+sessionID+"/abort", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.sessionURL(sessionID)+"/abort", nil)
 	if err != nil {
 		return err
 	}
@@ -147,8 +148,7 @@ func (c *Client) AnswerPermission(ctx context.Context, sessionID, permissionID s
 	if err != nil {
 		return err
 	}
-	url := fmt.Sprintf("%s/session/%s/permissions/%s", c.baseURL, sessionID, permissionID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.sessionURL(sessionID)+"/permissions/"+url.PathEscape(permissionID), bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -188,4 +188,8 @@ func (c *Client) setAuth(req *http.Request) {
 	if c.username != "" || c.password != "" {
 		req.SetBasicAuth(c.username, c.password)
 	}
+}
+
+func (c *Client) sessionURL(sessionID string) string {
+	return c.baseURL + "/session/" + url.PathEscape(sessionID)
 }

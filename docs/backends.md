@@ -89,7 +89,7 @@ This is split and sent as `{"providerID":"deepseek","modelID":"deepseek-v4-pro"}
 | Prompt execution | ✓ |
 | Cancel | ✓ (via `POST /session/:id/abort`) |
 | Event streaming | ✓ (SSE over `GET /event`) |
-| Permission relay | ✓ |
+| Permission relay | ✗ (not yet verified) |
 | Model selection | ✓ (set per prompt) |
 | External server URL | ✓ (required) |
 | Subprocess discovery | ✗ |
@@ -97,6 +97,6 @@ This is split and sent as `{"providerID":"deepseek","modelID":"deepseek-v4-pro"}
 ### Known differences from ACP
 
 - **Event stream is global.** The SSE `/event` endpoint delivers events for all sessions on the server. The provider filters by session ID locally.
-- **Session end detection.** Uses `session.status {idle}` + `session.idle` events (ACP uses `session/prompt` response `stopReason`).
+- **Session end detection.** Uses the message response finish status plus SSE `session.status {idle}` / `session.idle` events as a backup signal (ACP uses `session/prompt` response `stopReason`).
 - **Resume.** Checks `GET /session/:id` for existence. No dedicated resume endpoint.
-- **Permissions.** Permission support is mapped from HTTP events when available. The server may auto-approve tools depending on configuration.
+- **Permissions.** Permission request/response behavior has not been verified for HTTP mode yet. The server may auto-approve tools depending on configuration.
