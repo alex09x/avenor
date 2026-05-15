@@ -226,14 +226,16 @@ func TestServerEventsAreSkipped(t *testing.T) {
 	feed := sseFeed(
 		`{"type":"server.connected","properties":{}}`,
 		`{"type":"server.heartbeat","properties":{}}`,
+		`{"type":"session.diff","properties":{"sessionID":"ses_1","diff":[]}}`,
+		`{"type":"session.updated","properties":{"sessionID":"ses_1","info":{"id":"ses_1"}}}`,
 		`{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"busy"}}}`,
 		`{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"idle"}}}`,
 	)
 	evts := collectEvents(t, feed)
-	// Should only get session.end, no server events.
-	for _, e := range evts {
-		if e.Event == "server.connected" || e.Event == "server.heartbeat" {
-			t.Errorf("unexpected event: %s", e.Event)
-		}
+	if len(evts) != 1 {
+		t.Fatalf("got %d events, want exactly 1 (session.end): %+v", len(evts), evts)
+	}
+	if evts[0].Event != "session.end" {
+		t.Errorf("event = %q, want session.end", evts[0].Event)
 	}
 }
