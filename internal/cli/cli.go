@@ -16,6 +16,7 @@ import (
 	"github.com/sdougbrown/avenor/internal/control"
 	"github.com/sdougbrown/avenor/internal/digest"
 	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/sdougbrown/avenor/internal/looprunner"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/runtime"
 )
@@ -85,6 +86,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	controlSocket := fs.String("control-socket", "", "unix socket path for control plane")
 	httpDebug := fs.String("http-debug", "", "http debug adapter bind address")
 	permClaimTimeout := fs.Duration("permission-claim-timeout", 0, fmt.Sprintf("how long to wait for a connected socket client to answer a permission request before falling through to the file handler or 'none' resolver (0 uses the default: %v)", DefaultPermissionClaimTimeout))
+	loopFile := fs.String("loop-file", "", "path to loop config JSON (optional; enables multi-phase mode)")
 
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -118,8 +120,12 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "avenor: --prompt and --prompt-file are mutually exclusive")
 		return exitWithSentinel(1)
 	}
-	if *prompt == "" && *promptFile == "" {
-		fmt.Fprintln(stderr, "avenor: --prompt or --prompt-file is required")
+	if *prompt == "" && *promptFile == "" && *loopFile == "" {
+		fmt.Fprintln(stderr, "avenor: --prompt, --prompt-file, or --loop-file is required")
+		return exitWithSentinel(1)
+	}
+	if *loopFile != "" && *resume != "" {
+		fmt.Fprintln(stderr, "avenor: --loop-file and --resume are mutually exclusive")
 		return exitWithSentinel(1)
 	}
 
@@ -137,7 +143,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	var promptText []byte
 	if *prompt != "" {
 		promptText = []byte(*prompt)
-	} else {
+	} else if *promptFile != "" {
 		p, err := os.ReadFile(*promptFile)
 		if err != nil {
 			fmt.Fprintf(stderr, "avenor: read prompt file: %v\n", err)
@@ -218,6 +224,66 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		timer = t.C
 	}
 
+	if *loopFile != "" {
+		cfg, err := looprunner.LoadLoopConfig(*loopFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "avenor: load loop config: %v\n", err)
+			os.Exit(2)
+		}
+
+		if len(promptText) > 0 {
+			cfg.InsertInitialPrompt(string(promptText))
+		}
+
+		opts := looprunner.RunOptions{
+			WorkDir:    *dir,
+			RunID:      runID,
+			EventSink:  writer,
+			Config:     cfg,
+			MaxRetries: *maxRetries,
+			PhaseAttempt: func(ctx context.Context, phase looprunner.Phase, attemptNum int, iteration int, prevSessionID string) (looprunner.PhaseAttemptResult, error) {
+				startOpts := runtime.StartOptions{
+					Agent:     *agent,
+					Model:     *model,
+					Dir:       *dir,
+					ServerURL: discovery.URL,
+				}
+
+				var resumeID string
+				if prevSessionID != "" {
+					resumeID = prevSessionID
+				}
+
+				result := runSingleAttempt(
+					ctx, startOpts, resumeID, writer,
+					fileHandler, controlServer,
+					phase.Prompt,
+					runID, *label, *autoApprove, *permClaimTimeout, timer,
+					os.Stderr,
+				)
+
+				return looprunner.PhaseAttemptResult{
+					ExitCode:      result.exitCode,
+					SessionID:     result.sessionID,
+					LoopDirective: result.loopDirective,
+					LoopLabel:     result.loopLabel,
+				}, nil
+			},
+		}
+
+		lrCtx, lrCancel := context.WithCancel(context.Background())
+		defer lrCancel()
+
+		result, err := looprunner.Run(lrCtx, opts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "avenor: loop run: %v\n", err)
+		}
+
+		writeSentinelForResult(result, *sentinelFile, runID, os.Stderr)
+
+		os.Exit(result.ExitCode)
+	}
+
 	resumeID := *resume
 	var result attemptResult
 	for attempt := 1; ; attempt++ {
@@ -285,6 +351,17 @@ func permissionCleanupBase(sentinelPath, permissionHandler string) string {
 		return DerivePermBase(sentinelPath)
 	}
 	return ""
+}
+
+func writeSentinelForResult(result looprunner.RunResult, sentinelFile, runID string, stderr io.Writer) {
+	if sentinelFile == "" {
+		return
+	}
+	if result.Reason != "" {
+		WriteSentinelWithReason(sentinelFile, result.ExitCode, result.SessionID, result.StopReason, runID, result.Reason, stderr)
+	} else {
+		WriteSentinel(sentinelFile, result.ExitCode, result.SessionID, result.StopReason, runID, stderr)
+	}
 }
 
 // selectPermissionOption picks an option ID by matching the protocol kind:
