@@ -2,8 +2,14 @@ package opencodehttp
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/runtime"
 )
 
@@ -185,5 +191,125 @@ func TestResumeWithEmptyID(t *testing.T) {
 	_, err = p.Resume(context.Background(), "")
 	if err == nil {
 		t.Fatal("Resume with empty sessionID should fail")
+	}
+}
+
+func TestEventsBroadcastToConcurrentSubscribers(t *testing.T) {
+	p, err := NewWithOptions(runtime.StartOptions{})
+	if err != nil {
+		t.Fatalf("NewWithOptions error = %v", err)
+	}
+	prov := p.(*Provider)
+	prov.mu.Lock()
+	prov.events = make(chan events.Event, 1)
+	prov.mu.Unlock()
+
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	chA, err := prov.Events(ctxA, "ses_a")
+	if err != nil {
+		t.Fatalf("Events(ses_a) error = %v", err)
+	}
+	ctxB, cancelB := context.WithCancel(context.Background())
+	defer cancelB()
+	chB, err := prov.Events(ctxB, "ses_b")
+	if err != nil {
+		t.Fatalf("Events(ses_b) error = %v", err)
+	}
+
+	prov.publish(events.Event{Event: "agent.message_chunk", SessionID: "ses_a"})
+	prov.publish(events.Event{Event: "agent.message_chunk", SessionID: "ses_b"})
+
+	assertEvent := func(name string, ch <-chan events.Event, wantSessionID string) {
+		t.Helper()
+		select {
+		case evt := <-ch:
+			if evt.SessionID != wantSessionID {
+				t.Fatalf("%s got session %q, want %q", name, evt.SessionID, wantSessionID)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s timed out waiting for event", name)
+		}
+	}
+	assertEvent("subscriber A", chA, "ses_a")
+	assertEvent("subscriber B", chB, "ses_b")
+}
+
+func TestPromptUsesStartOptionsForSession(t *testing.T) {
+	var gotPayload map[string]any
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/global/health":
+			w.WriteHeader(http.StatusOK)
+		case "/event":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			<-r.Context().Done()
+		case "/session":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": "ses_test"})
+		case "/session/ses_test/message":
+			if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"info": map[string]any{"finish": "stop"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p, err := NewWithOptions(runtime.StartOptions{})
+	if err != nil {
+		t.Fatalf("NewWithOptions error = %v", err)
+	}
+	session, err := p.Start(context.Background(), runtime.StartOptions{
+		Agent:     "jockey",
+		Model:     "deepseek/deepseek-v4-pro",
+		ServerURL: srv.URL,
+	})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	defer p.(*Provider).Close()
+
+	if err := p.Prompt(context.Background(), session.SessionID, "hello"); err != nil {
+		t.Fatalf("Prompt error = %v", err)
+	}
+	if gotPayload["agent"] != "jockey" {
+		t.Fatalf("agent = %v, want jockey", gotPayload["agent"])
+	}
+	model, _ := gotPayload["model"].(map[string]any)
+	if model["providerID"] != "deepseek" || model["modelID"] != "deepseek-v4-pro" {
+		t.Fatalf("model = %v, want deepseek/deepseek-v4-pro", model)
+	}
+}
+
+func TestStartHealthUsesCallerContext(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/global/health" {
+			<-r.Context().Done()
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	p, err := NewWithOptions(runtime.StartOptions{})
+	if err != nil {
+		t.Fatalf("NewWithOptions error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = p.Start(ctx, runtime.StartOptions{ServerURL: srv.URL})
+	if err == nil {
+		t.Fatal("Start with cancelled context should fail")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Start error = %v, want context.Canceled", err)
 	}
 }

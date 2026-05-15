@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/runtime"
@@ -22,10 +23,14 @@ type Provider struct {
 	client       *Client
 	events       chan events.Event
 	streamCancel context.CancelFunc
-	sessions     map[string]struct {
-		sessionID string
-		dir       string
-	}
+	sessions     map[string]sessionState
+	subscribers  map[chan events.Event]string
+}
+
+type sessionState struct {
+	sessionID string
+	dir       string
+	opts      runtime.StartOptions
 }
 
 // New creates a Provider with empty options.
@@ -36,11 +41,9 @@ func New() (runtime.Provider, error) {
 // NewWithOptions creates a Provider with the given options.
 func NewWithOptions(opts runtime.StartOptions) (runtime.Provider, error) {
 	return &Provider{
-		opts:     opts,
-		sessions: make(map[string]struct {
-			sessionID string
-			dir       string
-		}),
+		opts:        opts,
+		sessions:    make(map[string]sessionState),
+		subscribers: make(map[chan events.Event]string),
 	}, nil
 }
 
@@ -51,7 +54,7 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	if merged.ServerURL == "" {
 		return runtime.Session{}, errors.New("server URL is required for opencode-http backend")
 	}
-	c, err := p.ensureClient(merged)
+	c, err := p.ensureClient(ctx, merged)
 	if err != nil {
 		return runtime.Session{}, err
 	}
@@ -65,10 +68,7 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 		return runtime.Session{}, fmt.Errorf("create session: %w", err)
 	}
 	p.mu.Lock()
-	p.sessions[sessionID] = struct {
-		sessionID string
-		dir       string
-	}{sessionID: sessionID, dir: merged.Dir}
+	p.sessions[sessionID] = sessionState{sessionID: sessionID, dir: merged.Dir, opts: merged}
 	p.mu.Unlock()
 
 	return runtime.Session{
@@ -85,7 +85,7 @@ func (p *Provider) Resume(ctx context.Context, sessionID string) (runtime.Sessio
 	if p.opts.ServerURL == "" {
 		return runtime.Session{}, errors.New("server URL is required for opencode-http backend")
 	}
-	c, err := p.ensureClient(p.opts)
+	c, err := p.ensureClient(ctx, p.opts)
 	if err != nil {
 		return runtime.Session{}, err
 	}
@@ -96,10 +96,9 @@ func (p *Provider) Resume(ctx context.Context, sessionID string) (runtime.Sessio
 	dir, _ := info["directory"].(string)
 
 	p.mu.Lock()
-	p.sessions[sessionID] = struct {
-		sessionID string
-		dir       string
-	}{sessionID: sessionID, dir: dir}
+	resumeOpts := p.opts
+	resumeOpts.Dir = dir
+	p.sessions[sessionID] = sessionState{sessionID: sessionID, dir: dir, opts: resumeOpts}
 	p.mu.Unlock()
 
 	return runtime.Session{
@@ -114,16 +113,17 @@ func (p *Provider) Prompt(ctx context.Context, sessionID string, prompt string) 
 	if err != nil {
 		return err
 	}
+	opts := p.sessionOptions(sessionID)
 	payload := map[string]any{
 		"parts": []map[string]any{
 			{"type": "text", "text": prompt},
 		},
 	}
-	if p.opts.Agent != "" {
-		payload["agent"] = p.opts.Agent
+	if opts.Agent != "" {
+		payload["agent"] = opts.Agent
 	}
-	if p.opts.Model != "" {
-		payload["model"] = mapModel(p.opts.Model)
+	if opts.Model != "" {
+		payload["model"] = mapModel(opts.Model)
 	}
 	_, err = c.SendMessage(ctx, sessionID, payload)
 	return err
@@ -139,27 +139,17 @@ func (p *Provider) Cancel(ctx context.Context, sessionID string) error {
 
 func (p *Provider) Events(ctx context.Context, sessionID string) (<-chan events.Event, error) {
 	p.mu.Lock()
-	source := p.events
-	p.mu.Unlock()
-	if source == nil {
+	if p.events == nil {
+		p.mu.Unlock()
 		return nil, errors.New("provider has not been started")
 	}
 	out := make(chan events.Event, 128)
+	p.subscribers[out] = sessionID
+	p.mu.Unlock()
+
 	go func() {
-		defer close(out)
-		for {
-			select {
-			case event, ok := <-source:
-				if !ok {
-					return
-				}
-				if sessionID == "" || event.SessionID == "" || event.SessionID == sessionID {
-					out <- event
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
+		<-ctx.Done()
+		p.removeSubscriber(out)
 	}()
 	return out, nil
 }
@@ -210,7 +200,7 @@ func (p *Provider) Close() error {
 	return nil
 }
 
-func (p *Provider) ensureClient(opts runtime.StartOptions) (*Client, error) {
+func (p *Provider) ensureClient(ctx context.Context, opts runtime.StartOptions) (*Client, error) {
 	p.mu.Lock()
 	if p.client != nil {
 		c := p.client
@@ -226,7 +216,9 @@ func (p *Provider) ensureClient(opts runtime.StartOptions) (*Client, error) {
 	}
 
 	client := NewClient(co)
-	if err := client.Health(context.Background()); err != nil {
+	healthCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := client.Health(healthCtx); err != nil {
 		return nil, fmt.Errorf("connect to opencode server at %s: %w", opts.ServerURL, err)
 	}
 
@@ -254,11 +246,8 @@ func (p *Provider) streamEvents(c *Client) {
 	defer func() {
 		p.mu.Lock()
 		p.streamCancel = nil
-		// Close the event channel so Events() readers unblock.
-		if p.events != nil {
-			close(p.events)
-			p.events = nil
-		}
+		p.closeSubscribersLocked()
+		p.events = nil
 		p.mu.Unlock()
 	}()
 
@@ -277,11 +266,7 @@ func (p *Provider) streamEvents(c *Client) {
 			if !ok {
 				return
 			}
-			select {
-			case p.events <- evt:
-			case <-ctx.Done():
-				return
-			}
+			p.publish(evt)
 		case <-ctx.Done():
 			return
 		}
@@ -295,6 +280,41 @@ func (p *Provider) clientLocked() (*Client, error) {
 		return nil, errors.New("provider has not been started")
 	}
 	return p.client, nil
+}
+
+func (p *Provider) sessionOptions(sessionID string) runtime.StartOptions {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if session, ok := p.sessions[sessionID]; ok {
+		return session.opts
+	}
+	return p.opts
+}
+
+func (p *Provider) publish(event events.Event) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for ch, sessionID := range p.subscribers {
+		if sessionID == "" || event.SessionID == "" || event.SessionID == sessionID {
+			ch <- event
+		}
+	}
+}
+
+func (p *Provider) removeSubscriber(ch chan events.Event) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.subscribers[ch]; ok {
+		delete(p.subscribers, ch)
+		close(ch)
+	}
+}
+
+func (p *Provider) closeSubscribersLocked() {
+	for ch := range p.subscribers {
+		delete(p.subscribers, ch)
+		close(ch)
+	}
 }
 
 // mapModel converts a StartOptions.Model string (e.g. "deepseek/deepseek-v4-pro")

@@ -1466,6 +1466,66 @@ func TestRunBackendOpenCodeHTTPWithServerURL(t *testing.T) {
 	}
 }
 
+func TestRunBackendOpenCodeHTTPWithEnvServerURL(t *testing.T) {
+	oldRunAttempt := runAttempt
+	oldRetryAfter := retryAfter
+	t.Cleanup(func() {
+		runAttempt = oldRunAttempt
+		retryAfter = oldRetryAfter
+	})
+
+	var gotBackend string
+	var gotServerURL string
+	runAttempt = func(
+		ctx context.Context,
+		startOptions runtime.StartOptions,
+		backend string,
+		resumeID string,
+		writer EventSink,
+		fileHandler *permission.FileHandler,
+		controlServer *control.ControlServer,
+		prompt string,
+		runID string,
+		runLabel string,
+		autoApprove bool,
+		permClaimTimeout time.Duration,
+		timer <-chan time.Time,
+		stderr io.Writer,
+	) attemptResult {
+		gotBackend = backend
+		gotServerURL = startOptions.ServerURL
+		return attemptResult{exitCode: 0}
+	}
+	retryAfter = func(time.Duration) <-chan time.Time { return make(chan time.Time) }
+
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+
+	env := func(key string) string {
+		if key == "AVENOR_OPENCODE_URL" {
+			return "http://env.example"
+		}
+		return ""
+	}
+	var stderr strings.Builder
+	code := run([]string{
+		"--prompt-file", promptPath,
+		"--backend", "opencode-http",
+	}, env, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if gotBackend != "opencode-http" {
+		t.Fatalf("runAttempt backend = %q, want %q", gotBackend, "opencode-http")
+	}
+	if gotServerURL != "http://env.example" {
+		t.Fatalf("startOptions.ServerURL = %q, want env URL", gotServerURL)
+	}
+}
+
 func TestRunUnknownBackend(t *testing.T) {
 	var stderr strings.Builder
 	code := run([]string{"--backend", "bogus"}, nil, &stderr)

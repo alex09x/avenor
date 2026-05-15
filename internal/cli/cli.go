@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	defaultBackend    = "opencode-acp"
-	backendOpenCodeACP = "opencode-acp"
+	defaultBackend      = "opencode-acp"
+	backendOpenCodeACP  = "opencode-acp"
 	backendOpenCodeHTTP = "opencode-http"
 )
 
@@ -116,10 +116,11 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		return code
 	}
 
+	discovery := DiscoverServer(*serverURL, getenv)
 	switch *backend {
 	case backendOpenCodeACP:
 	case backendOpenCodeHTTP:
-		if *serverURL == "" {
+		if discovery.URL == "" {
 			fmt.Fprintf(stderr, "avenor: --server-url is required for backend opencode-http\n")
 			return exitWithSentinel(1)
 		}
@@ -213,7 +214,6 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		}
 	}
 
-	discovery := DiscoverServer(*serverURL, getenv)
 	startOptions := runtime.StartOptions{
 		Agent:     *agent,
 		Label:     *label,
