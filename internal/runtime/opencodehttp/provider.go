@@ -215,17 +215,12 @@ func (p *Provider) ensureClient(ctx context.Context, opts runtime.StartOptions) 
 	}
 	p.mu.Unlock()
 
-	co := ClientOptions{BaseURL: opts.ServerURL}
-	if u, err := url.Parse(opts.ServerURL); err == nil && u.User != nil {
-		co.Username = u.User.Username()
-		co.Password, _ = u.User.Password()
-	}
-
+	co, safeURL := clientOptionsFromURL(opts.ServerURL)
 	client := NewClient(co)
 	healthCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := client.Health(healthCtx); err != nil {
-		return nil, fmt.Errorf("connect to opencode server at %s: %w", opts.ServerURL, err)
+		return nil, fmt.Errorf("connect to opencode server at %s: %w", safeURL, err)
 	}
 
 	p.mu.Lock()
@@ -400,6 +395,25 @@ func mapModel(model string) map[string]string {
 		result["modelID"] = model
 	}
 	return result
+}
+
+// clientOptionsFromURL extracts credentials from the URL userinfo and returns
+// ClientOptions with a credential-free base URL plus a safe URL for logging.
+func clientOptionsFromURL(rawURL string) (ClientOptions, string) {
+	co := ClientOptions{BaseURL: rawURL}
+	safeURL := rawURL
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return co, safeURL
+	}
+	if u.User != nil {
+		co.Username = u.User.Username()
+		co.Password, _ = u.User.Password()
+		u.User = nil
+	}
+	co.BaseURL = u.String()
+	safeURL = u.Redacted()
+	return co, safeURL
 }
 
 func mergeStartOptions(base, override runtime.StartOptions) runtime.StartOptions {

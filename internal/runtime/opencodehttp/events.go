@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"io"
 	"strings"
-	"sync"
 
 	"github.com/sdougbrown/avenor/internal/events"
 )
@@ -23,7 +22,6 @@ type sseEvent struct {
 func readSSEEvents(ctx context.Context, r io.Reader, out chan<- events.Event) {
 	defer close(out)
 
-	var mu sync.Mutex
 	sessionErrors := map[string]string{} // sessionID → last error name
 	sessionBusy := map[string]bool{}     // sessionID → is busy
 
@@ -83,7 +81,6 @@ func readSSEEvents(ctx context.Context, r io.Reader, out chan<- events.Event) {
 				continue
 			}
 			statusType, _ := status["type"].(string)
-			mu.Lock()
 			switch statusType {
 			case "busy":
 				sessionBusy[sid] = true
@@ -105,27 +102,35 @@ func readSSEEvents(ctx context.Context, r io.Reader, out chan<- events.Event) {
 					})
 				}
 			}
-			mu.Unlock()
 
 		case "session.error":
 			errObj, _ := raw.Properties["error"].(map[string]any)
 			if errObj != nil {
 				errName, _ := errObj["name"].(string)
-				mu.Lock()
 				sessionErrors[sid] = errName
-				mu.Unlock()
 			}
 
 		case "permission.request":
 			if sid == "" {
 				continue
 			}
-			// Emit permission.request with fields from properties.
+			// Emit permission.request with normalized field names.
 			fields := map[string]any{}
 			for k, v := range raw.Properties {
-				if k != "sessionID" {
+				if k == "sessionID" {
+					continue
+				}
+				// Map camelCase to snake_case for known fields.
+				switch k {
+				case "requestID":
+					fields["request_id"] = v
+				default:
 					fields[k] = v
 				}
+			}
+			// If request_id wasn't in properties, try the raw event id as fallback.
+			if _, ok := fields["request_id"]; !ok && raw.ID != "" {
+				fields["request_id"] = raw.ID
 			}
 			emit(events.Event{
 				Event:     "permission.request",
