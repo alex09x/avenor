@@ -38,6 +38,8 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 		return runtime.Session{}, err
 	}
 
+	c := p.client // ensureClient holds the lock and guarantees client is set
+
 	cwd := opts.Dir
 	if cwd == "" {
 		cwd = p.opts.Dir
@@ -48,7 +50,7 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	}
 
 	params := threadStartParams{CWD: cwd, Model: model}
-	result, err := p.client.request(ctx, "thread/start", params)
+	result, err := c.request(ctx, "thread/start", params)
 	if err != nil {
 		return runtime.Session{}, fmt.Errorf("thread/start: %w", err)
 	}
@@ -86,8 +88,10 @@ func (p *Provider) Resume(ctx context.Context, sessionID string) (runtime.Sessio
 		return runtime.Session{}, err
 	}
 
+	c := p.client // ensureClient guarantees client is set
+
 	params := threadResumeParams{ThreadID: sessionID}
-	result, err := p.client.request(ctx, "thread/resume", params)
+	result, err := c.request(ctx, "thread/resume", params)
 	if err != nil {
 		return runtime.Session{}, fmt.Errorf("thread/resume: %w", err)
 	}
@@ -113,13 +117,18 @@ func (p *Provider) Prompt(ctx context.Context, sessionID string, prompt string) 
 		return err
 	}
 
+	c, err := p.getClient()
+	if err != nil {
+		return err
+	}
+
 	params := turnStartParams{
 		ThreadID: sessionID,
 		Input: []inputPart{
 			{Type: "text", Text: prompt},
 		},
 	}
-	result, err := p.client.request(ctx, "turn/start", params)
+	result, err := c.request(ctx, "turn/start", params)
 	if err != nil {
 		return fmt.Errorf("turn/start: %w", err)
 	}
@@ -130,20 +139,23 @@ func (p *Provider) Prompt(ctx context.Context, sessionID string, prompt string) 
 	}
 	turnID := tsr.Turn.ID
 
-	turnCh := p.client.registerTurn(turnID)
+	turnCh := c.registerTurn(turnID)
 	p.mu.Lock()
 	p.turns[sessionID] = turnID
 	p.mu.Unlock()
 
 	defer func() {
-		p.client.unregisterTurn(turnID)
+		c.unregisterTurn(turnID)
 		p.mu.Lock()
 		delete(p.turns, sessionID)
 		p.mu.Unlock()
 	}()
 
 	select {
-	case ev := <-turnCh:
+	case ev, ok := <-turnCh:
+		if !ok {
+			return errors.New("client closed while waiting for turn completion")
+		}
 		reason, _ := ev.Fields["stop_reason"].(string)
 		switch reason {
 		case "end_turn":
@@ -172,22 +184,25 @@ func (p *Provider) Cancel(ctx context.Context, sessionID string) error {
 		return fmt.Errorf("no active turn for session %q", sessionID)
 	}
 
+	c, err := p.getClient()
+	if err != nil {
+		return err
+	}
+
 	params := turnInterruptParams{
 		ThreadID: sessionID,
 		TurnID:   turnID,
 	}
-	if err := p.client.notify("turn/interrupt", params); err != nil {
+	if err := c.notify("turn/interrupt", params); err != nil {
 		return fmt.Errorf("turn/interrupt: %w", err)
 	}
 	return nil
 }
 
 func (p *Provider) Events(ctx context.Context, sessionID string) (<-chan events.Event, error) {
-	p.mu.Lock()
-	c := p.client
-	p.mu.Unlock()
-	if c == nil {
-		return nil, errors.New("provider has not been started")
+	c, err := p.getClient()
+	if err != nil {
+		return nil, err
 	}
 
 	out := make(chan events.Event, 128)
@@ -201,11 +216,9 @@ func (p *Provider) Events(ctx context.Context, sessionID string) (<-chan events.
 }
 
 func (p *Provider) AnswerPermission(ctx context.Context, sessionID string, requestID string, response runtime.PermissionResponse) error {
-	p.mu.Lock()
-	c := p.client
-	p.mu.Unlock()
-	if c == nil {
-		return errors.New("provider has not been started")
+	c, err := p.getClient()
+	if err != nil {
+		return err
 	}
 	if requestID == "" {
 		return errors.New("permission request id is required")
@@ -266,4 +279,15 @@ func (p *Provider) sessionThread(sessionID string) (string, error) {
 		return "", fmt.Errorf("session %q not found", sessionID)
 	}
 	return threadID, nil
+}
+
+// getClient returns the current client, or an error if the provider has not been started or was closed.
+func (p *Provider) getClient() (*client, error) {
+	p.mu.Lock()
+	c := p.client
+	p.mu.Unlock()
+	if c == nil {
+		return nil, errors.New("provider has not been started")
+	}
+	return c, nil
 }

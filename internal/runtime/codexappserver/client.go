@@ -29,16 +29,25 @@ type client struct {
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
 
-	mu        sync.Mutex
-	pending   map[string]chan json.RawMessage // requestID → response result
-	turns     map[string]chan events.Event    // turnID → completion event
-	subs      map[string][]chan events.Event  // threadID → Events subscribers
-	approvals map[string]pendingApproval      // requestID → pending approval
+	stdinMu  sync.Mutex // serializes writes to stdin
+	mu       sync.Mutex
+	pending  map[string]chan json.RawMessage // requestID → response result
+	turns    map[string]chan events.Event    // turnID → completion event
+	subs     map[string][]chan events.Event  // threadID → Events subscribers
+	approvals map[string]pendingApproval     // requestID → pending approval
 
 	stderr *rollingBuffer
 
 	eventsCh chan events.Event // output channel for all events (notifications + approvals)
 	done     chan struct{}     // closed when reader goroutine exits
+}
+
+// writeStdin serializes writes to the stdin pipe to prevent interleaving.
+func (c *client) writeStdin(data []byte) error {
+	c.stdinMu.Lock()
+	defer c.stdinMu.Unlock()
+	_, err := c.stdin.Write(data)
+	return err
 }
 
 func newClient(proc *exec.Cmd, stdin io.WriteCloser, stdout io.ReadCloser, stderr io.ReadCloser) *client {
@@ -138,13 +147,6 @@ func (c *client) Close() error {
 		close(ch)
 	}
 	c.turns = nil
-	// Close subscriber channels.
-	for _, chans := range c.subs {
-		for _, ch := range chans {
-			close(ch)
-		}
-	}
-	c.subs = nil
 	c.mu.Unlock()
 
 	close(c.eventsCh)
@@ -182,7 +184,7 @@ func (c *client) request(ctx context.Context, method string, params any) (json.R
 	data, _ := json.Marshal(msg)
 	data = append(data, '\n')
 
-	if _, err := c.stdin.Write(data); err != nil {
+	if err := c.writeStdin(data); err != nil {
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
@@ -266,7 +268,7 @@ func (c *client) answerApproval(requestID string, allow bool) error {
 	data, _ := json.Marshal(msg)
 	data = append(data, '\n')
 
-	if _, err := c.stdin.Write(data); err != nil {
+	if err := c.writeStdin(data); err != nil {
 		return err
 	}
 	return nil
@@ -300,7 +302,7 @@ func (c *client) answerApprovalThreaded(requestID, threadID string, allow bool) 
 	data, _ := json.Marshal(msg)
 	data = append(data, '\n')
 
-	if _, err := c.stdin.Write(data); err != nil {
+	if err := c.writeStdin(data); err != nil {
 		return err
 	}
 	return nil
