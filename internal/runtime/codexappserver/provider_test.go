@@ -124,6 +124,10 @@ func TestProviderPipeRoundtrip(t *testing.T) {
 		},
 	})
 
+	// Allow Prompt goroutine to register the turn waiter before sending completion.
+	// In production the codex server would take time to process; here we need a yield.
+	time.Sleep(50 * time.Millisecond)
+
 	writeLine(wOut, map[string]any{
 		"method": "turn/completed",
 		"params": map[string]any{

@@ -2,9 +2,11 @@ package codexappserver
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -64,7 +66,7 @@ func TestClientRequestResponse(t *testing.T) {
 		done <- msg.Result
 	}()
 
-	result, err := c.request("thread/start", threadStartParams{CWD: "/tmp"})
+	result, err := c.request(context.Background(), "thread/start", threadStartParams{CWD: "/tmp"})
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
@@ -100,18 +102,12 @@ func TestClientRequestError(t *testing.T) {
 		})
 	}()
 
-	result, err := c.request("thread/start", nil)
-	if err != nil {
-		t.Fatalf("request error: %v", err)
+	_, err := c.request(context.Background(), "thread/start", nil)
+	if err == nil {
+		t.Fatal("expected error from rpc error response")
 	}
-	var parsed map[string]any
-	if err := json.Unmarshal(result, &parsed); err != nil {
-		t.Fatalf("unmarshal result: %v", err)
-	}
-	if errMap, ok := parsed["error"].(map[string]any); !ok {
-		t.Fatal("expected error in result")
-	} else if msg, _ := errMap["message"].(string); msg != "something went wrong" {
-		t.Errorf("error message = %q", msg)
+	if !strings.Contains(err.Error(), "something went wrong") {
+		t.Errorf("error = %v, want something went wrong", err)
 	}
 }
 

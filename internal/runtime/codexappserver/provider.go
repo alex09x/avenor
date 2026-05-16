@@ -48,7 +48,7 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	}
 
 	params := threadStartParams{CWD: cwd, Model: model}
-	result, err := p.client.request("thread/start", params)
+	result, err := p.client.request(ctx, "thread/start", params)
 	if err != nil {
 		return runtime.Session{}, fmt.Errorf("thread/start: %w", err)
 	}
@@ -87,7 +87,7 @@ func (p *Provider) Resume(ctx context.Context, sessionID string) (runtime.Sessio
 	}
 
 	params := threadResumeParams{ThreadID: sessionID}
-	result, err := p.client.request("thread/resume", params)
+	result, err := p.client.request(ctx, "thread/resume", params)
 	if err != nil {
 		return runtime.Session{}, fmt.Errorf("thread/resume: %w", err)
 	}
@@ -119,7 +119,7 @@ func (p *Provider) Prompt(ctx context.Context, sessionID string, prompt string) 
 			{Type: "text", Text: prompt},
 		},
 	}
-	result, err := p.client.request("turn/start", params)
+	result, err := p.client.request(ctx, "turn/start", params)
 	if err != nil {
 		return fmt.Errorf("turn/start: %w", err)
 	}

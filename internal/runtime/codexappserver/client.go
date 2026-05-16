@@ -51,7 +51,7 @@ func newClient(proc *exec.Cmd, stdin io.WriteCloser, stdout io.ReadCloser, stder
 		subs:      map[string][]chan events.Event{},
 		approvals: map[string]pendingApproval{},
 		stderr:    newRollingBuffer(stderrCap),
-		eventsCh:  make(chan events.Event, 256),
+		eventsCh:  make(chan events.Event, 4096),
 		done:      make(chan struct{}),
 	}
 	go c.drainStderr(stderr)
@@ -90,7 +90,7 @@ func StartClient(ctx context.Context) (*client, error) {
 			"experimentalApi": true,
 		},
 	}
-	_, err = c.request("initialize", initParams)
+	_, err = c.request(ctx, "initialize", initParams)
 	if err != nil {
 		_ = c.Close()
 		return nil, fmt.Errorf("codex initialize: %w", err)
@@ -128,8 +128,17 @@ func (c *client) Close() error {
 	// Wait for reader goroutine.
 	<-c.done
 
-	// Close subscriber channels.
+	// Close all pending request channels so blocked callers unblock.
 	c.mu.Lock()
+	for _, ch := range c.pending {
+		close(ch)
+	}
+	c.pending = nil
+	for _, ch := range c.turns {
+		close(ch)
+	}
+	c.turns = nil
+	// Close subscriber channels.
 	for _, chans := range c.subs {
 		for _, ch := range chans {
 			close(ch)
@@ -147,7 +156,8 @@ func (c *client) Events() <-chan events.Event { return c.eventsCh }
 func (c *client) Stderr() string { return c.stderr.String() }
 
 // request sends a JSON-RPC request and blocks until the response arrives.
-func (c *client) request(method string, params any) (json.RawMessage, error) {
+// If ctx is cancelled or the client is closed, it returns an error.
+func (c *client) request(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	id := newRequestID()
 	ch := make(chan json.RawMessage, 1)
 
@@ -179,11 +189,36 @@ func (c *client) request(method string, params any) (json.RawMessage, error) {
 		return nil, fmt.Errorf("write request: %w", err)
 	}
 
-	result, ok := <-ch
-	if !ok {
+	select {
+	case result, ok := <-ch:
+		if !ok {
+			return nil, errors.New("client closed while waiting for response")
+		}
+		if err := rpcErrorFromResult(result); err != nil {
+			return nil, err
+		}
+		return result, nil
+	case <-ctx.Done():
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		return nil, ctx.Err()
+	case <-c.done:
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
 		return nil, errors.New("client closed while waiting for response")
 	}
-	return result, nil
+}
+
+func rpcErrorFromResult(result json.RawMessage) error {
+	var envelope struct {
+		Error *rpcError `json:"error"`
+	}
+	if err := json.Unmarshal(result, &envelope); err != nil || envelope.Error == nil {
+		return nil
+	}
+	return fmt.Errorf("rpc error %d: %s", envelope.Error.Code, envelope.Error.Message)
 }
 
 func (c *client) notify(method string, params any) error {
@@ -434,13 +469,13 @@ func (c *client) fanout(ev *events.Event) {
 
 	c.mu.Lock()
 	chans := c.subs[ev.SessionID]
-	c.mu.Unlock()
 	for _, ch := range chans {
 		select {
 		case ch <- *ev:
 		default:
 		}
 	}
+	c.mu.Unlock()
 }
 
 func (c *client) drainStderr(r io.ReadCloser) {
