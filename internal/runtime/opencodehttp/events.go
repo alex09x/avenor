@@ -139,7 +139,7 @@ func readSSEEvents(ctx context.Context, r io.Reader, out chan<- events.Event) {
 			})
 
 		case "server.connected", "server.heartbeat",
-			"session.diff", "session.updated":
+			"session.diff", "session.updated", "session.idle":
 			// Known idle events — silently skip.
 
 		default:

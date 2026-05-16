@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -195,28 +196,33 @@ func TestCreateSessionReturnsID(t *testing.T) {
 }
 
 func TestBasicAuthFromURL(t *testing.T) {
-	var gotAuth string
+	var gotUser, gotPass string
+	var gotOK bool
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/global/health" {
-			gotAuth = r.Header.Get("Authorization")
+			gotUser, gotPass, gotOK = r.BasicAuth()
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 	}))
 	defer srv.Close()
 
-	// Test that basic auth is extracted from URL userinfo and sent.
-	client := NewClient(ClientOptions{
-		BaseURL:  srv.URL,
-		Username: "testuser",
-		Password: "testpass",
-	})
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	u.User = url.UserPassword("testuser", "testpass")
+	opts, safeURL := clientOptionsFromURL(u.String())
+	if strings.Contains(opts.BaseURL, "testpass") || strings.Contains(safeURL, "testpass") {
+		t.Fatalf("credentials leaked into base/safe URL: base=%q safe=%q", opts.BaseURL, safeURL)
+	}
+	client := NewClient(opts)
 	if err := client.Health(context.Background()); err != nil {
 		t.Fatalf("health check: %v", err)
 	}
-	if !strings.Contains(gotAuth, "Basic ") {
-		t.Errorf("Authorization header = %q, want Basic auth", gotAuth)
+	if !gotOK || gotUser != "testuser" || gotPass != "testpass" {
+		t.Errorf("BasicAuth = (%q, %q, %v), want exact URL userinfo credentials", gotUser, gotPass, gotOK)
 	}
 }
 

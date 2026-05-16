@@ -1438,12 +1438,14 @@ func TestRunBackendOpenCodeHTTPWithServerURL(t *testing.T) {
 	})
 
 	var gotBackend string
+	var gotServerURL string
 	runAttempt = func(
 		ctx context.Context,
 		cfg attemptConfig,
 		deps attemptDeps,
 	) attemptResult {
 		gotBackend = cfg.backend
+		gotServerURL = cfg.startOptions.ServerURL
 		return attemptResult{exitCode: 0}
 	}
 	retryAfter = func(time.Duration) <-chan time.Time { return make(chan time.Time) }
@@ -1465,6 +1467,9 @@ func TestRunBackendOpenCodeHTTPWithServerURL(t *testing.T) {
 	}
 	if gotBackend != "opencode-http" {
 		t.Fatalf("runAttempt backend = %q, want %q", gotBackend, "opencode-http")
+	}
+	if gotServerURL != "http://localhost:8080" {
+		t.Fatalf("startOptions.ServerURL = %q, want flag URL", gotServerURL)
 	}
 }
 

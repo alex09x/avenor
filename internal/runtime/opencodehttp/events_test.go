@@ -258,6 +258,7 @@ func TestServerEventsAreSkipped(t *testing.T) {
 		`{"type":"session.updated","properties":{"sessionID":"ses_1","info":{"id":"ses_1"}}}`,
 		`{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"busy"}}}`,
 		`{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"idle"}}}`,
+		`{"type":"session.idle","properties":{"sessionID":"ses_1"}}`,
 	)
 	evts := collectEvents(t, feed)
 	if len(evts) != 1 {

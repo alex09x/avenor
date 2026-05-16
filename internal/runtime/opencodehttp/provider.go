@@ -56,6 +56,10 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	if merged.ServerURL == "" {
 		return runtime.Session{}, errors.New("server URL is required for opencode-http backend")
 	}
+	sessionDir, err := supportedDir(merged.Dir)
+	if err != nil {
+		return runtime.Session{}, err
+	}
 	c, err := p.ensureClient(ctx, merged)
 	if err != nil {
 		return runtime.Session{}, err
@@ -70,13 +74,14 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 		return runtime.Session{}, fmt.Errorf("create session: %w", err)
 	}
 	p.mu.Lock()
-	p.sessions[sessionID] = sessionState{sessionID: sessionID, dir: merged.Dir, opts: merged}
+	merged.Dir = sessionDir
+	p.sessions[sessionID] = sessionState{sessionID: sessionID, dir: sessionDir, opts: merged}
 	p.mu.Unlock()
 
 	return runtime.Session{
 		SessionID: sessionID,
 		Backend:   backendID,
-		Dir:       merged.Dir,
+		Dir:       sessionDir,
 	}, nil
 }
 
@@ -167,27 +172,10 @@ func (p *Provider) Events(ctx context.Context, sessionID string) (<-chan events.
 }
 
 func (p *Provider) AnswerPermission(ctx context.Context, sessionID string, requestID string, response runtime.PermissionResponse) error {
-	c, err := p.clientLocked()
-	if err != nil {
-		return err
-	}
 	if requestID == "" {
 		return errors.New("permission request id is required")
 	}
-	outcome := response.Outcome
-	if outcome == "" {
-		outcome = "selected"
-	}
-	payload := map[string]any{
-		"outcome": outcome,
-	}
-	if response.OptionID != "" {
-		payload["option_id"] = response.OptionID
-	}
-	if response.Message != "" {
-		payload["message"] = response.Message
-	}
-	return c.AnswerPermission(ctx, sessionID, requestID, payload)
+	return errors.New("permissions are not supported by opencode-http backend")
 }
 
 func (p *Provider) Capabilities(ctx context.Context) (runtime.Capabilities, error) {
@@ -428,6 +416,15 @@ func mapModel(model string) map[string]string {
 		result["modelID"] = model
 	}
 	return result
+}
+
+func supportedDir(dir string) (string, error) {
+	switch strings.TrimSpace(dir) {
+	case "", ".":
+		return "", nil
+	default:
+		return "", errors.New("opencode-http backend does not support --dir; start opencode serve in the target directory instead")
+	}
 }
 
 // clientOptionsFromURL extracts credentials from the URL userinfo and returns

@@ -97,6 +97,7 @@ This is split and sent as `{"providerID":"deepseek","modelID":"deepseek-v4-pro"}
 ### Known differences from ACP
 
 - **Event stream is global.** The SSE `/event` endpoint delivers events for all sessions on the server. The provider filters by session ID locally.
-- **Session end detection.** Uses the message response finish status plus SSE `session.status {idle}` / `session.idle` events as a backup signal (ACP uses `session/prompt` response `stopReason`).
+- **Session end detection.** Uses the message response finish status; SSE idle transitions are ignored as terminal signals because they can arrive late for prior turns.
+- **Working directory.** HTTP mode does not support per-session `--dir`; start `opencode serve` in the target directory instead.
 - **Resume.** Checks `GET /session/:id` for existence. No dedicated resume endpoint.
 - **Permissions.** Permission request/response behavior has not been verified for HTTP mode yet. The server may auto-approve tools depending on configuration.

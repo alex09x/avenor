@@ -47,33 +47,30 @@
 //	session.status {type:"idle"}
 //	session.idle
 //
-// # Duplicate session.end guard
+// # session.end source
 //
-// The session.end event can arrive from two sources: the SSE idle transition
-// and the synchronous POST /message response. The provider tracks
-// endedSessions to suppress the second emission. This avoids duplicate
-// session.end events in the NDJSON log.
+// The synchronous POST /message response is the authoritative source for
+// session.end. SSE idle transitions are deliberately ignored as terminal
+// signals because they can arrive late for a previous turn on the same
+// session.
 //
 // # Reconnect behavior
 //
 // The SSE stream reconnects with exponential backoff (100ms → 1s cap). On
 // reconnect, the per-session busy/error state tracked by the SSE reader is
 // reset. If a session was mid-execution during disconnect, the post-reconnect
-// idle event will not produce a session.end (no prior busy was observed).
-// The response-derived session.end from Prompt() covers this gap in practice;
-// if the response-derived path is ever removed, the busy/error maps must be
-// lifted to the Provider to survive reconnects.
+// idle event will not produce a session.end. The response-derived session.end
+// from Prompt() covers this gap in practice.
 //
 // # Stop-reason mapping
 //
 // The HTTP API uses `info.finish` on the POST /session/:id/message response
-// to signal completion status, and SSE events to signal the same transitions.
+// to signal completion status.
 //
-//	finish value     | SSE event sequence                     | avenor stop_reason
-//	-----------------|----------------------------------------|--------------------
-//	"stop"           | session.status(idle) + session.idle   | "end_turn"
-//	(error present)  | session.error + session.status(idle)  | (error name)
-//	                    + session.idle
+//	finish value     | avenor stop_reason
+//	-----------------|--------------------
+//	"stop"           | "end_turn"
+//	(error present)  | (error name)
 //
 // The `session.error` properties contain `{name, data}` where name identifies
 // the error class (e.g., "MessageAbortedError" for cancellation).
@@ -84,6 +81,12 @@
 // plain string. The provider maps StartOptions.Model (a string) to this
 // format. If the string contains a "/", it is split as "providerID/modelID".
 // Otherwise the providerID is inferred from agent defaults.
+//
+// # Working directory
+//
+// The HTTP API does not currently support binding a new session to an
+// arbitrary directory. Start rejects non-default StartOptions.Dir values; run
+// opencode serve from the target project directory instead.
 //
 // # Permissions
 //

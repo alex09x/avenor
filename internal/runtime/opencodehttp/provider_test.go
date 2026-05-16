@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -183,6 +184,22 @@ func TestCancelFailsBeforeStart(t *testing.T) {
 	}
 }
 
+func TestStartRejectsUnsupportedDir(t *testing.T) {
+	p, err := NewWithOptions(runtime.StartOptions{
+		ServerURL: "http://localhost:4096",
+	})
+	if err != nil {
+		t.Fatalf("NewWithOptions error = %v", err)
+	}
+	_, err = p.Start(context.Background(), runtime.StartOptions{Dir: "/tmp/project"})
+	if err == nil {
+		t.Fatal("Start with explicit Dir should fail")
+	}
+	if !strings.Contains(err.Error(), "does not support --dir") {
+		t.Fatalf("error = %q, want unsupported dir message", err.Error())
+	}
+}
+
 func TestResumeWithEmptyID(t *testing.T) {
 	p, err := NewWithOptions(runtime.StartOptions{
 		ServerURL: "http://localhost:4096",
@@ -272,6 +289,7 @@ func TestPromptUsesStartOptionsForSession(t *testing.T) {
 		Agent:     "jockey",
 		Model:     "deepseek/deepseek-v4-pro",
 		ServerURL: srv.URL,
+		Dir:       ".",
 	})
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
@@ -496,7 +514,11 @@ func TestStreamSessionEndDoesNotEndLaterTurn(t *testing.T) {
 	}
 
 	close(lateIdle)
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case evt := <-ch:
+		t.Fatalf("late stream event was published before second prompt: %+v", evt)
+	case <-time.After(100 * time.Millisecond):
+	}
 
 	if err := p.Prompt(context.Background(), session.SessionID, "second"); err != nil {
 		t.Fatalf("second Prompt error = %v", err)
@@ -511,6 +533,26 @@ func TestStreamSessionEndDoesNotEndLaterTurn(t *testing.T) {
 	}
 	if got := messageRequests.Load(); got != 2 {
 		t.Fatalf("message requests = %d, want 2", got)
+	}
+}
+
+func TestAnswerPermissionUnsupported(t *testing.T) {
+	p, err := NewWithOptions(runtime.StartOptions{})
+	if err != nil {
+		t.Fatalf("NewWithOptions error = %v", err)
+	}
+	prov := p.(*Provider)
+	prov.mu.Lock()
+	prov.client = NewClient(ClientOptions{BaseURL: "http://localhost:4096"})
+	prov.started = true
+	prov.mu.Unlock()
+
+	err = prov.AnswerPermission(context.Background(), "ses_test", "req_1", runtime.PermissionResponse{OptionID: "allow"})
+	if err == nil {
+		t.Fatal("AnswerPermission should fail while opencode-http permissions are unsupported")
+	}
+	if !strings.Contains(err.Error(), "permissions are not supported") {
+		t.Fatalf("error = %q, want unsupported permissions message", err.Error())
 	}
 }
 
