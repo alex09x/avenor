@@ -108,10 +108,15 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	// finalSessionID is updated after each attempt so exitWithSentinel always
 	// writes the most recent session ID regardless of which return path fires.
 	var finalSessionID string
+	var finalStopReason string
 
 	exitWithSentinel := func(code int) int {
 		if *sentinelFile != "" {
-			WriteSentinel(*sentinelFile, code, finalSessionID, runtime.StopReasonForExitCode(code), runID, stderr)
+			sr := finalStopReason
+			if sr == "" {
+				sr = runtime.StopReasonForExitCode(code)
+			}
+			WriteSentinel(*sentinelFile, code, finalSessionID, sr, runID, stderr)
 		}
 		return code
 	}
@@ -277,6 +282,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 					runLabel:               *label,
 					autoApprove:            *autoApprove,
 					permissionClaimTimeout: *permClaimTimeout,
+					progressTimeout:        0,
 					timer:                  timer,
 				}, attemptDeps{
 					writer:        writer,
@@ -288,6 +294,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 				return looprunner.PhaseAttemptResult{
 					ExitCode:      result.exitCode,
 					SessionID:     result.sessionID,
+					StopReason:    result.stopReason,
 					LoopDirective: result.loopDirective,
 					LoopLabel:     result.loopLabel,
 				}, nil
@@ -326,6 +333,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			runLabel:               *label,
 			autoApprove:            *autoApprove,
 			permissionClaimTimeout: *permClaimTimeout,
+			progressTimeout:        0,
 			timer:                  timer,
 		}, attemptDeps{
 			writer:        writer,
@@ -334,6 +342,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			stderr:        stderr,
 		})
 		finalSessionID = result.sessionID
+		finalStopReason = result.stopReason
 
 		if result.exitCode != 1 || attempt > *maxRetries {
 			break
@@ -444,6 +453,7 @@ type permissionResult struct {
 // code and any loop directive that was detected during the session.
 type sessionResult struct {
 	ExitCode      int
+	StopReason    string
 	LoopDirective string
 	LoopLabel     string
 }
@@ -470,6 +480,7 @@ type SessionWaitConfig struct {
 	RunLabel               string
 	AutoApprove            bool
 	PermissionClaimTimeout time.Duration
+	ProgressTimeout        time.Duration
 	Timeout                <-chan time.Time
 }
 
@@ -654,7 +665,7 @@ func cancelAndEnd(provider runtime.Provider, writer EventSink, sessionID, runID,
 		fmt.Fprintf(stderr, "avenor: write terminal event: %v\n", err)
 		return sessionResult{ExitCode: 1}
 	}
-	return sessionResult{ExitCode: runtime.ExitCodeForStopReason(stopReason)}
+	return sessionResult{ExitCode: runtime.ExitCodeForStopReason(stopReason), StopReason: stopReason}
 }
 
 type eventWriter struct {

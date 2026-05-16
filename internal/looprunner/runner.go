@@ -27,6 +27,7 @@ type RunOptions struct {
 type PhaseAttemptResult struct {
 	ExitCode      int
 	SessionID     string
+	StopReason    string
 	LoopDirective string
 	LoopLabel     string
 }
