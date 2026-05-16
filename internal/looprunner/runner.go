@@ -94,9 +94,13 @@ func Run(ctx context.Context, opts RunOptions) (RunResult, error) {
 		sr := runtime.StopReasonForExitCode(result.ExitCode)
 		if sr != "end_turn" {
 			_ = emitLoopEnd(opts.EventSink, opts.RunID, "phase_failure", "", 0)
+			stopReason := result.StopReason
+			if stopReason == "" {
+				stopReason = sr
+			}
 			return RunResult{
 				ExitCode:   result.ExitCode,
-				StopReason: sr,
+				StopReason: stopReason,
 				SessionID:  result.SessionID,
 			}, nil
 		}
@@ -156,9 +160,13 @@ func Run(ctx context.Context, opts RunOptions) (RunResult, error) {
 
 			if sr != "end_turn" {
 				_ = emitLoopEnd(opts.EventSink, opts.RunID, "phase_failure", "", iterationsCompleted)
+				stopReason := result.StopReason
+				if stopReason == "" {
+					stopReason = sr
+				}
 				return RunResult{
 					ExitCode:   result.ExitCode,
-					StopReason: sr,
+					StopReason: stopReason,
 					SessionID:  result.SessionID,
 				}, nil
 			}
