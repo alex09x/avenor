@@ -1,6 +1,14 @@
 # Avenor
 
-Avenor helps an orchestration harness and an ACP-speaking backend coordinate tool calls and approvals without stepping on each other. ACP (Agent Client Protocol) is the wire protocol that lets those two sides talk; if you've got a harness like `.botfiles` on one side and a backend like OpenCode on the other, Avenor is the bit in the middle that keeps the handoff clean.
+Most agent harnesses will only let you call a single layer of sub-agents. That's normally all you need. For large projects, you may want to reach for more advances orechestration models. (I did.)
+
+Avenor allows for any given to top-level agent (the one you're chatting with) to kick off an entirely seperate process that is no longer bound by the single-level sub-agent restriction. Now your sub-agents can call sub-agents. Let your horses run wild!
+
+The way I have this organized personally is to have a "jockey" agent that is write-restricted, forcing it to spawn "horse" or "mule" sub-agents to do write-oriented work for it. An amusing pattern, and keeps implementing agents from getting confused and doing the wrong thing. Each agent above keeps focusing the prompts so that the implementors don't get distracted and start doing things they aren't supposed to. 
+
+Initially this is configured to work with [OpenCode](opencode.ai) via ACP or HTTP. (No real difference, just wanted to experiment so both work.) Get your agent to check to the docs to ensure it uses the cli correctly. (Hilariously this CLI is intended for your agent to use, not you as a human.)
+
+I'm working to provide a good skill/agent template to get folks started on using this pattern. Originally I intended for this to be "token sparing" but that hasn't really borne out. It does do a good job of preserving top-level context though for longer-lived build runs so I'm happy with it so far. 
 
 ## Installation
 
