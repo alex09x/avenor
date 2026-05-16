@@ -177,6 +177,7 @@ func (p *Provider) Close() error {
 	p.mu.Lock()
 	client := p.client
 	p.client = nil
+	p.pendingOptions = nil
 	p.mu.Unlock()
 	if client == nil {
 		return nil
@@ -254,6 +255,12 @@ func (p *Provider) configureSession(ctx context.Context, session *Session, opts 
 }
 
 func (p *Provider) cachePermissionOptions(event events.Event) {
+	if event.Event == "session.end" {
+		p.mu.Lock()
+		p.pendingOptions = nil
+		p.mu.Unlock()
+		return
+	}
 	if event.Event != "permission.request" {
 		return
 	}

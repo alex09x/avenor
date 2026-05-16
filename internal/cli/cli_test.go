@@ -1604,11 +1604,30 @@ func TestRunOpenCodeHTTPWithoutServerURL(t *testing.T) {
 }
 
 func TestRunCodexAppServerBackend(t *testing.T) {
-	// codex-app-server is a valid backend; should not produce "unknown backend".
-	// May fail later (no codex binary), but validation must accept it.
+	oldRunAttempt := runAttempt
+	oldRetryAfter := retryAfter
+	t.Cleanup(func() {
+		runAttempt = oldRunAttempt
+		retryAfter = oldRetryAfter
+	})
+
+	var gotBackend string
+	runAttempt = func(
+		ctx context.Context,
+		cfg attemptConfig,
+		deps attemptDeps,
+	) attemptResult {
+		gotBackend = cfg.backend
+		return attemptResult{exitCode: 0}
+	}
+	retryAfter = func(time.Duration) <-chan time.Time { return make(chan time.Time) }
+
 	var stderr strings.Builder
-	code := run([]string{"--backend", "codex-app-server", "--prompt", "hello"}, nil, &stderr)
-	if code == 1 && strings.Contains(stderr.String(), "unknown backend") {
-		t.Fatalf("codex-app-server was rejected as unknown: %s", stderr.String())
+	code := run([]string{"--backend", "codex-app-server", "--prompt", "hello"}, func(string) string { return "" }, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if gotBackend != "codex-app-server" {
+		t.Fatalf("runAttempt backend = %q, want %q", gotBackend, "codex-app-server")
 	}
 }

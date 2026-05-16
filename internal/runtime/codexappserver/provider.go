@@ -34,11 +34,10 @@ func NewWithOptions(opts runtime.StartOptions) *Provider {
 var _ runtime.Provider = (*Provider)(nil)
 
 func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtime.Session, error) {
-	if err := p.ensureClient(ctx); err != nil {
+	c, err := p.ensureClient(ctx)
+	if err != nil {
 		return runtime.Session{}, err
 	}
-
-	c := p.client // ensureClient holds the lock and guarantees client is set
 
 	cwd := opts.Dir
 	if cwd == "" {
@@ -84,11 +83,10 @@ func (p *Provider) Resume(ctx context.Context, sessionID string) (runtime.Sessio
 	}
 	p.mu.Unlock()
 
-	if err := p.ensureClient(ctx); err != nil {
+	c, err := p.ensureClient(ctx)
+	if err != nil {
 		return runtime.Session{}, err
 	}
-
-	c := p.client // ensureClient guarantees client is set
 
 	params := threadResumeParams{ThreadID: sessionID}
 	result, err := c.request(ctx, "thread/resume", params)
@@ -248,27 +246,22 @@ func (p *Provider) Close() error {
 	return c.Close()
 }
 
-func (p *Provider) ensureClient(ctx context.Context) error {
+func (p *Provider) ensureClient(ctx context.Context) (*client, error) {
 	p.mu.Lock()
 	if p.client != nil {
+		c := p.client
 		p.mu.Unlock()
-		return nil
+		return c, nil
 	}
-	p.mu.Unlock()
 
 	c, err := StartClient(ctx)
 	if err != nil {
-		return err
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.client != nil {
-		_ = c.Close()
-		return nil
+		p.mu.Unlock()
+		return nil, err
 	}
 	p.client = c
-	return nil
+	p.mu.Unlock()
+	return c, nil
 }
 
 func (p *Provider) sessionThread(sessionID string) (string, error) {

@@ -85,17 +85,20 @@ func TestSelectPermissionOption(t *testing.T) {
 }
 
 func TestAnswerPermissionMissingOptions(t *testing.T) {
-	p := &Provider{}
-	p.pendingOptions = map[string][]any{}
+	p := &Provider{
+		client:         &Client{},
+		pendingOptions: map[string][]any{},
+	}
 
 	err := p.AnswerPermission(context.Background(), "ses", "req_missing", runtime.PermissionResponse{Allow: true})
 	if err == nil {
 		t.Fatal("expected error for missing options")
 	}
-	// When provider has no client, the not-started error wins over the
-	// missing-options error — both are correct failure paths.
-	if !strings.Contains(err.Error(), "resolve permission request") && !strings.Contains(err.Error(), "has not been started") {
-		t.Fatalf("expected resolve or not-started error, got: %v", err)
+	if !strings.Contains(err.Error(), `resolve permission request "req_missing"`) {
+		t.Fatalf("expected resolve error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), `permission options missing kind "allow"`) {
+		t.Fatalf("expected missing allow option error, got: %v", err)
 	}
 }
 
@@ -124,18 +127,50 @@ func TestCachePermissionOptions(t *testing.T) {
 }
 
 func TestCachePermissionOptionsNonRequestEvent(t *testing.T) {
-	p := &Provider{}
+	p := &Provider{
+		pendingOptions: map[string][]any{
+			"req_existing": {
+				map[string]any{"optionId": "allow", "kind": "allow"},
+			},
+		},
+	}
 	ev := events.Event{
-		Event:  "session.end",
-		Fields: map[string]any{"stop_reason": "end_turn"},
+		Event:  "message",
+		Fields: map[string]any{"request_id": "req_nope", "options": []any{map[string]any{"optionId": "deny", "kind": "reject"}}},
 	}
 	p.cachePermissionOptions(ev)
 
 	p.mu.Lock()
-	_, ok := p.pendingOptions["req_nope"]
+	_, cachedNope := p.pendingOptions["req_nope"]
+	_, keptExisting := p.pendingOptions["req_existing"]
+	gotLen := len(p.pendingOptions)
 	p.mu.Unlock()
-	if ok {
+	if cachedNope {
 		t.Fatal("non-request event should not cache options")
+	}
+	if !keptExisting || gotLen != 1 {
+		t.Fatalf("non-request event changed cache: len=%d keptExisting=%v", gotLen, keptExisting)
+	}
+}
+
+func TestCachePermissionOptionsSessionEndClearsCache(t *testing.T) {
+	p := &Provider{
+		pendingOptions: map[string][]any{
+			"req_pending": {
+				map[string]any{"optionId": "allow", "kind": "allow"},
+			},
+		},
+	}
+	p.cachePermissionOptions(events.Event{
+		Event:  "session.end",
+		Fields: map[string]any{"stop_reason": "end_turn"},
+	})
+
+	p.mu.Lock()
+	gotLen := len(p.pendingOptions)
+	p.mu.Unlock()
+	if gotLen != 0 {
+		t.Fatalf("session.end should clear pending options, got %d entries", gotLen)
 	}
 }
 
@@ -154,5 +189,25 @@ func TestCachePermissionOptionsNoOptions(t *testing.T) {
 	p.mu.Unlock()
 	if ok {
 		t.Fatal("event without options should not cache entry")
+	}
+}
+
+func TestCloseClearsPermissionOptions(t *testing.T) {
+	p := &Provider{
+		pendingOptions: map[string][]any{
+			"req_pending": {
+				map[string]any{"optionId": "allow", "kind": "allow"},
+			},
+		},
+	}
+
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	p.mu.Lock()
+	gotLen := len(p.pendingOptions)
+	p.mu.Unlock()
+	if gotLen != 0 {
+		t.Fatalf("Close should clear pending options, got %d entries", gotLen)
 	}
 }
