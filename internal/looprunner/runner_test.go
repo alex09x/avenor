@@ -113,6 +113,40 @@ func TestRunEmitsRetryEventBeforeRetry(t *testing.T) {
 	}
 }
 
+func TestRunPhaseEndPreservesExplicitStopReason(t *testing.T) {
+	sink := &recordingEventWriter{}
+	result, err := Run(context.Background(), RunOptions{
+		WorkDir:   t.TempDir(),
+		RunID:     "run_1",
+		EventSink: sink,
+		Config:    &LoopConfig{Pre: []Phase{{Name: "build", Prompt: "build"}}, MaxIterations: 1},
+		PhaseAttempt: func(ctx context.Context, phase Phase, attemptNum int, iteration int, prevSessionID string) (PhaseAttemptResult, error) {
+			return PhaseAttemptResult{
+				ExitCode:   124,
+				SessionID:  "ses_1",
+				StopReason: "progress_timeout",
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.StopReason != "progress_timeout" {
+		t.Fatalf("RunResult StopReason = %q, want progress_timeout", result.StopReason)
+	}
+
+	var got any
+	for _, ev := range sink.events {
+		if ev.Event == "avenor.phase.end" {
+			got = ev.Fields["stop_reason"]
+			break
+		}
+	}
+	if got != "progress_timeout" {
+		t.Fatalf("phase.end stop_reason = %v, want progress_timeout; events=%+v", got, sink.events)
+	}
+}
+
 type discardEventWriter struct{}
 
 func (discardEventWriter) Write(events.Event) error { return nil }

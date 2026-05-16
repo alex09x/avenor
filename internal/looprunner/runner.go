@@ -211,7 +211,7 @@ func executePhase(ctx context.Context, opts RunOptions, phase Phase, iteration i
 	}
 
 	defer func() {
-		_ = emitPhaseEnd(opts.EventSink, opts.RunID, phase.Name, iteration, runtime.StopReasonForExitCode(result.ExitCode), markerFromResult(result))
+		_ = emitPhaseEnd(opts.EventSink, opts.RunID, phase.Name, iteration, phaseStopReason(result), markerFromResult(result))
 	}()
 
 	var retryCount int
@@ -277,6 +277,13 @@ func cancelledRunResult(ctx context.Context, opts RunOptions, iterationsComplete
 	}
 	_ = emitLoopEnd(opts.EventSink, opts.RunID, exitReason, "", iterationsCompleted)
 	return RunResult{ExitCode: code, StopReason: exitReason}, nil
+}
+
+func phaseStopReason(result PhaseAttemptResult) string {
+	if result.StopReason != "" {
+		return result.StopReason
+	}
+	return runtime.StopReasonForExitCode(result.ExitCode)
 }
 
 func markerFromResult(result PhaseAttemptResult) *loopMarker {
