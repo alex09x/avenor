@@ -107,6 +107,20 @@ func waitForSessionForTest(
 	})
 }
 
+func waitForPendingPermissionForTest(t *testing.T, cs *control.ControlServer) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if cs.HasPendingPermission() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for pending permission claim")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
@@ -925,9 +939,7 @@ func TestControlPermissionResolution(t *testing.T) {
 		result = waitForSessionForTest(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_ctrl", "run_1", "mylabel", false, 5*time.Second, nil, io.Discard)
 	}()
 
-	// Wait for the permission.request to be processed by the event loop
-	// before sending the answer so the claim window is open.
-	time.Sleep(100 * time.Millisecond)
+	waitForPendingPermissionForTest(t, cs)
 
 	// Answer the pending permission via the control socket.
 	params, _ := json.Marshal(control.PermissionAnswer{RequestID: "req_ctrl", OptionID: "allow_x"})
@@ -1042,7 +1054,7 @@ func TestControlPermissionNonLiteralOptionIDMapsByKind(t *testing.T) {
 			result = waitForSessionForTest(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_map", "run_map", "", false, 5*time.Second, nil, io.Discard)
 		}()
 
-		time.Sleep(100 * time.Millisecond)
+		waitForPendingPermissionForTest(t, cs)
 
 		params, _ := json.Marshal(control.PermissionAnswer{RequestID: "req_map", OptionID: optionID})
 		req := control.Request{JSONRPC: "2.0", ID: 1, Method: "answer_permission", Params: params}
@@ -1148,7 +1160,7 @@ func TestControlPermissionRejectsUnknownOptionID(t *testing.T) {
 		defer wg.Done()
 		result = waitForSessionForTest(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_bad", "run_bad", "", false, 5*time.Second, nil, io.Discard)
 	}()
-	time.Sleep(100 * time.Millisecond)
+	waitForPendingPermissionForTest(t, cs)
 
 	params, _ := json.Marshal(control.PermissionAnswer{RequestID: "req_bad", OptionID: "missing"})
 	req := control.Request{JSONRPC: "2.0", ID: 1, Method: "answer_permission", Params: params}
@@ -1229,7 +1241,7 @@ func TestControlPermissionRejectsUnsupportedKind(t *testing.T) {
 		defer wg.Done()
 		result = waitForSessionForTest(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_bad_kind", "run_bad_kind", "", false, 5*time.Second, nil, io.Discard)
 	}()
-	time.Sleep(100 * time.Millisecond)
+	waitForPendingPermissionForTest(t, cs)
 
 	params, _ := json.Marshal(control.PermissionAnswer{RequestID: "req_bad_kind", OptionID: "weird"})
 	req := control.Request{JSONRPC: "2.0", ID: 1, Method: "answer_permission", Params: params}
