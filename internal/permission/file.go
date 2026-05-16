@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/sdougbrown/avenor/internal/events"
@@ -96,7 +97,11 @@ func (h *FileHandler) Handle(ctx context.Context, provider runtime.Provider, eve
 		}
 	}
 
-	response, optionID, err := h.waitForResponse(ctx, responsePath)
+	rawResponse, optionID, err := h.waitForResponse(ctx, responsePath)
+	if err != nil {
+		return Resolution{}, err
+	}
+	response, err := permissionResponseFromRequest(request.Options, rawResponse, optionID)
 	if err != nil {
 		return Resolution{}, err
 	}
@@ -106,7 +111,7 @@ func (h *FileHandler) Handle(ctx context.Context, provider runtime.Provider, eve
 	return Resolution{RequestID: request.RequestID, OptionID: optionID}, nil
 }
 
-func (h *FileHandler) waitForResponse(ctx context.Context, path string) (runtime.PermissionResponse, string, error) {
+func (h *FileHandler) waitForResponse(ctx context.Context, path string) (fileResponse, string, error) {
 	timeout := h.Timeout
 	if timeout == 0 {
 		timeout = DefaultTimeout
@@ -122,17 +127,17 @@ func (h *FileHandler) waitForResponse(ctx context.Context, path string) (runtime
 	defer ticker.Stop()
 
 	for {
-		response, optionID, err := readResponse(path)
+		raw, err := readResponse(path)
 		if err == nil {
-			return response, optionID, nil
+			return raw, raw.OptionID, nil
 		}
 		if !errors.Is(err, os.ErrNotExist) {
-			return runtime.PermissionResponse{}, "", err
+			return fileResponse{}, "", err
 		}
 
 		select {
 		case <-waitCtx.Done():
-			return runtime.PermissionResponse{}, "", fmt.Errorf("wait for permission response: %w", waitCtx.Err())
+			return fileResponse{}, "", fmt.Errorf("wait for permission response: %w", waitCtx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -144,28 +149,66 @@ type fileResponse struct {
 	Message  string `json:"message,omitempty"`
 }
 
-func readResponse(path string) (runtime.PermissionResponse, string, error) {
+func readResponse(path string) (fileResponse, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return runtime.PermissionResponse{}, "", err
+		return fileResponse{}, err
 	}
 	if len(data) == 0 {
 		// File exists but is empty — likely a non-atomic writer mid-O_TRUNC.
 		// Treat as not-yet-ready so waitForResponse keeps polling.
-		return runtime.PermissionResponse{}, "", os.ErrNotExist
+		return fileResponse{}, os.ErrNotExist
 	}
 	var raw fileResponse
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return runtime.PermissionResponse{}, "", err
+		return fileResponse{}, err
 	}
-	if raw.Outcome == "" {
+	switch raw.Outcome {
+	case "", "selected":
 		raw.Outcome = "selected"
+	default:
+		return fileResponse{}, fmt.Errorf("invalid permission response outcome %q", raw.Outcome)
 	}
-	resp := runtime.PermissionResponse{
-		Allow:   raw.OptionID == "allow",
-		Message: raw.Message,
+	return raw, nil
+}
+
+func permissionResponseFromRequest(options any, response fileResponse, optionID string) (runtime.PermissionResponse, error) {
+	allow, err := permissionAllowFromOptions(options, optionID)
+	if err != nil {
+		return runtime.PermissionResponse{}, err
 	}
-	return resp, raw.OptionID, nil
+	return runtime.PermissionResponse{
+		Allow:    allow,
+		OptionID: optionID,
+		Message:  response.Message,
+	}, nil
+}
+
+func permissionAllowFromOptions(options any, optionID string) (bool, error) {
+	list, ok := options.([]any)
+	if !ok {
+		return false, fmt.Errorf("permission request options must be an array, got %T", options)
+	}
+	for _, opt := range list {
+		m, ok := opt.(map[string]any)
+		if !ok {
+			continue
+		}
+		oid, _ := m["optionId"].(string)
+		if oid != optionID {
+			continue
+		}
+		kind, _ := m["kind"].(string)
+		switch strings.ToLower(kind) {
+		case "allow":
+			return true, nil
+		case "reject":
+			return false, nil
+		default:
+			return false, fmt.Errorf("unsupported permission option kind %q for option_id %q", kind, optionID)
+		}
+	}
+	return false, fmt.Errorf("unknown permission option_id %q", optionID)
 }
 
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {

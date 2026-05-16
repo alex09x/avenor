@@ -17,10 +17,10 @@ import (
 // Returns the client, a writer to simulate server→client messages (stdout),
 // and a reader to inspect client→server writes (stdin).
 func fakeClient() (*client, *io.PipeWriter, *io.PipeReader) {
-	clientInR, clientInW := io.Pipe() // stdin: client writes, we read
+	clientInR, clientInW := io.Pipe()   // stdin: client writes, we read
 	clientOutR, clientOutW := io.Pipe() // stdout: we write, client reads
 	errR, errW := io.Pipe()             // stderr: subprocess writes, client drains
-	_ = errW.Close()                     // no real stderr; close writer so drain exits
+	_ = errW.Close()                    // no real stderr; close writer so drain exits
 
 	c := newClient(nil, clientInW, clientOutR, errR)
 	return c, clientOutW, clientInR
@@ -148,8 +148,6 @@ func TestClientTurnWaiter(t *testing.T) {
 	c, wOut, _ := fakeClient()
 	defer c.Close()
 
-	turnCh := c.registerTurn("turn_w")
-
 	go func() {
 		writeLine(wOut, map[string]any{
 			"method": "turn/completed",
@@ -163,6 +161,8 @@ func TestClientTurnWaiter(t *testing.T) {
 		})
 	}()
 
+	turnCh := c.registerTurn("turn_w")
+
 	select {
 	case ev := <-turnCh:
 		if ev.Event != "session.end" {
@@ -170,6 +170,37 @@ func TestClientTurnWaiter(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for turn completion")
+	}
+}
+
+func TestClientTurnCompletionBufferedBeforeRegister(t *testing.T) {
+	c, wOut, _ := fakeClient()
+	defer c.Close()
+
+	go func() {
+		writeLine(wOut, map[string]any{
+			"method": "turn/completed",
+			"params": map[string]any{
+				"threadId": "th_x",
+				"turn": map[string]any{
+					"id":     "turn_buf",
+					"status": "completed",
+				},
+			},
+		})
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+
+	turnCh := c.registerTurn("turn_buf")
+
+	select {
+	case ev := <-turnCh:
+		if ev.Event != "session.end" {
+			t.Errorf("event = %q, want session.end", ev.Event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for buffered turn completion")
 	}
 }
 
@@ -269,6 +300,27 @@ func TestClientAnswerApprovalNotFound(t *testing.T) {
 	err := c.answerApproval("unknown", true)
 	if err == nil {
 		t.Fatal("expected error for unknown approval")
+	}
+}
+
+func TestClientAnswerApprovalWrongThreadPreservesRequest(t *testing.T) {
+	c, _, _ := fakeClient()
+	defer c.Close()
+
+	c.mu.Lock()
+	c.approvals["req_keep"] = pendingApproval{threadID: "th_right", method: "item/commandExecution/requestApproval"}
+	c.mu.Unlock()
+
+	err := c.answerApprovalThreaded("req_keep", "th_wrong", true)
+	if err == nil {
+		t.Fatal("expected error for wrong thread")
+	}
+
+	c.mu.Lock()
+	_, ok := c.approvals["req_keep"]
+	c.mu.Unlock()
+	if !ok {
+		t.Fatal("approval should remain pending after wrong-thread answer")
 	}
 }
 

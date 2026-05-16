@@ -35,8 +35,9 @@ type Session struct {
 
 // PermissionResponse is the response to a permission request.
 type PermissionResponse struct {
-	Allow   bool
-	Message string
+	Allow    bool
+	OptionID string
+	Message  string
 }
 
 // Capabilities describes what a runtime backend supports.

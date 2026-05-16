@@ -65,7 +65,7 @@ func TestFileHandlerRoundTrip(t *testing.T) {
 			"tool":       "bash",
 			"question":   "Run command?",
 			"options": []any{
-				map[string]any{"optionId": "allow", "kind": "allow"},
+				map[string]any{"optionId": "allow_fh", "kind": "allow"},
 			},
 		},
 	}
@@ -102,7 +102,7 @@ func TestFileHandlerRoundTrip(t *testing.T) {
 		t.Fatalf("request = %+v", request)
 	}
 
-	response := []byte(`{"outcome":"selected","option_id":"allow"}`)
+	response := []byte(`{"outcome":"selected","option_id":"allow_fh"}`)
 	if err := os.WriteFile(reqPath+".response", response, 0o600); err != nil {
 		t.Fatalf("write response: %v", err)
 	}
@@ -122,9 +122,12 @@ func TestFileHandlerRoundTrip(t *testing.T) {
 	if !provider.response.Allow {
 		t.Fatalf("response.Allow = false, want true")
 	}
+	if provider.response.OptionID != "allow_fh" {
+		t.Fatalf("response.OptionID = %q, want allow_fh", provider.response.OptionID)
+	}
 	select {
 	case res := <-resolved:
-		if res.RequestID != "42" || res.OptionID != "allow" {
+		if res.RequestID != "42" || res.OptionID != "allow_fh" {
 			t.Fatalf("resolution = %+v", res)
 		}
 	default:
@@ -145,39 +148,38 @@ func TestReadResponseMapping(t *testing.T) {
 	dir := t.TempDir()
 
 	tests := []struct {
-		name        string
-		json        string
-		wantAllow   bool
-		wantOptID   string
-		wantOutcome string
+		name       string
+		json       string
+		options    any
+		wantAllow  bool
+		wantOptID  string
+		wantErrMsg string
 	}{
 		{
-			name:        "allow maps to Allow=true",
-			json:        `{"outcome":"selected","option_id":"allow"}`,
-			wantAllow:   true,
-			wantOptID:   "allow",
-			wantOutcome: "selected",
+			name:      "custom allow id maps to Allow=true",
+			json:      `{"outcome":"selected","option_id":"allow_fh"}`,
+			options:   []any{map[string]any{"optionId": "allow_fh", "kind": "allow"}},
+			wantAllow: true,
+			wantOptID: "allow_fh",
 		},
 		{
-			name:        "reject maps to Allow=false",
-			json:        `{"outcome":"selected","option_id":"reject"}`,
-			wantAllow:   false,
-			wantOptID:   "reject",
-			wantOutcome: "selected",
+			name:      "reject id maps to Allow=false",
+			json:      `{"outcome":"selected","option_id":"deny_fh"}`,
+			options:   []any{map[string]any{"optionId": "deny_fh", "kind": "reject"}},
+			wantAllow: false,
+			wantOptID: "deny_fh",
 		},
 		{
-			name:        "unknown option_id maps to Allow=false",
-			json:        `{"outcome":"selected","option_id":"custom_deny"}`,
-			wantAllow:   false,
-			wantOptID:   "custom_deny",
-			wantOutcome: "selected",
+			name:       "unknown option id errors",
+			json:       `{"outcome":"selected","option_id":"custom_deny"}`,
+			options:    []any{map[string]any{"optionId": "allow_fh", "kind": "allow"}},
+			wantErrMsg: `unknown permission option_id "custom_deny"`,
 		},
 		{
-			name:        "missing outcome defaults to selected",
-			json:        `{"option_id":"allow"}`,
-			wantAllow:   true,
-			wantOptID:   "allow",
-			wantOutcome: "selected",
+			name:       "invalid outcome errors",
+			json:       `{"outcome":"ignored","option_id":"allow_fh"}`,
+			options:    []any{map[string]any{"optionId": "allow_fh", "kind": "allow"}},
+			wantErrMsg: `invalid permission response outcome "ignored"`,
 		},
 	}
 	for _, tt := range tests {
@@ -186,15 +188,34 @@ func TestReadResponseMapping(t *testing.T) {
 			if err := os.WriteFile(path, []byte(tt.json), 0o600); err != nil {
 				t.Fatalf("write: %v", err)
 			}
-			resp, optID, err := readResponse(path)
+			raw, err := readResponse(path)
 			if err != nil {
-				t.Fatalf("readResponse: %v", err)
+				if tt.wantErrMsg == "" {
+					t.Fatalf("readResponse: %v", err)
+				}
+				if err.Error() != tt.wantErrMsg {
+					t.Fatalf("readResponse error = %q, want %q", err.Error(), tt.wantErrMsg)
+				}
+				return
+			}
+			resp, err := permissionResponseFromRequest(tt.options, raw, raw.OptionID)
+			if err != nil {
+				if tt.wantErrMsg == "" {
+					t.Fatalf("permissionResponseFromRequest: %v", err)
+				}
+				if err.Error() != tt.wantErrMsg {
+					t.Fatalf("permissionResponseFromRequest error = %q, want %q", err.Error(), tt.wantErrMsg)
+				}
+				return
 			}
 			if resp.Allow != tt.wantAllow {
 				t.Errorf("Allow = %v, want %v", resp.Allow, tt.wantAllow)
 			}
-			if optID != tt.wantOptID {
-				t.Errorf("optionID = %q, want %q", optID, tt.wantOptID)
+			if resp.OptionID != tt.wantOptID {
+				t.Errorf("response.OptionID = %q, want %q", resp.OptionID, tt.wantOptID)
+			}
+			if raw.OptionID != tt.wantOptID {
+				t.Errorf("optionID = %q, want %q", raw.OptionID, tt.wantOptID)
 			}
 		})
 	}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -895,10 +896,13 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 	s.controlMu.Lock()
 	key := rtID + ":" + requestID
 	options := s.permOptions[key]
-	delete(s.permOptions, key)
 	s.controlMu.Unlock()
+	if options == nil {
+		return fmt.Errorf("permission request %q not found for runtime %q", requestID, rtID)
+	}
 
 	kind := ""
+	found := false
 	for _, opt := range options {
 		m, ok := opt.(map[string]any)
 		if !ok {
@@ -907,11 +911,19 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 		oid, _ := m["optionId"].(string)
 		if oid == optionID {
 			k, _ := m["kind"].(string)
-			kind = k
+			kind = strings.ToLower(k)
+			found = true
 			break
 		}
 	}
-	allow := kind == "allow"
+	if !found {
+		return fmt.Errorf("unknown option_id %q for request %q on runtime %q", optionID, requestID, rtID)
+	}
+	switch kind {
+	case "allow", "reject":
+	default:
+		return fmt.Errorf("unsupported option kind %q for option_id %q on request %q", kind, optionID, requestID)
+	}
 
 	rt.mu.Lock()
 	provider := rt.provider
@@ -920,9 +932,16 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 	if provider == nil || sessionID == "" {
 		return fmt.Errorf("runtime %q has no active session for permission response", rtID)
 	}
-	return provider.AnswerPermission(context.Background(), sessionID, requestID, runtime.PermissionResponse{
-		Allow: allow,
-	})
+	if err := provider.AnswerPermission(context.Background(), sessionID, requestID, runtime.PermissionResponse{
+		Allow:    kind == "allow",
+		OptionID: optionID,
+	}); err != nil {
+		return err
+	}
+	s.controlMu.Lock()
+	delete(s.permOptions, key)
+	s.controlMu.Unlock()
+	return nil
 }
 
 func (s *Supervisor) cachePermissionOptions(runtimeID, requestID string, options []any) {

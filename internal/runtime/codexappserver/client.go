@@ -29,12 +29,13 @@ type client struct {
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
 
-	stdinMu  sync.Mutex // serializes writes to stdin
-	mu       sync.Mutex
-	pending  map[string]chan json.RawMessage // requestID → response result
-	turns    map[string]chan events.Event    // turnID → completion event
-	subs     map[string][]chan events.Event  // threadID → Events subscribers
-	approvals map[string]pendingApproval     // requestID → pending approval
+	stdinMu   sync.Mutex // serializes writes to stdin
+	mu        sync.Mutex
+	pending   map[string]chan json.RawMessage // requestID → response result
+	turns     map[string]chan events.Event    // turnID → completion event
+	turnDone  map[string]events.Event         // turnID → buffered completion event
+	subs      map[string][]chan events.Event  // threadID → Events subscribers
+	approvals map[string]pendingApproval      // requestID → pending approval
 
 	stderr *rollingBuffer
 
@@ -57,6 +58,7 @@ func newClient(proc *exec.Cmd, stdin io.WriteCloser, stdout io.ReadCloser, stder
 		stdout:    stdout,
 		pending:   map[string]chan json.RawMessage{},
 		turns:     map[string]chan events.Event{},
+		turnDone:  map[string]events.Event{},
 		subs:      map[string][]chan events.Event{},
 		approvals: map[string]pendingApproval{},
 		stderr:    newRollingBuffer(stderrCap),
@@ -147,6 +149,7 @@ func (c *client) Close() error {
 		close(ch)
 	}
 	c.turns = nil
+	c.turnDone = nil
 	c.mu.Unlock()
 
 	close(c.eventsCh)
@@ -236,8 +239,7 @@ func (c *client) notify(method string, params any) error {
 	data, _ := json.Marshal(msg)
 	data = append(data, '\n')
 
-	_, err = c.stdin.Write(data)
-	if err != nil {
+	if err := c.writeStdin(data); err != nil {
 		return fmt.Errorf("write notify: %w", err)
 	}
 	return nil
@@ -279,16 +281,16 @@ func (c *client) answerApproval(requestID string, allow bool) error {
 func (c *client) answerApprovalThreaded(requestID, threadID string, allow bool) error {
 	c.mu.Lock()
 	approval, ok := c.approvals[requestID]
-	if ok {
-		delete(c.approvals, requestID)
-	}
-	c.mu.Unlock()
 	if !ok {
+		c.mu.Unlock()
 		return fmt.Errorf("approval request %q not found", requestID)
 	}
 	if approval.threadID != threadID {
+		c.mu.Unlock()
 		return fmt.Errorf("approval request %q belongs to thread %q, not %q", requestID, approval.threadID, threadID)
 	}
+	delete(c.approvals, requestID)
+	c.mu.Unlock()
 
 	decision := "decline"
 	if allow {
@@ -333,6 +335,13 @@ func (c *client) registerTurn(turnID string) chan events.Event {
 	ch := make(chan events.Event, 1)
 	c.mu.Lock()
 	c.turns[turnID] = ch
+	if ev, ok := c.turnDone[turnID]; ok {
+		delete(c.turnDone, turnID)
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
 	c.mu.Unlock()
 	return ch
 }
@@ -341,6 +350,7 @@ func (c *client) registerTurn(turnID string) chan events.Event {
 func (c *client) unregisterTurn(turnID string) {
 	c.mu.Lock()
 	delete(c.turns, turnID)
+	delete(c.turnDone, turnID)
 	c.mu.Unlock()
 }
 
@@ -426,6 +436,9 @@ func (c *client) routeNotification(method string, params json.RawMessage) {
 		if err := json.Unmarshal(params, &n); err == nil {
 			c.mu.Lock()
 			ch, ok := c.turns[n.Turn.ID]
+			if !ok {
+				c.turnDone[n.Turn.ID] = *ev
+			}
 			c.mu.Unlock()
 			if ok {
 				select {

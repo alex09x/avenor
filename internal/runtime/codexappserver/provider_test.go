@@ -111,7 +111,8 @@ func TestProviderPipeRoundtrip(t *testing.T) {
 		errCh <- p.Prompt(context.Background(), "th_pipe", "hello")
 	}()
 
-	// Server side: read request, respond with turn ID, then send turn/completed.
+	// Server side: read request, respond with turn ID, then send turn/completed
+	// immediately to exercise the buffered completion path.
 	msg, err := readLine(rIn)
 	if err != nil {
 		t.Fatalf("read turn/start: %v", err)
@@ -123,11 +124,6 @@ func TestProviderPipeRoundtrip(t *testing.T) {
 			"turn": map[string]any{"id": "turn_pipe"},
 		},
 	})
-
-	// Allow Prompt goroutine to register the turn waiter before sending completion.
-	// In production the codex server would take time to process; here we need a yield.
-	time.Sleep(50 * time.Millisecond)
-
 	writeLine(wOut, map[string]any{
 		"method": "turn/completed",
 		"params": map[string]any{

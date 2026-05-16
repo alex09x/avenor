@@ -412,8 +412,9 @@ func (p *stableFakeProvider) Capabilities(context.Context) (runtime.Capabilities
 
 // permRecordingProvider records PermissionResponse from AnswerPermission calls.
 type permRecordingProvider struct {
-	lastAllow bool
-	called    bool
+	lastAllow    bool
+	lastOptionID string
+	called       bool
 }
 
 func (p *permRecordingProvider) Start(context.Context, runtime.StartOptions) (runtime.Session, error) {
@@ -430,10 +431,82 @@ func (p *permRecordingProvider) Events(context.Context, string) (<-chan events.E
 func (p *permRecordingProvider) AnswerPermission(_ context.Context, _ string, _ string, resp runtime.PermissionResponse) error {
 	p.called = true
 	p.lastAllow = resp.Allow
+	p.lastOptionID = resp.OptionID
 	return nil
 }
 func (p *permRecordingProvider) Capabilities(context.Context) (runtime.Capabilities, error) {
 	return runtime.Capabilities{}, nil
+}
+
+func TestAnswerPermissionRejectsUnknownOptionIDWithoutConsumingCache(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket:          "/tmp/test-answer-unknown.sock",
+		MaxRuntimes:            1,
+		PermissionClaimTimeout: 5 * time.Second,
+	})
+	provider := &permRecordingProvider{}
+	sup.runtimes["rt_unknown"] = &childRuntime{
+		id:       "rt_unknown",
+		provider: provider,
+		session:  runtime.Session{SessionID: "ses_unknown"},
+		done:     make(chan struct{}),
+		promptCh: make(chan struct{}, 1),
+	}
+	cachePermissionOptionsThroughFanout(t, sup, "rt_unknown", events.Event{
+		Event: "permission.request",
+		Fields: map[string]any{
+			"request_id": "req_unknown",
+			"options": []any{
+				map[string]any{"optionId": "allow_it", "kind": "allow"},
+				map[string]any{"optionId": "deny_it", "kind": "reject"},
+			},
+		},
+	})
+
+	if err := sup.answerPermission("rt_unknown", "req_unknown", "missing"); err == nil {
+		t.Fatal("answerPermission with unknown option_id should error")
+	}
+	if provider.called {
+		t.Fatal("AnswerPermission was called for unknown option_id")
+	}
+	if _, ok := sup.permOptions["rt_unknown:req_unknown"]; !ok {
+		t.Fatal("cache entry was consumed on invalid option_id")
+	}
+}
+
+func TestAnswerPermissionRejectsUnsupportedKindWithoutConsumingCache(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket:          "/tmp/test-answer-kind-bad.sock",
+		MaxRuntimes:            1,
+		PermissionClaimTimeout: 5 * time.Second,
+	})
+	provider := &permRecordingProvider{}
+	sup.runtimes["rt_kind_bad"] = &childRuntime{
+		id:       "rt_kind_bad",
+		provider: provider,
+		session:  runtime.Session{SessionID: "ses_kind_bad"},
+		done:     make(chan struct{}),
+		promptCh: make(chan struct{}, 1),
+	}
+	cachePermissionOptionsThroughFanout(t, sup, "rt_kind_bad", events.Event{
+		Event: "permission.request",
+		Fields: map[string]any{
+			"request_id": "req_kind_bad",
+			"options": []any{
+				map[string]any{"optionId": "weird", "kind": "maybe"},
+			},
+		},
+	})
+
+	if err := sup.answerPermission("rt_kind_bad", "req_kind_bad", "weird"); err == nil {
+		t.Fatal("answerPermission with unsupported kind should error")
+	}
+	if provider.called {
+		t.Fatal("AnswerPermission was called for unsupported kind")
+	}
+	if _, ok := sup.permOptions["rt_kind_bad:req_kind_bad"]; !ok {
+		t.Fatal("cache entry was consumed on unsupported kind")
+	}
 }
 
 func TestAnswerPermissionMapsAllowByKind(t *testing.T) {
@@ -470,9 +543,13 @@ func TestAnswerPermissionMapsAllowByKind(t *testing.T) {
 	if !provider.lastAllow {
 		t.Fatal("Allow = false, want true for kind=allow option")
 	}
+	if provider.lastOptionID != "yes_please" {
+		t.Fatalf("OptionID = %q, want yes_please", provider.lastOptionID)
+	}
 
 	provider.called = false
 	provider.lastAllow = false
+	provider.lastOptionID = ""
 
 	cachePermissionOptionsThroughFanout(t, sup, "rt_kind", events.Event{
 		Event: "permission.request",
@@ -493,6 +570,9 @@ func TestAnswerPermissionMapsAllowByKind(t *testing.T) {
 	}
 	if provider.lastAllow {
 		t.Fatal("Allow = true, want false for kind=reject option")
+	}
+	if provider.lastOptionID != "nope_please" {
+		t.Fatalf("OptionID = %q, want nope_please", provider.lastOptionID)
 	}
 }
 

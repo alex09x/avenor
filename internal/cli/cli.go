@@ -714,11 +714,11 @@ func resolvePermission(
 ) permissionResult {
 	options, _ := event.Fields["options"].([]any)
 	if autoApprove {
-		resp := runtime.PermissionResponse{Allow: true}
+		optionID, kind := firstOptionKind(options, "allow")
+		resp := runtime.PermissionResponse{Allow: true, OptionID: optionID}
 		if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 			return permissionResult{err: err}
 		}
-		optionID, kind := firstOptionKind(options, "allow")
 		return permissionResult{requestID: requestID, optionID: optionID, kind: kind, source: "avenor"}
 	}
 
@@ -742,23 +742,33 @@ func resolvePermission(
 			case ans := <-answerCh:
 				claimTimer.Stop()
 				controlServer.EndPermissionClaim(requestID)
-				allow := permissionKindFromOptionID(ans.OptionID, options) == "allow"
-				resp := runtime.PermissionResponse{Allow: allow}
+				kind := permissionKindFromOptionID(ans.OptionID, options)
+				switch kind {
+				case "allow", "reject":
+				default:
+					return permissionResult{err: fmt.Errorf("unknown option_id %q for request %q", ans.OptionID, requestID)}
+				}
+				resp := runtime.PermissionResponse{Allow: kind == "allow", OptionID: ans.OptionID}
 				if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 					return permissionResult{err: err}
 				}
-				return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
+				return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: kind, source: "control"}
 			case <-ctx.Done():
 				claimTimer.Stop()
 				controlServer.EndPermissionClaim(requestID)
 				select {
 				case ans := <-answerCh:
-					allow := permissionKindFromOptionID(ans.OptionID, options) == "allow"
-					resp := runtime.PermissionResponse{Allow: allow}
+					kind := permissionKindFromOptionID(ans.OptionID, options)
+					switch kind {
+					case "allow", "reject":
+					default:
+						return permissionResult{err: fmt.Errorf("unknown option_id %q for request %q", ans.OptionID, requestID)}
+					}
+					resp := runtime.PermissionResponse{Allow: kind == "allow", OptionID: ans.OptionID}
 					if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 						return permissionResult{err: err}
 					}
-					return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
+					return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: kind, source: "control"}
 				default:
 				}
 				return permissionResult{err: ctx.Err()}
@@ -766,12 +776,17 @@ func resolvePermission(
 				controlServer.EndPermissionClaim(requestID)
 				select {
 				case ans := <-answerCh:
-					allow := permissionKindFromOptionID(ans.OptionID, options) == "allow"
-					resp := runtime.PermissionResponse{Allow: allow}
+					kind := permissionKindFromOptionID(ans.OptionID, options)
+					switch kind {
+					case "allow", "reject":
+					default:
+						return permissionResult{err: fmt.Errorf("unknown option_id %q for request %q", ans.OptionID, requestID)}
+					}
+					resp := runtime.PermissionResponse{Allow: kind == "allow", OptionID: ans.OptionID}
 					if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 						return permissionResult{err: err}
 					}
-					return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
+					return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: kind, source: "control"}
 				default:
 					// Nothing in the channel; fall through to the file-handler.
 				}

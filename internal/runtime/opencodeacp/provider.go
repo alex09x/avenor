@@ -22,7 +22,7 @@ type Provider struct {
 	events         chan events.Event
 	sessions       map[string]*Session
 	initialized    bool
-	pendingOptions map[string][]any // requestID → permsission options from event
+	pendingOptions map[string]map[string][]any // sessionID → requestID → permission options from event
 }
 
 func New() runtime.Provider {
@@ -151,15 +151,26 @@ func (p *Provider) AnswerPermission(ctx context.Context, sessionID string, reque
 	}
 
 	p.mu.Lock()
-	options := p.pendingOptions[requestID]
-	delete(p.pendingOptions, requestID)
+	cacheSessionID, options := pendingPermissionOptions(p.pendingOptions, sessionID, requestID)
 	p.mu.Unlock()
 
-	optionID, err := selectPermissionOption(options, response.Allow)
+	optionID, err := selectPermissionResponseOption(options, response)
 	if err != nil {
 		return fmt.Errorf("resolve permission request %q: %w", requestID, err)
 	}
-	return client.answerPermission(requestID, permissionResponseResult(response, optionID))
+	if err := client.answerPermission(requestID, permissionResponseResult(response, optionID)); err != nil {
+		return err
+	}
+
+	p.mu.Lock()
+	if sessionOptions := p.pendingOptions[cacheSessionID]; sessionOptions != nil {
+		delete(sessionOptions, requestID)
+		if len(sessionOptions) == 0 {
+			delete(p.pendingOptions, cacheSessionID)
+		}
+	}
+	p.mu.Unlock()
+	return nil
 }
 
 func (p *Provider) Capabilities(ctx context.Context) (runtime.Capabilities, error) {
@@ -257,7 +268,12 @@ func (p *Provider) configureSession(ctx context.Context, session *Session, opts 
 func (p *Provider) cachePermissionOptions(event events.Event) {
 	if event.Event == "session.end" {
 		p.mu.Lock()
-		p.pendingOptions = nil
+		if event.SessionID == "" {
+			p.pendingOptions = nil
+			p.mu.Unlock()
+			return
+		}
+		delete(p.pendingOptions, event.SessionID)
 		p.mu.Unlock()
 		return
 	}
@@ -274,10 +290,33 @@ func (p *Provider) cachePermissionOptions(event events.Event) {
 	}
 	p.mu.Lock()
 	if p.pendingOptions == nil {
-		p.pendingOptions = map[string][]any{}
+		p.pendingOptions = map[string]map[string][]any{}
 	}
-	p.pendingOptions[requestID] = options
+	sessionID := event.SessionID
+	if p.pendingOptions[sessionID] == nil {
+		p.pendingOptions[sessionID] = map[string][]any{}
+	}
+	p.pendingOptions[sessionID][requestID] = options
 	p.mu.Unlock()
+}
+
+func pendingPermissionOptions(pending map[string]map[string][]any, sessionID, requestID string) (string, []any) {
+	if pending == nil {
+		return "", nil
+	}
+	if sessionOptions := pending[sessionID]; sessionOptions != nil {
+		if options := sessionOptions[requestID]; options != nil {
+			return sessionID, options
+		}
+	}
+	if sessionID != "" {
+		if sessionOptions := pending[""]; sessionOptions != nil {
+			if options := sessionOptions[requestID]; options != nil {
+				return "", options
+			}
+		}
+	}
+	return "", nil
 }
 
 func (p *Provider) session(sessionID string) (*Session, error) {
@@ -321,6 +360,35 @@ func selectPermissionOption(options []any, approve bool) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("permission options missing kind %q", want)
+}
+
+func selectPermissionResponseOption(options []any, response runtime.PermissionResponse) (string, error) {
+	if response.OptionID == "" {
+		return selectPermissionOption(options, response.Allow)
+	}
+	want := "reject"
+	if response.Allow {
+		want = "allow"
+	}
+	for _, opt := range options {
+		m, ok := opt.(map[string]any)
+		if !ok {
+			continue
+		}
+		optID, _ := m["optionId"].(string)
+		if optID != response.OptionID {
+			continue
+		}
+		if optID == "" {
+			return "", fmt.Errorf("permission option with kind %q missing optionId", want)
+		}
+		kind := strings.ToLower(fmt.Sprint(m["kind"]))
+		if kind != want {
+			return "", fmt.Errorf("permission option %q has kind %q, want %q", response.OptionID, kind, want)
+		}
+		return optID, nil
+	}
+	return "", fmt.Errorf("permission options missing optionId %q", response.OptionID)
 }
 
 func mergeStartOptions(base, override runtime.StartOptions) runtime.StartOptions {
