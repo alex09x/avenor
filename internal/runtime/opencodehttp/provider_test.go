@@ -433,6 +433,87 @@ func TestPromptResetsSessionEndGuardForNextTurn(t *testing.T) {
 	}
 }
 
+func TestStreamSessionEndDoesNotEndLaterTurn(t *testing.T) {
+	var messageRequests atomic.Int32
+	lateIdle := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/global/health":
+			w.WriteHeader(http.StatusOK)
+		case "/session":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": "ses_test"})
+		case "/session/ses_test/message":
+			messageRequests.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"info": map[string]any{"finish": "stop"}})
+		case "/event":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-lateIdle
+			fmt.Fprint(w, `data: {"type":"session.status","properties":{"sessionID":"ses_test","status":{"type":"busy"}}}`+"\n\n")
+			fmt.Fprint(w, `data: {"type":"session.status","properties":{"sessionID":"ses_test","status":{"type":"idle"}}}`+"\n\n")
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p, err := NewWithOptions(runtime.StartOptions{})
+	if err != nil {
+		t.Fatalf("NewWithOptions error = %v", err)
+	}
+	session, err := p.Start(context.Background(), runtime.StartOptions{ServerURL: srv.URL})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	defer p.(*Provider).Close()
+
+	eventCtx, cancelEvents := context.WithCancel(context.Background())
+	defer cancelEvents()
+	ch, err := p.Events(eventCtx, session.SessionID)
+	if err != nil {
+		t.Fatalf("Events error = %v", err)
+	}
+
+	if err := p.Prompt(context.Background(), session.SessionID, "first"); err != nil {
+		t.Fatalf("first Prompt error = %v", err)
+	}
+	select {
+	case evt := <-ch:
+		if evt.Event != "session.end" || evt.Fields["stop_reason"] != "end_turn" {
+			t.Fatalf("first event = %+v, want session.end end_turn", evt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first session.end")
+	}
+
+	close(lateIdle)
+	time.Sleep(50 * time.Millisecond)
+
+	if err := p.Prompt(context.Background(), session.SessionID, "second"); err != nil {
+		t.Fatalf("second Prompt error = %v", err)
+	}
+	select {
+	case evt := <-ch:
+		if evt.Event != "session.end" || evt.Fields["stop_reason"] != "end_turn" {
+			t.Fatalf("second event = %+v, want response-derived session.end", evt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for second session.end")
+	}
+	if got := messageRequests.Load(); got != 2 {
+		t.Fatalf("message requests = %d, want 2", got)
+	}
+}
+
 func TestPublishDropsSlowSubscriberWithoutBlocking(t *testing.T) {
 	p, err := NewWithOptions(runtime.StartOptions{})
 	if err != nil {
