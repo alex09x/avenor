@@ -13,6 +13,7 @@ import (
 	"github.com/sdougbrown/avenor/internal/cli"
 	"github.com/sdougbrown/avenor/internal/control"
 	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/sdougbrown/avenor/internal/looprunner"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/runtime"
 	"github.com/sdougbrown/avenor/internal/runtime/opencodeacp"
@@ -41,6 +42,7 @@ type SpawnParams struct {
 	AutoApprove       bool   `json:"auto_approve,omitempty"`
 	Timeout           int    `json:"timeout,omitempty"`
 	MaxRetries        int    `json:"max_retries,omitempty"`
+	LoopFile          string `json:"loop_file,omitempty"`
 }
 
 type SpawnResult struct {
@@ -193,12 +195,14 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 	s.runtimes[rtID] = child
 	s.controlMu.Unlock()
 
-	// Clean up reserved slot on failure.
+	releaseReservation := func() {
+		s.controlMu.Lock()
+		delete(s.runtimes, rtID)
+		s.controlMu.Unlock()
+	}
 	defer func() {
-		if child.provider == nil {
-			s.controlMu.Lock()
-			delete(s.runtimes, rtID)
-			s.controlMu.Unlock()
+		if releaseReservation != nil {
+			releaseReservation()
 		}
 	}()
 
@@ -214,8 +218,8 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 		}
 		promptText = string(data)
 	}
-	if promptText == "" {
-		return SpawnResult{}, fmt.Errorf("prompt or prompt_file is required")
+	if promptText == "" && params.LoopFile == "" {
+		return SpawnResult{}, fmt.Errorf("prompt, prompt_file, or loop_file is required")
 	}
 
 	// Per-runtime artifact directory.
@@ -251,6 +255,53 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 			return SpawnResult{}, fmt.Errorf("permission handler: %w", err)
 		}
 		fileHandler = fh
+	}
+
+	// Loop spawn path — uses looprunner instead of a single provider/session.
+	if params.LoopFile != "" {
+		cfg, err := looprunner.LoadLoopConfig(params.LoopFile)
+		if err != nil {
+			_ = writer.Close()
+			return SpawnResult{}, fmt.Errorf("spawn: load loop config: %w", err)
+		}
+		if promptText != "" {
+			cfg.InsertInitialPrompt(promptText)
+		}
+
+		// For loop spawns, skip the normal provider/session pre-start.
+		// SpawnResult.SessionID is empty — phase session IDs are in events.
+		result := SpawnResult{
+			RuntimeID:    rtID,
+			OnEvent:      onEvent,
+			SentinelFile: sentinelFile,
+		}
+
+		childCtx, childCancel := context.WithCancel(context.Background())
+
+		child.label = params.Label
+		child.cancelFn = childCancel
+		child.autoApprove = params.AutoApprove
+		child.permClaimTimeout = s.config.PermissionClaimTimeout
+		if child.permClaimTimeout == 0 {
+			child.permClaimTimeout = cli.DefaultPermissionClaimTimeout
+		}
+		child.eventWriter = writer
+		child.fileHandler = fileHandler
+		child.runID = s.runID
+		child.dir = params.Dir
+		child.onEvent = onEvent
+		child.sentinelFile = sentinelFile
+		// provider and session remain zero-valued for loop children
+
+		select {
+		case s.runtimeActivity <- struct{}{}:
+		default:
+		}
+
+		releaseReservation = nil
+		go s.runLoopChild(childCtx, child, cfg, params.MaxRetries, params.Agent, params.Model, params.ServerURL)
+
+		return result, nil
 	}
 
 	// Start provider and session.
@@ -294,6 +345,7 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 	child.cancelFn = childCancel
 
 	// Start the child event loop in a goroutine.
+	releaseReservation = nil
 	go s.runChild(childCtx, child, promptText, params.Timeout, params.MaxRetries)
 
 	select {
@@ -405,6 +457,139 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 	}
 }
 
+func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg *looprunner.LoopConfig, maxRetries int, agent, model, serverURL string) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "avenor stable: child %s panic: %v\n", child.id, r)
+			s.emitChildError(child, fmt.Sprintf("panic: %v", r), "error")
+			if child.sentinelFile != "" {
+				cli.WriteSentinel(child.sentinelFile, 1, "", "error", s.runID, os.Stderr)
+			}
+		}
+		if child.cancelFn != nil {
+			child.cancelFn()
+		}
+	}()
+	defer func() {
+		if child.eventWriter != nil {
+			_ = child.eventWriter.Close()
+		}
+		child.mu.Lock()
+		child.completed = true
+		child.mu.Unlock()
+		close(child.done)
+		s.controlMu.Lock()
+		delete(s.runtimes, child.id)
+		s.controlMu.Unlock()
+	}()
+
+	taggedWriter := &runtimeFanoutWriter{
+		base:      child.eventWriter,
+		runtimeID: child.id,
+		control:   s.control,
+	}
+
+	opts := looprunner.RunOptions{
+		WorkDir:    child.dir,
+		RunID:      s.runID,
+		EventSink:  taggedWriter,
+		Config:     cfg,
+		MaxRetries: maxRetries,
+		PhaseAttempt: func(ctx context.Context, phase looprunner.Phase, attemptNum int, iteration int, prevSessionID string) (looprunner.PhaseAttemptResult, error) {
+			startOpts := runtime.StartOptions{
+				Agent:     agent,
+				Model:     model,
+				Dir:       child.dir,
+				ServerURL: serverURL,
+			}
+
+			var resumeID string
+			if prevSessionID != "" {
+				resumeID = prevSessionID
+			}
+
+			provider := opencodeacp.NewWithOptions(startOpts)
+			defer func() {
+				if closer, ok := provider.(interface{ Close() error }); ok {
+					_ = closer.Close()
+				}
+			}()
+
+			session, err := cli.StartSession(ctx, provider, startOpts, resumeID)
+			if err != nil {
+				return looprunner.PhaseAttemptResult{ExitCode: 1}, fmt.Errorf("start session: %w", err)
+			}
+			child.mu.Lock()
+			child.provider = provider
+			child.session = session
+			child.active = true
+			child.mu.Unlock()
+			defer func() {
+				child.mu.Lock()
+				if child.provider == provider {
+					child.provider = nil
+					child.session = runtime.Session{}
+				}
+				child.active = false
+				child.mu.Unlock()
+			}()
+
+			eventCtx, cancelEvents := context.WithCancel(ctx)
+			defer cancelEvents()
+
+			eventCh, err := provider.Events(eventCtx, session.SessionID)
+			if err != nil {
+				return looprunner.PhaseAttemptResult{ExitCode: 1}, fmt.Errorf("subscribe events: %w", err)
+			}
+
+			promptDone := make(chan error, 1)
+			go func() {
+				promptDone <- provider.Prompt(context.Background(), session.SessionID, phase.Prompt)
+			}()
+
+			result := cli.WaitForSession(
+				ctx, provider, taggedWriter,
+				child.fileHandler, nil,
+				eventCh, promptDone, nil,
+				session.SessionID, s.runID, child.label,
+				child.autoApprove, child.permClaimTimeout,
+				nil,
+				os.Stderr,
+			)
+
+			return looprunner.PhaseAttemptResult{
+				ExitCode:      result.ExitCode,
+				SessionID:     session.SessionID,
+				LoopDirective: result.LoopDirective,
+				LoopLabel:     result.LoopLabel,
+			}, nil
+		},
+	}
+
+	result, err := looprunner.Run(ctx, opts)
+	if err != nil {
+		child.mu.Lock()
+		child.exitCode = 1
+		child.mu.Unlock()
+		if child.sentinelFile != "" {
+			cli.WriteSentinel(child.sentinelFile, 1, "", "error", s.runID, os.Stderr)
+		}
+		return
+	}
+
+	child.mu.Lock()
+	child.exitCode = result.ExitCode
+	child.mu.Unlock()
+
+	if child.sentinelFile != "" {
+		if result.Reason != "" {
+			cli.WriteSentinelWithReason(child.sentinelFile, result.ExitCode, result.SessionID, result.StopReason, s.runID, result.Reason, os.Stderr)
+		} else {
+			cli.WriteSentinel(child.sentinelFile, result.ExitCode, result.SessionID, result.StopReason, s.runID, os.Stderr)
+		}
+	}
+}
+
 type childAttemptResult struct {
 	exitCode  int
 	sessionID string
@@ -498,7 +683,8 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 		runtimeID: child.id,
 		control:   s.control,
 	}
-	exitCode := cli.WaitForSession(turnCtx, child.provider, taggedWriter, child.fileHandler, nil, eventCh, promptDone, nil, session.SessionID, s.runID, child.label, child.autoApprove, child.permClaimTimeout, timer, os.Stderr)
+	result := cli.WaitForSession(turnCtx, child.provider, taggedWriter, child.fileHandler, nil, eventCh, promptDone, nil, session.SessionID, s.runID, child.label, child.autoApprove, child.permClaimTimeout, timer, os.Stderr)
+	exitCode := result.ExitCode
 	return childAttemptResult{exitCode: exitCode, sessionID: session.SessionID}
 }
 
@@ -666,7 +852,14 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 	if rt == nil {
 		return fmt.Errorf("runtime %q not found", rtID)
 	}
-	return rt.provider.AnswerPermission(context.Background(), rt.sessionID(), requestID, runtime.PermissionResponse{
+	rt.mu.Lock()
+	provider := rt.provider
+	sessionID := rt.session.SessionID
+	rt.mu.Unlock()
+	if provider == nil || sessionID == "" {
+		return fmt.Errorf("runtime %q has no active session for permission response", rtID)
+	}
+	return provider.AnswerPermission(context.Background(), sessionID, requestID, runtime.PermissionResponse{
 		Outcome:  "selected",
 		OptionID: optionID,
 	})

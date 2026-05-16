@@ -16,6 +16,7 @@ import (
 	"github.com/sdougbrown/avenor/internal/control"
 	"github.com/sdougbrown/avenor/internal/digest"
 	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/sdougbrown/avenor/internal/looprunner"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/runtime"
 )
@@ -85,6 +86,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	controlSocket := fs.String("control-socket", "", "unix socket path for control plane")
 	httpDebug := fs.String("http-debug", "", "http debug adapter bind address")
 	permClaimTimeout := fs.Duration("permission-claim-timeout", 0, fmt.Sprintf("how long to wait for a connected socket client to answer a permission request before falling through to the file handler or 'none' resolver (0 uses the default: %v)", DefaultPermissionClaimTimeout))
+	loopFile := fs.String("loop-file", "", "path to loop config JSON (optional; enables multi-phase mode)")
 
 	if err := fs.Parse(args); err != nil {
 		return 1
@@ -118,8 +120,12 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "avenor: --prompt and --prompt-file are mutually exclusive")
 		return exitWithSentinel(1)
 	}
-	if *prompt == "" && *promptFile == "" {
-		fmt.Fprintln(stderr, "avenor: --prompt or --prompt-file is required")
+	if *prompt == "" && *promptFile == "" && *loopFile == "" {
+		fmt.Fprintln(stderr, "avenor: --prompt, --prompt-file, or --loop-file is required")
+		return exitWithSentinel(1)
+	}
+	if *loopFile != "" && *resume != "" {
+		fmt.Fprintln(stderr, "avenor: --loop-file and --resume are mutually exclusive")
 		return exitWithSentinel(1)
 	}
 
@@ -137,7 +143,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	var promptText []byte
 	if *prompt != "" {
 		promptText = []byte(*prompt)
-	} else {
+	} else if *promptFile != "" {
 		p, err := os.ReadFile(*promptFile)
 		if err != nil {
 			fmt.Fprintf(stderr, "avenor: read prompt file: %v\n", err)
@@ -218,6 +224,73 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		timer = t.C
 	}
 
+	if *loopFile != "" {
+		cfg, err := looprunner.LoadLoopConfig(*loopFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "avenor: load loop config: %v\n", err)
+			if *sentinelFile != "" {
+				WriteSentinel(*sentinelFile, 1, finalSessionID, "error", runID, stderr)
+			}
+			return 1
+		}
+
+		if len(promptText) > 0 {
+			cfg.InsertInitialPrompt(string(promptText))
+		}
+
+		opts := looprunner.RunOptions{
+			WorkDir:    *dir,
+			RunID:      runID,
+			EventSink:  writer,
+			Config:     cfg,
+			MaxRetries: *maxRetries,
+			PhaseAttempt: func(ctx context.Context, phase looprunner.Phase, attemptNum int, iteration int, prevSessionID string) (looprunner.PhaseAttemptResult, error) {
+				startOpts := runtime.StartOptions{
+					Agent:     *agent,
+					Model:     *model,
+					Dir:       *dir,
+					ServerURL: discovery.URL,
+				}
+
+				var resumeID string
+				if prevSessionID != "" {
+					resumeID = prevSessionID
+				}
+
+				result := runSingleAttempt(
+					ctx, startOpts, resumeID, writer,
+					fileHandler, controlServer,
+					phase.Prompt,
+					runID, *label, *autoApprove, *permClaimTimeout, timer,
+					os.Stderr,
+				)
+
+				return looprunner.PhaseAttemptResult{
+					ExitCode:      result.exitCode,
+					SessionID:     result.sessionID,
+					LoopDirective: result.loopDirective,
+					LoopLabel:     result.loopLabel,
+				}, nil
+			},
+		}
+
+		lrCtx, lrCancel := context.WithCancel(ctx)
+		defer lrCancel()
+
+		result, err := looprunner.Run(lrCtx, opts)
+		if err != nil {
+			fmt.Fprintf(stderr, "avenor: loop run: %v\n", err)
+			if *sentinelFile != "" {
+				WriteSentinel(*sentinelFile, 1, result.SessionID, "error", runID, stderr)
+			}
+			return 1
+		}
+
+		writeSentinelForResult(result, *sentinelFile, runID, stderr)
+
+		return result.ExitCode
+	}
+
 	resumeID := *resume
 	var result attemptResult
 	for attempt := 1; ; attempt++ {
@@ -287,6 +360,17 @@ func permissionCleanupBase(sentinelPath, permissionHandler string) string {
 	return ""
 }
 
+func writeSentinelForResult(result looprunner.RunResult, sentinelFile, runID string, stderr io.Writer) {
+	if sentinelFile == "" {
+		return
+	}
+	if result.Reason != "" {
+		WriteSentinelWithReason(sentinelFile, result.ExitCode, result.SessionID, result.StopReason, runID, result.Reason, stderr)
+	} else {
+		WriteSentinel(sentinelFile, result.ExitCode, result.SessionID, result.StopReason, runID, stderr)
+	}
+}
+
 // selectPermissionOption picks an option ID by matching the protocol kind:
 // allow when approve is true, reject otherwise.
 func selectPermissionOption(options []any, approve bool) (string, error) {
@@ -321,6 +405,27 @@ type permissionResult struct {
 	source string
 }
 
+// sessionResult is the return value of WaitForSession, carrying both the exit
+// code and any loop directive that was detected during the session.
+type sessionResult struct {
+	ExitCode      int
+	LoopDirective string
+	LoopLabel     string
+}
+
+func loopDirectiveSeverity(d string) int {
+	switch d {
+	case "abort":
+		return 3
+	case "exit":
+		return 2
+	case "continue":
+		return 1
+	default:
+		return 0
+	}
+}
+
 func WaitForSession(
 	ctx context.Context,
 	provider runtime.Provider,
@@ -337,10 +442,12 @@ func WaitForSession(
 	permClaimTimeout time.Duration,
 	timeout <-chan time.Time,
 	stderr io.Writer,
-) int {
+) sessionResult {
 	var finalStopReason string
 	promptReturned := false
 	var permissionDone <-chan permissionResult
+	var loopDirective string
+	var loopLabel string
 	tracker := newStatusTracker(sessionID, runID, runLabel)
 
 	writeStatus := func(ev events.Event, ok bool) bool {
@@ -384,35 +491,41 @@ func WaitForSession(
 				// Nil the channel so it no longer fires on subsequent iterations.
 				eventCh = nil
 				if finalStopReason == "" {
-					return 1
+					return sessionResult{ExitCode: 1}
 				}
 				// Wait for any in-flight AnswerPermission goroutine before exiting.
 				if permissionDone != nil {
 					break
 				}
-				return runtime.ExitCodeForStopReason(finalStopReason)
+				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel}
 			}
 			markerHandled := false
 			if event.Event == "agent.message_chunk" || event.Event == "agent.thought_chunk" {
 				if text := chunkText(event); text != "" {
 					if phase, label, ok := digest.ExtractStatusMarker(text); ok {
 						if !writeStatus(tracker.ObserveMarker(phase, label)) {
-							return 1
+							return sessionResult{ExitCode: 1}
 						}
 						markerHandled = true
+					}
+					if dir, lbl, ok := digest.ExtractLoopMarker(text); ok {
+						if loopDirectiveSeverity(dir) > loopDirectiveSeverity(loopDirective) {
+							loopDirective = dir
+							loopLabel = lbl
+						}
 					}
 				}
 			}
 			if !markerHandled {
 				if !writeStatus(tracker.Observe(event)) {
-					return 1
+					return sessionResult{ExitCode: 1}
 				}
 			}
 			if event.Event == "permission.request" {
 				// Auto-answer / control-owner / file fallback resolver.
 				if err := writer.Write(event); err != nil {
 					fmt.Fprintf(stderr, "avenor: write event: %v\n", err)
-					return 1
+					return sessionResult{ExitCode: 1}
 				}
 				requestID, _ := event.Fields["request_id"].(string)
 				if requestID == "" {
@@ -423,7 +536,7 @@ func WaitForSession(
 				}
 				if permissionDone != nil {
 					emitErrorEvent(writer, sessionID, runID, "permission", "another permission request is already pending", stderr, runLabel)
-					return 1
+					return sessionResult{ExitCode: 1}
 				}
 				done := make(chan permissionResult, 1)
 				permissionDone = done
@@ -438,10 +551,10 @@ func WaitForSession(
 			}
 			if err := writer.Write(event); err != nil {
 				fmt.Fprintf(stderr, "avenor: write event: %v\n", err)
-				return 1
+				return sessionResult{ExitCode: 1}
 			}
 			if event.Event == "session.end" && promptReturned && permissionDone == nil {
-				return runtime.ExitCodeForStopReason(finalStopReason)
+				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel}
 			}
 		case err := <-promptDone:
 			promptReturned = true
@@ -450,27 +563,27 @@ func WaitForSession(
 					return cancelAndEnd(provider, writer, sessionID, runID, runLabel, "cancelled", stderr)
 				}
 				emitErrorEvent(writer, sessionID, runID, "prompt", fmt.Sprintf("prompt: %v", err), stderr, runLabel)
-				return 1
+				return sessionResult{ExitCode: 1}
 			}
 			if finalStopReason != "" && permissionDone == nil {
-				return runtime.ExitCodeForStopReason(finalStopReason)
+				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel}
 			}
 		case res := <-permissionDone:
 			permissionDone = nil
 			if res.err != nil {
 				emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("permission handler: %v", res.err), stderr, runLabel)
-				return 1
+				return sessionResult{ExitCode: 1}
 			}
 			if res.requestID != "" {
 				emitPermissionResponse(res.requestID, res.optionID, res.kind, res.source)
 				if !writeStatus(tracker.PermissionAnswered()) {
-					return 1
+					return sessionResult{ExitCode: 1}
 				}
 			}
 			// If session.end + promptDone already arrived while we were waiting for
 			// AnswerPermission, exit now that the permission goroutine has resolved.
 			if finalStopReason != "" && promptReturned {
-				return runtime.ExitCodeForStopReason(finalStopReason)
+				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel}
 			}
 		case <-interruptCh:
 			cancelCtx, cfn := context.WithTimeout(context.Background(), 5*time.Second)
@@ -487,7 +600,7 @@ func WaitForSession(
 	}
 }
 
-func cancelAndEnd(provider runtime.Provider, writer EventSink, sessionID, runID, runLabel, stopReason string, stderr io.Writer) int {
+func cancelAndEnd(provider runtime.Provider, writer EventSink, sessionID, runID, runLabel, stopReason string, stderr io.Writer) sessionResult {
 	cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := provider.Cancel(cancelCtx, sessionID); err != nil {
@@ -501,9 +614,9 @@ func cancelAndEnd(provider runtime.Provider, writer EventSink, sessionID, runID,
 		},
 	}); err != nil {
 		fmt.Fprintf(stderr, "avenor: write terminal event: %v\n", err)
-		return 1
+		return sessionResult{ExitCode: 1}
 	}
-	return runtime.ExitCodeForStopReason(stopReason)
+	return sessionResult{ExitCode: runtime.ExitCodeForStopReason(stopReason)}
 }
 
 type eventWriter struct {

@@ -262,6 +262,14 @@ func excerpt(event map[string]any, name string) string {
 		return stringField(event, "title")
 	case "session.end":
 		return "stop_reason=" + stringField(event, "stop_reason")
+	case "avenor.loop.start":
+		return fmt.Sprintf("loop start, max_iterations=%v", event["max_iterations"])
+	case "avenor.phase.start":
+		return fmt.Sprintf("phase: %s (iter %v)", stringField(event, "phase"), event["iteration"])
+	case "avenor.phase.end":
+		return fmt.Sprintf("phase: %s → %s", stringField(event, "phase"), stringField(event, "stop_reason"))
+	case "avenor.loop.end":
+		return fmt.Sprintf("loop end: %s", stringField(event, "exit_reason"))
 	case "avenor.retry":
 		if event["attempt"] == nil {
 			return "retrying"

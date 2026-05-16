@@ -12,6 +12,8 @@ func ExitCodeForStopReason(stopReason string) int {
 		return 3
 	case "max_turn_requests":
 		return 4
+	case "blocked":
+		return 5
 	case "cancelled":
 		return 130
 	case "timeout":
@@ -34,6 +36,8 @@ func StopReasonForExitCode(exitCode int) string {
 		return "max_tokens"
 	case 4:
 		return "max_turn_requests"
+	case 5:
+		return "blocked"
 	case 124:
 		return "timeout"
 	case 130:

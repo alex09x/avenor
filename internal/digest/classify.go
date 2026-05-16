@@ -42,6 +42,14 @@ func Classify(event map[string]any) string {
 		return TagMilestone
 	case "permission.request":
 		return TagMilestone
+	case "avenor.loop.start":
+		return TagMilestone
+	case "avenor.phase.end":
+		return TagMilestone
+	case "avenor.loop.end":
+		return TagMilestone
+	case "avenor.phase.start":
+		return TagActivity
 	case "avenor.retry", "avenor.error":
 		return TagMilestone
 	case "permission.response":

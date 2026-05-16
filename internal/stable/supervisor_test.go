@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/sdougbrown/avenor/internal/looprunner"
 	"github.com/sdougbrown/avenor/internal/runtime"
 )
 
@@ -97,6 +98,24 @@ func TestSpawnParamsValidation(t *testing.T) {
 	_, err = sup.spawn(SpawnParams{Prompt: "hello"})
 	// Dir defaults to ".", so this shouldn't error on validation alone
 	// It might fail on starting the acp session though
+}
+
+func TestSpawnLoopFileFailureCleansReservedRuntime(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-loop-spawn-cleanup.sock",
+		MaxRuntimes:   1,
+	})
+
+	_, err := sup.spawn(SpawnParams{LoopFile: "/path/does/not/exist.json"})
+	if err == nil {
+		t.Fatal("spawn with missing loop file should error")
+	}
+	if got := sup.activeRuntimeCount(); got != 0 {
+		t.Fatalf("activeRuntimeCount() = %d, want 0", got)
+	}
+	if len(sup.runtimes) != 0 {
+		t.Fatalf("runtimes = %d, want 0 after failed loop spawn", len(sup.runtimes))
+	}
 }
 
 func TestActiveRuntimeCountIgnoresCompletedHistory(t *testing.T) {
@@ -225,10 +244,96 @@ func TestShutdownTimeoutDoesNotHangWithMultipleStuckRuntimes(t *testing.T) {
 	}
 }
 
+func TestRunLoopChildCleansUpOnLooprunnerError(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-loop-cleanup.sock",
+		MaxRuntimes:   1,
+	})
+	sink := &closeRecordingSink{}
+	cancelled := false
+	child := &childRuntime{
+		id:          "rt_loop",
+		done:        make(chan struct{}),
+		promptCh:    make(chan struct{}, 1),
+		eventWriter: sink,
+		cancelFn:    func() { cancelled = true },
+	}
+	sup.runtimes[child.id] = child
+
+	cfg := &looprunner.LoopConfig{
+		MaxIterations: 1,
+		Pre:           []looprunner.Phase{{Name: "broken", Prompt: "{{"}},
+	}
+	sup.runLoopChild(context.Background(), child, cfg, 0, "", "", "")
+
+	select {
+	case <-child.done:
+	default:
+		t.Fatal("loop child done channel was not closed")
+	}
+	if !sink.closed {
+		t.Fatal("loop child event writer was not closed")
+	}
+	if len(sink.events) == 0 {
+		t.Fatal("loop child did not write lifecycle events")
+	}
+	for _, ev := range sink.events {
+		if ev.Fields["runtime_id"] != "rt_loop" {
+			t.Fatalf("event %s runtime_id = %v, want rt_loop", ev.Event, ev.Fields["runtime_id"])
+		}
+	}
+	if !cancelled {
+		t.Fatal("loop child cancel function was not called")
+	}
+	child.mu.Lock()
+	completed := child.completed
+	exitCode := child.exitCode
+	child.mu.Unlock()
+	if !completed {
+		t.Fatal("loop child was not marked completed")
+	}
+	if exitCode != 1 {
+		t.Fatalf("loop child exitCode = %d, want 1", exitCode)
+	}
+	if _, ok := sup.runtimes[child.id]; ok {
+		t.Fatal("loop child was not removed from supervisor runtimes")
+	}
+}
+
+func TestRuntimeAnswerPermissionRejectsRuntimeWithoutActiveSession(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-loop-answer-no-session.sock",
+		MaxRuntimes:   1,
+	})
+	sup.runtimes["rt_loop"] = &childRuntime{
+		id:       "rt_loop",
+		done:     make(chan struct{}),
+		promptCh: make(chan struct{}, 1),
+	}
+
+	if err := sup.RuntimeAnswerPermission("rt_loop", "req_1", "allow"); err == nil {
+		t.Fatal("RuntimeAnswerPermission should reject runtime without active session")
+	}
+}
+
 type stableTestSink struct{}
 
 func (stableTestSink) Write(events.Event) error { return nil }
 func (stableTestSink) Close() error             { return nil }
+
+type closeRecordingSink struct {
+	closed bool
+	events []events.Event
+}
+
+func (s *closeRecordingSink) Write(ev events.Event) error {
+	s.events = append(s.events, ev)
+	return nil
+}
+func (s *closeRecordingSink) Close() error {
+	s.closed = true
+	return nil
+}
 
 type stableFakeProvider struct {
 	events     chan events.Event
