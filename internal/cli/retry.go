@@ -17,6 +17,7 @@ import (
 type attemptResult struct {
 	exitCode      int
 	sessionID     string
+	stopReason    string
 	loopDirective string
 	loopLabel     string
 }
@@ -30,6 +31,7 @@ type attemptConfig struct {
 	runLabel               string
 	autoApprove            bool
 	permissionClaimTimeout time.Duration
+	progressTimeout        time.Duration
 	timer                  <-chan time.Time
 }
 
@@ -125,6 +127,7 @@ func runSingleAttempt(
 			RunLabel:               cfg.runLabel,
 			AutoApprove:            cfg.autoApprove,
 			PermissionClaimTimeout: cfg.permissionClaimTimeout,
+			ProgressTimeout:        cfg.progressTimeout,
 			Timeout:                cfg.timer,
 		}, SessionWaitDeps{
 			Writer:        deps.writer,
@@ -133,6 +136,7 @@ func runSingleAttempt(
 			Stderr:        deps.stderr,
 		})
 		exitCode := result.ExitCode
+		stopReason := result.StopReason
 		cancelEvents()
 
 		if loopDirectiveSeverity(result.LoopDirective) > loopDirectiveSeverity(accDirective) {
@@ -146,7 +150,7 @@ func runSingleAttempt(
 			if interruptText := deps.controlServer.ConsumeInterrupt(); interruptText != "" {
 				if _, err := resumeSession(ctx, provider, session.SessionID); err != nil {
 					fmt.Fprintf(deps.stderr, "avenor: resume after cancel: %v\n", err)
-					return attemptResult{exitCode: 1, sessionID: session.SessionID, loopDirective: accDirective, loopLabel: accLabel}
+					return attemptResult{exitCode: 1, sessionID: session.SessionID, stopReason: stopReason, loopDirective: accDirective, loopLabel: accLabel}
 				}
 				prompt = interruptText
 				continue
@@ -155,7 +159,7 @@ func runSingleAttempt(
 				if nextPrompt := deps.controlServer.DequeuePrompt(); nextPrompt != "" {
 					if _, err := resumeSession(ctx, provider, session.SessionID); err != nil {
 						fmt.Fprintf(deps.stderr, "avenor: resume after end_turn: %v\n", err)
-						return attemptResult{exitCode: 1, sessionID: session.SessionID, loopDirective: accDirective, loopLabel: accLabel}
+						return attemptResult{exitCode: 1, sessionID: session.SessionID, stopReason: stopReason, loopDirective: accDirective, loopLabel: accLabel}
 					}
 					prompt = nextPrompt
 					continue
@@ -163,7 +167,7 @@ func runSingleAttempt(
 			}
 		}
 
-		return attemptResult{exitCode: exitCode, sessionID: session.SessionID, loopDirective: accDirective, loopLabel: accLabel}
+		return attemptResult{exitCode: exitCode, sessionID: session.SessionID, stopReason: stopReason, loopDirective: accDirective, loopLabel: accLabel}
 	}
 }
 

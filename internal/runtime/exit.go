@@ -16,6 +16,8 @@ func ExitCodeForStopReason(stopReason string) int {
 		return 5
 	case "cancelled":
 		return 130
+	case "progress_timeout":
+		return 124
 	case "timeout":
 		return 124
 	default:

@@ -30,6 +30,7 @@ func TestExitCodeForStopReason(t *testing.T) {
 		"blocked":           5,
 		"cancelled":         130,
 		"timeout":           124,
+		"progress_timeout":  124,
 		"":                  1,
 		"unknown":           1,
 	}
