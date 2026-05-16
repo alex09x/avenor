@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/sdougbrown/avenor/internal/events"
@@ -16,11 +17,12 @@ const backendID = "opencode-acp"
 type Provider struct {
 	opts runtime.StartOptions
 
-	mu          sync.Mutex
-	client      *Client
-	events      chan events.Event
-	sessions    map[string]*Session
-	initialized bool
+	mu             sync.Mutex
+	client         *Client
+	events         chan events.Event
+	sessions       map[string]*Session
+	initialized    bool
+	pendingOptions map[string][]any // requestID → permsission options from event
 }
 
 func New() runtime.Provider {
@@ -147,7 +149,17 @@ func (p *Provider) AnswerPermission(ctx context.Context, sessionID string, reque
 	if requestID == "" {
 		return errors.New("permission request id is required")
 	}
-	return client.answerPermission(requestID, permissionResponseResult(response))
+
+	p.mu.Lock()
+	options := p.pendingOptions[requestID]
+	delete(p.pendingOptions, requestID)
+	p.mu.Unlock()
+
+	optionID, err := selectPermissionOption(options, response.Allow)
+	if err != nil {
+		return fmt.Errorf("resolve permission request %q: %w", requestID, err)
+	}
+	return client.answerPermission(requestID, permissionResponseResult(response, optionID))
 }
 
 func (p *Provider) Capabilities(ctx context.Context) (runtime.Capabilities, error) {
@@ -211,11 +223,13 @@ func (p *Provider) ensureClient(ctx context.Context, opts runtime.StartOptions) 
 
 func (p *Provider) pumpClientEvents(client *Client, out chan<- events.Event) {
 	for event := range client.Events() {
+		p.cachePermissionOptions(event)
 		out <- event
 	}
 }
 
 func (p *Provider) publish(event events.Event) {
+	p.cachePermissionOptions(event)
 	p.mu.Lock()
 	out := p.events
 	p.mu.Unlock()
@@ -239,6 +253,26 @@ func (p *Provider) configureSession(ctx context.Context, session *Session, opts 
 	return nil
 }
 
+func (p *Provider) cachePermissionOptions(event events.Event) {
+	if event.Event != "permission.request" {
+		return
+	}
+	requestID, _ := event.Fields["request_id"].(string)
+	if requestID == "" {
+		return
+	}
+	options, _ := event.Fields["options"].([]any)
+	if options == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.pendingOptions == nil {
+		p.pendingOptions = map[string][]any{}
+	}
+	p.pendingOptions[requestID] = options
+	p.mu.Unlock()
+}
+
 func (p *Provider) session(sessionID string) (*Session, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -249,11 +283,7 @@ func (p *Provider) session(sessionID string) (*Session, error) {
 	return session, nil
 }
 
-func permissionResponseResult(response runtime.PermissionResponse) map[string]any {
-	optionID := "reject"
-	if response.Allow {
-		optionID = "allow"
-	}
+func permissionResponseResult(response runtime.PermissionResponse, optionID string) map[string]any {
 	result := map[string]any{
 		"outcome":  "selected",
 		"optionId": optionID,
@@ -262,6 +292,28 @@ func permissionResponseResult(response runtime.PermissionResponse) map[string]an
 		result["message"] = response.Message
 	}
 	return map[string]any{"outcome": result}
+}
+
+func selectPermissionOption(options []any, approve bool) (string, error) {
+	want := "reject"
+	if approve {
+		want = "allow"
+	}
+	for _, opt := range options {
+		m, ok := opt.(map[string]any)
+		if !ok {
+			continue
+		}
+		optID, _ := m["optionId"].(string)
+		kind := strings.ToLower(fmt.Sprint(m["kind"]))
+		if kind == want {
+			if optID == "" {
+				return "", fmt.Errorf("permission option with kind %q missing optionId", want)
+			}
+			return optID, nil
+		}
+	}
+	return "", fmt.Errorf("permission options missing kind %q", want)
 }
 
 func mergeStartOptions(base, override runtime.StartOptions) runtime.StartOptions {

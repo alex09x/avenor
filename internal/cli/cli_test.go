@@ -21,66 +21,6 @@ import (
 	"github.com/sdougbrown/avenor/internal/runtime"
 )
 
-func TestSelectPermissionOption(t *testing.T) {
-	opts := func(pairs ...string) []any {
-		out := make([]any, 0, len(pairs)/2)
-		for i := 0; i+1 < len(pairs); i += 2 {
-			out = append(out, map[string]any{"optionId": pairs[i], "kind": pairs[i+1]})
-		}
-		return out
-	}
-
-	tests := []struct {
-		name    string
-		options []any
-		approve bool
-		want    string
-		wantErr bool
-	}{
-		{
-			name:    "approve picks allow-kind",
-			options: opts("deny", "reject", "allow", "allow"),
-			approve: true,
-			want:    "allow",
-		},
-		{
-			name:    "reject picks reject-kind",
-			options: opts("allow", "allow", "deny", "reject"),
-			approve: false,
-			want:    "deny",
-		},
-		{
-			name:    "unknown kind returns error",
-			options: opts("x1", "other"),
-			approve: true,
-			wantErr: true,
-		},
-		{
-			name:    "empty options returns error",
-			options: nil,
-			approve: true,
-			wantErr: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := selectPermissionOption(tt.options, tt.approve)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("selectPermissionOption() error = nil, want error")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("selectPermissionOption() error = %v", err)
-			}
-			if got != tt.want {
-				t.Errorf("selectPermissionOption(approve=%v) = %q, want %q", tt.approve, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestEffectivePermissionHandlerAutoApproveSkipsDerivedSentinelHandler(t *testing.T) {
 	sentinel := filepath.Join(t.TempDir(), "run.done")
 

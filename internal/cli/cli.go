@@ -406,30 +406,6 @@ func writeSentinelForResult(result looprunner.RunResult, sentinelFile, runID str
 	}
 }
 
-// selectPermissionOption picks an option ID by matching the protocol kind:
-// allow when approve is true, reject otherwise.
-func selectPermissionOption(options []any, approve bool) (string, error) {
-	want := "reject"
-	if approve {
-		want = "allow"
-	}
-	for _, opt := range options {
-		m, ok := opt.(map[string]any)
-		if !ok {
-			continue
-		}
-		optID, _ := m["optionId"].(string)
-		kind := strings.ToLower(fmt.Sprint(m["kind"]))
-		if kind == want {
-			if optID == "" {
-				return "", fmt.Errorf("permission option with kind %q missing optionId", want)
-			}
-			return optID, nil
-		}
-	}
-	return "", fmt.Errorf("permission options missing kind %q", want)
-}
-
 // permissionResult carries the outcome of an async permission resolution.
 type permissionResult struct {
 	err       error
@@ -705,6 +681,23 @@ func permissionKindFromOptionID(optionID string, options []any) string {
 	return "unknown"
 }
 
+// firstOptionKind returns the optionId and kind of the first option matching
+// the given kind. Used for logging in auto-approve flows.
+func firstOptionKind(options []any, wantKind string) (string, string) {
+	for _, opt := range options {
+		m, ok := opt.(map[string]any)
+		if !ok {
+			continue
+		}
+		kind, _ := m["kind"].(string)
+		if strings.ToLower(kind) == wantKind {
+			optID, _ := m["optionId"].(string)
+			return optID, wantKind
+		}
+	}
+	return "", ""
+}
+
 func resolvePermission(
 	ctx context.Context,
 	provider runtime.Provider,
@@ -723,11 +716,7 @@ func resolvePermission(
 		if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 			return permissionResult{err: err}
 		}
-		optionID, _ := selectPermissionOption(options, true)
-		kind := ""
-		if optionID != "" {
-			kind = permissionKindFromOptionID(optionID, options)
-		}
+		optionID, kind := firstOptionKind(options, "allow")
 		return permissionResult{requestID: requestID, optionID: optionID, kind: kind, source: "avenor"}
 	}
 
