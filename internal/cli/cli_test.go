@@ -1023,6 +1023,125 @@ func TestControlPermissionResolution(t *testing.T) {
 	}
 }
 
+// TestControlPermissionNonLiteralOptionIDMapsByKind verifies that the control
+// answer path maps the optionID to Allow by looking up the option kind from
+// the permission.request options, even when the option ID is not the literal
+// string "allow". It tests both the allow path (kind "allow" → Allow=true)
+// and the reject path (kind "reject" → Allow=false).
+func TestControlPermissionNonLiteralOptionIDMapsByKind(t *testing.T) {
+	run := func(t *testing.T, optionID string, expectAllow bool) {
+		t.Helper()
+
+		dir := t.TempDir()
+		eventsPath := filepath.Join(dir, "events.ndjson")
+
+		sockDir, err := os.MkdirTemp("", "av-pnl-*")
+		if err != nil {
+			t.Fatalf("mkdirtemp: %v", err)
+		}
+		t.Cleanup(func() { os.RemoveAll(sockDir) })
+
+		state := control.NewState("run_map", "label", 0)
+		cs := control.NewServer(state)
+		socketPath := filepath.Join(sockDir, "m.sock")
+		if err := cs.Start(socketPath); err != nil {
+			t.Fatalf("start control: %v", err)
+		}
+		defer cs.Stop()
+
+		writer, err := NewEventWriter(eventsPath)
+		if err != nil {
+			t.Fatalf("newEventWriter: %v", err)
+		}
+
+		eventCh := make(chan events.Event, 2)
+		eventCh <- events.Event{
+			Event:     "permission.request",
+			SessionID: "ses_map",
+			Fields: map[string]any{
+				"request_id": "req_map",
+				"options": []any{
+					map[string]any{"optionId": "nope_please", "kind": "reject"},
+					map[string]any{"optionId": "yes_please", "kind": "allow"},
+				},
+			},
+		}
+		eventCh <- events.Event{
+			Event:     "session.end",
+			SessionID: "ses_map",
+			Fields:    map[string]any{"stop_reason": "end_turn"},
+		}
+		close(eventCh)
+		promptDone := make(chan error, 1)
+		promptDone <- nil
+
+		provider := &cliFakeProvider{}
+
+		deadline := time.Now().Add(5 * time.Second)
+		var ctrlConn net.Conn
+		for {
+			ctrlConn, err = net.DialTimeout("unix", socketPath, 2*time.Second)
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("dial control socket: %v", err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		defer ctrlConn.Close()
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		var result sessionResult
+		go func() {
+			defer wg.Done()
+			result = waitForSessionForTest(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_map", "run_map", "", false, 5*time.Second, nil, io.Discard)
+		}()
+
+		time.Sleep(100 * time.Millisecond)
+
+		params, _ := json.Marshal(control.PermissionAnswer{RequestID: "req_map", OptionID: optionID})
+		req := control.Request{JSONRPC: "2.0", ID: 1, Method: "answer_permission", Params: params}
+		b, _ := json.Marshal(req)
+		b = append(b, '\n')
+		if _, err := ctrlConn.Write(b); err != nil {
+			t.Fatalf("write answer_permission: %v", err)
+		}
+
+		_ = ctrlConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		scanner := bufio.NewScanner(ctrlConn)
+		if !scanner.Scan() {
+			t.Fatal("no response to answer_permission")
+		}
+		var resp control.Response
+		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("answer_permission error: %+v", resp.Error)
+		}
+
+		wg.Wait()
+		if err := writer.Close(); err != nil {
+			t.Fatalf("close writer: %v", err)
+		}
+		if result.ExitCode != 0 {
+			t.Fatalf("WaitForSession() = %d, want 0", result.ExitCode)
+		}
+		if provider.answerResponse.Allow != expectAllow {
+			t.Fatalf("answerResponse.Allow = %v, want %v (optionID=%q)", provider.answerResponse.Allow, expectAllow, optionID)
+		}
+	}
+
+	t.Run("allow_by_kind", func(t *testing.T) {
+		run(t, "yes_please", true)
+	})
+	t.Run("reject_by_kind", func(t *testing.T) {
+		run(t, "nope_please", false)
+	})
+}
+
 // TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits verifies that
 // receiving a second permission.request while one is already in-flight causes
 // the loop to emit an avenor.error and exit with code 1.

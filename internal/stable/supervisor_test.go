@@ -388,3 +388,103 @@ func (p *stableFakeProvider) AnswerPermission(context.Context, string, string, r
 func (p *stableFakeProvider) Capabilities(context.Context) (runtime.Capabilities, error) {
 	return runtime.Capabilities{}, nil
 }
+
+// permRecordingProvider records PermissionResponse from AnswerPermission calls.
+type permRecordingProvider struct {
+	lastAllow bool
+	called    bool
+}
+
+func (p *permRecordingProvider) Start(context.Context, runtime.StartOptions) (runtime.Session, error) {
+	return runtime.Session{SessionID: "ses_rec"}, nil
+}
+func (p *permRecordingProvider) Resume(context.Context, string) (runtime.Session, error) {
+	return runtime.Session{}, nil
+}
+func (p *permRecordingProvider) Prompt(context.Context, string, string) error { return nil }
+func (p *permRecordingProvider) Cancel(context.Context, string) error        { return nil }
+func (p *permRecordingProvider) Events(context.Context, string) (<-chan events.Event, error) {
+	return nil, nil
+}
+func (p *permRecordingProvider) AnswerPermission(_ context.Context, _ string, _ string, resp runtime.PermissionResponse) error {
+	p.called = true
+	p.lastAllow = resp.Allow
+	return nil
+}
+func (p *permRecordingProvider) Capabilities(context.Context) (runtime.Capabilities, error) {
+	return runtime.Capabilities{}, nil
+}
+
+func TestAnswerPermissionMapsAllowByKind(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket:         "/tmp/test-answer-kind.sock",
+		MaxRuntimes:           1,
+		PermissionClaimTimeout: 5 * time.Second,
+	})
+	provider := &permRecordingProvider{}
+	sup.runtimes["rt_kind"] = &childRuntime{
+		id:       "rt_kind",
+		provider: provider,
+		session:  runtime.Session{SessionID: "ses_kind"},
+		done:     make(chan struct{}),
+		promptCh: make(chan struct{}, 1),
+	}
+	sup.permOptions["rt_kind:req_kind"] = []any{
+		map[string]any{"optionId": "nope_please", "kind": "reject"},
+		map[string]any{"optionId": "yes_please", "kind": "allow"},
+	}
+
+	if err := sup.answerPermission("rt_kind", "req_kind", "yes_please"); err != nil {
+		t.Fatalf("answerPermission allow: %v", err)
+	}
+	if !provider.called {
+		t.Fatal("AnswerPermission was not called")
+	}
+	if !provider.lastAllow {
+		t.Fatal("Allow = false, want true for kind=allow option")
+	}
+
+	provider.called = false
+	provider.lastAllow = false
+
+	sup.permOptions["rt_kind:req_kind"] = []any{
+		map[string]any{"optionId": "nope_please", "kind": "reject"},
+		map[string]any{"optionId": "yes_please", "kind": "allow"},
+	}
+
+	if err := sup.answerPermission("rt_kind", "req_kind", "nope_please"); err != nil {
+		t.Fatalf("answerPermission reject: %v", err)
+	}
+	if !provider.called {
+		t.Fatal("AnswerPermission was not called")
+	}
+	if provider.lastAllow {
+		t.Fatal("Allow = true, want false for kind=reject option")
+	}
+}
+
+func TestAnswerPermissionClearsCacheEntry(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket:         "/tmp/test-answer-clear.sock",
+		MaxRuntimes:           1,
+		PermissionClaimTimeout: 5 * time.Second,
+	})
+	provider := &permRecordingProvider{}
+	sup.runtimes["rt_clear"] = &childRuntime{
+		id:       "rt_clear",
+		provider: provider,
+		session:  runtime.Session{SessionID: "ses_clear"},
+		done:     make(chan struct{}),
+		promptCh: make(chan struct{}, 1),
+	}
+	sup.permOptions["rt_clear:req_clear"] = []any{
+		map[string]any{"optionId": "ok", "kind": "allow"},
+	}
+
+	if err := sup.answerPermission("rt_clear", "req_clear", "ok"); err != nil {
+		t.Fatalf("answerPermission: %v", err)
+	}
+	if _, ok := sup.permOptions["rt_clear:req_clear"]; ok {
+		t.Fatal("cache entry was not cleared after use")
+	}
+}

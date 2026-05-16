@@ -719,15 +719,16 @@ func resolvePermission(
 ) permissionResult {
 	options, _ := event.Fields["options"].([]any)
 	if autoApprove {
-		optionID, err := selectPermissionOption(options, true)
-		if err != nil {
-			return permissionResult{err: err}
-		}
 		resp := runtime.PermissionResponse{Allow: true}
 		if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 			return permissionResult{err: err}
 		}
-		return permissionResult{requestID: requestID, optionID: optionID, kind: permissionKindFromOptionID(optionID, options), source: "avenor"}
+		optionID, _ := selectPermissionOption(options, true)
+		kind := ""
+		if optionID != "" {
+			kind = permissionKindFromOptionID(optionID, options)
+		}
+		return permissionResult{requestID: requestID, optionID: optionID, kind: kind, source: "avenor"}
 	}
 
 	// Only consult the control plane when a client is actually connected to
@@ -750,24 +751,19 @@ func resolvePermission(
 			case ans := <-answerCh:
 				claimTimer.Stop()
 				controlServer.EndPermissionClaim(requestID)
-				resp := runtime.PermissionResponse{Allow: true}
+				allow := permissionKindFromOptionID(ans.OptionID, options) == "allow"
+				resp := runtime.PermissionResponse{Allow: allow}
 				if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 					return permissionResult{err: err}
 				}
 				return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
 			case <-ctx.Done():
 				claimTimer.Stop()
-				// EndPermissionClaim clears pendingAnswer so the server's next
-				// ownership check sees no claim. Drain the channel afterwards to
-				// catch any answer the server sent in the window between reading
-				// pendingAnswer (under its lock) and our clear landing.
-				// Residual window: a send completing after the drain (between
-				// EndPermissionClaim's unlock and select{default}) is silently
-				// lost — no sleep added per policy.
 				controlServer.EndPermissionClaim(requestID)
 				select {
 				case ans := <-answerCh:
-					resp := runtime.PermissionResponse{Allow: true}
+					allow := permissionKindFromOptionID(ans.OptionID, options) == "allow"
+					resp := runtime.PermissionResponse{Allow: allow}
 					if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 						return permissionResult{err: err}
 					}
@@ -776,19 +772,11 @@ func resolvePermission(
 				}
 				return permissionResult{err: ctx.Err()}
 			case <-claimTimer.C:
-				// Client disconnected or went silent after HasClients() gate.
-				// EndPermissionClaim first: clears pendingAnswer so the server's
-				// ownership check sees no active claim and won't accept new sends.
-				// Then drain to catch any answer already queued in the buffered
-				// channel before or during our clear.
-				// Residual window: a send completing after the drain (between
-				// EndPermissionClaim's unlock and select{default}) is silently
-				// lost — the server already replied "accepted: true" to the client
-				// in that case. No sleep added per policy.
 				controlServer.EndPermissionClaim(requestID)
 				select {
 				case ans := <-answerCh:
-					resp := runtime.PermissionResponse{Allow: true}
+					allow := permissionKindFromOptionID(ans.OptionID, options) == "allow"
+					resp := runtime.PermissionResponse{Allow: allow}
 					if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 						return permissionResult{err: err}
 					}
