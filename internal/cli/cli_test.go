@@ -209,8 +209,8 @@ func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) 
 	if provider.answerSessionID != "ses_1" || provider.answerRequestID != "req_1" {
 		t.Fatalf("answered session=%q request=%q", provider.answerSessionID, provider.answerRequestID)
 	}
-	if provider.answerResponse.OptionID != "allow" {
-		t.Fatalf("answer option = %q, want allow", provider.answerResponse.OptionID)
+	if !provider.answerResponse.Allow {
+		t.Fatal("answerResponse.Allow = false, want true")
 	}
 
 	got := readEventLogForTest(t, eventsPath)
@@ -1018,8 +1018,8 @@ func TestControlPermissionResolution(t *testing.T) {
 	if provider.answerRequestID != "req_ctrl" {
 		t.Fatalf("answerRequestID = %q, want req_ctrl", provider.answerRequestID)
 	}
-	if provider.answerResponse.OptionID != "allow_x" {
-		t.Fatalf("optionID = %q, want allow_x", provider.answerResponse.OptionID)
+	if !provider.answerResponse.Allow {
+		t.Fatal("answerResponse.Allow = false, want true")
 	}
 }
 
@@ -1246,7 +1246,7 @@ func TestControlPermissionClaimTimeoutFallsToFileHandler(t *testing.T) {
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
-		_ = os.WriteFile(respPath, []byte(`{"outcome":"selected","option_id":"allow_fh"}`+"\n"), 0o600)
+		_ = os.WriteFile(respPath, []byte(`{"outcome":"selected","option_id":"allow"}`+"\n"), 0o600)
 	}()
 
 	event := events.Event{
@@ -1272,15 +1272,15 @@ func TestControlPermissionClaimTimeoutFallsToFileHandler(t *testing.T) {
 	if res.source != "file" {
 		t.Fatalf("result source = %q, want \"file\"", res.source)
 	}
-	if res.optionID != "allow_fh" {
-		t.Fatalf("optionID = %q, want \"allow_fh\"", res.optionID)
+	if res.optionID != "allow" {
+		t.Fatalf("optionID = %q, want \"allow\"", res.optionID)
 	}
 	// File handler called provider.AnswerPermission — verify the fields.
 	if provider.answerRequestID != "req_fh" {
 		t.Fatalf("provider.answerRequestID = %q, want \"req_fh\"", provider.answerRequestID)
 	}
-	if provider.answerResponse.OptionID != "allow_fh" {
-		t.Fatalf("provider.answerResponse.OptionID = %q, want \"allow_fh\"", provider.answerResponse.OptionID)
+	if !provider.answerResponse.Allow {
+		t.Fatal("provider.answerResponse.Allow = false, want true")
 	}
 }
 

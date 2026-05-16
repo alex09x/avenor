@@ -96,17 +96,17 @@ func (h *FileHandler) Handle(ctx context.Context, provider runtime.Provider, eve
 		}
 	}
 
-	response, err := h.waitForResponse(ctx, responsePath)
+	response, optionID, err := h.waitForResponse(ctx, responsePath)
 	if err != nil {
 		return Resolution{}, err
 	}
 	if err := provider.AnswerPermission(ctx, event.SessionID, request.RequestID, response); err != nil {
 		return Resolution{}, err
 	}
-	return Resolution{RequestID: request.RequestID, OptionID: response.OptionID}, nil
+	return Resolution{RequestID: request.RequestID, OptionID: optionID}, nil
 }
 
-func (h *FileHandler) waitForResponse(ctx context.Context, path string) (runtime.PermissionResponse, error) {
+func (h *FileHandler) waitForResponse(ctx context.Context, path string) (runtime.PermissionResponse, string, error) {
 	timeout := h.Timeout
 	if timeout == 0 {
 		timeout = DefaultTimeout
@@ -122,40 +122,50 @@ func (h *FileHandler) waitForResponse(ctx context.Context, path string) (runtime
 	defer ticker.Stop()
 
 	for {
-		response, err := readResponse(path)
+		response, optionID, err := readResponse(path)
 		if err == nil {
-			return response, nil
+			return response, optionID, nil
 		}
 		if !errors.Is(err, os.ErrNotExist) {
-			return runtime.PermissionResponse{}, err
+			return runtime.PermissionResponse{}, "", err
 		}
 
 		select {
 		case <-waitCtx.Done():
-			return runtime.PermissionResponse{}, fmt.Errorf("wait for permission response: %w", waitCtx.Err())
+			return runtime.PermissionResponse{}, "", fmt.Errorf("wait for permission response: %w", waitCtx.Err())
 		case <-ticker.C:
 		}
 	}
 }
 
-func readResponse(path string) (runtime.PermissionResponse, error) {
+type fileResponse struct {
+	Outcome  string `json:"outcome"`
+	OptionID string `json:"option_id"`
+	Message  string `json:"message,omitempty"`
+}
+
+func readResponse(path string) (runtime.PermissionResponse, string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return runtime.PermissionResponse{}, err
+		return runtime.PermissionResponse{}, "", err
 	}
 	if len(data) == 0 {
 		// File exists but is empty — likely a non-atomic writer mid-O_TRUNC.
 		// Treat as not-yet-ready so waitForResponse keeps polling.
-		return runtime.PermissionResponse{}, os.ErrNotExist
+		return runtime.PermissionResponse{}, "", os.ErrNotExist
 	}
-	var response runtime.PermissionResponse
-	if err := json.Unmarshal(data, &response); err != nil {
-		return runtime.PermissionResponse{}, err
+	var raw fileResponse
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return runtime.PermissionResponse{}, "", err
 	}
-	if response.Outcome == "" {
-		response.Outcome = "selected"
+	if raw.Outcome == "" {
+		raw.Outcome = "selected"
 	}
-	return response, nil
+	resp := runtime.PermissionResponse{
+		Allow:   raw.OptionID == "allow",
+		Message: raw.Message,
+	}
+	return resp, raw.OptionID, nil
 }
 
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {

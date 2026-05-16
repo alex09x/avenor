@@ -119,8 +119,8 @@ func TestFileHandlerRoundTrip(t *testing.T) {
 	if provider.sessionID != "ses_1" || provider.requestID != "42" {
 		t.Fatalf("answered session=%q request=%q", provider.sessionID, provider.requestID)
 	}
-	if provider.response.Outcome != "selected" || provider.response.OptionID != "allow" {
-		t.Fatalf("response = %+v", provider.response)
+	if !provider.response.Allow {
+		t.Fatalf("response.Allow = false, want true")
 	}
 	select {
 	case res := <-resolved:

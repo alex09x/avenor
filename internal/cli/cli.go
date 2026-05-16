@@ -723,7 +723,7 @@ func resolvePermission(
 		if err != nil {
 			return permissionResult{err: err}
 		}
-		resp := runtime.PermissionResponse{Outcome: "selected", OptionID: optionID}
+		resp := runtime.PermissionResponse{Allow: true}
 		if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 			return permissionResult{err: err}
 		}
@@ -750,7 +750,7 @@ func resolvePermission(
 			case ans := <-answerCh:
 				claimTimer.Stop()
 				controlServer.EndPermissionClaim(requestID)
-				resp := runtime.PermissionResponse{Outcome: "selected", OptionID: ans.OptionID}
+				resp := runtime.PermissionResponse{Allow: true}
 				if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 					return permissionResult{err: err}
 				}
@@ -767,7 +767,7 @@ func resolvePermission(
 				controlServer.EndPermissionClaim(requestID)
 				select {
 				case ans := <-answerCh:
-					resp := runtime.PermissionResponse{Outcome: "selected", OptionID: ans.OptionID}
+					resp := runtime.PermissionResponse{Allow: true}
 					if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 						return permissionResult{err: err}
 					}
@@ -788,7 +788,7 @@ func resolvePermission(
 				controlServer.EndPermissionClaim(requestID)
 				select {
 				case ans := <-answerCh:
-					resp := runtime.PermissionResponse{Outcome: "selected", OptionID: ans.OptionID}
+					resp := runtime.PermissionResponse{Allow: true}
 					if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 						return permissionResult{err: err}
 					}

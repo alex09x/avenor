@@ -893,8 +893,7 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 		return fmt.Errorf("runtime %q has no active session for permission response", rtID)
 	}
 	return provider.AnswerPermission(context.Background(), sessionID, requestID, runtime.PermissionResponse{
-		Outcome:  "selected",
-		OptionID: optionID,
+		Allow: true,
 	})
 }
 

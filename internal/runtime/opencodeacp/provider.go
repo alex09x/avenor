@@ -250,15 +250,13 @@ func (p *Provider) session(sessionID string) (*Session, error) {
 }
 
 func permissionResponseResult(response runtime.PermissionResponse) map[string]any {
-	outcome := response.Outcome
-	if outcome == "" {
-		outcome = "selected"
+	optionID := "reject"
+	if response.Allow {
+		optionID = "allow"
 	}
 	result := map[string]any{
-		"outcome": outcome,
-	}
-	if response.OptionID != "" {
-		result["optionId"] = response.OptionID
+		"outcome":  "selected",
+		"optionId": optionID,
 	}
 	if response.Message != "" {
 		result["message"] = response.Message

@@ -547,7 +547,7 @@ func TestAnswerPermissionUnsupported(t *testing.T) {
 	prov.started = true
 	prov.mu.Unlock()
 
-	err = prov.AnswerPermission(context.Background(), "ses_test", "req_1", runtime.PermissionResponse{OptionID: "allow"})
+	err = prov.AnswerPermission(context.Background(), "ses_test", "req_1", runtime.PermissionResponse{Allow: true})
 	if err == nil {
 		t.Fatal("AnswerPermission should fail while opencode-http permissions are unsupported")
 	}
