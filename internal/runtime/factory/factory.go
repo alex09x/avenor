@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/sdougbrown/avenor/internal/runtime/codexappserver"
 	"github.com/sdougbrown/avenor/internal/runtime/opencodeacp"
 	"github.com/sdougbrown/avenor/internal/runtime/opencodehttp"
 )
@@ -14,6 +15,8 @@ func NewProvider(startOpts runtime.StartOptions, backend string) (runtime.Provid
 		return opencodeacp.NewWithOptions(startOpts), nil
 	case "opencode-http":
 		return opencodehttp.NewWithOptions(startOpts)
+	case "codex-app-server":
+		return codexappserver.NewWithOptions(startOpts), nil
 	default:
 		return nil, fmt.Errorf("unknown backend %q", backend)
 	}

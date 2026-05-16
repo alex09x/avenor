@@ -26,6 +26,16 @@ func TestNewProviderHTTP(t *testing.T) {
 	}
 }
 
+func TestNewProviderCodex(t *testing.T) {
+	p, err := NewProvider(runtime.StartOptions{}, "codex-app-server")
+	if err != nil {
+		t.Fatalf("NewProvider(codex) error = %v", err)
+	}
+	if p == nil {
+		t.Fatal("NewProvider(codex) provider is nil")
+	}
+}
+
 func TestNewProviderUnknown(t *testing.T) {
 	p, err := NewProvider(runtime.StartOptions{}, "unknown")
 	if p != nil {

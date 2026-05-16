@@ -22,9 +22,10 @@ import (
 )
 
 const (
-	defaultBackend      = "opencode-acp"
-	backendOpenCodeACP  = "opencode-acp"
-	backendOpenCodeHTTP = "opencode-http"
+	defaultBackend        = "opencode-acp"
+	backendOpenCodeACP    = "opencode-acp"
+	backendOpenCodeHTTP   = "opencode-http"
+	backendCodexAppServer = "codex-app-server"
 )
 
 // DefaultPermissionClaimTimeout is the default value for --permission-claim-timeout:
@@ -124,6 +125,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "avenor: --server-url is required for backend opencode-http\n")
 			return exitWithSentinel(1)
 		}
+	case backendCodexAppServer:
 	default:
 		fmt.Fprintf(stderr, "avenor: unknown backend %q\n", *backend)
 		return exitWithSentinel(1)

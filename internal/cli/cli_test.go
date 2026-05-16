@@ -1602,3 +1602,13 @@ func TestRunOpenCodeHTTPWithoutServerURL(t *testing.T) {
 		t.Fatalf("stderr = %q, want exact --server-url message", stderr.String())
 	}
 }
+
+func TestRunCodexAppServerBackend(t *testing.T) {
+	// codex-app-server is a valid backend; should not produce "unknown backend".
+	// May fail later (no codex binary), but validation must accept it.
+	var stderr strings.Builder
+	code := run([]string{"--backend", "codex-app-server", "--prompt", "hello"}, nil, &stderr)
+	if code == 1 && strings.Contains(stderr.String(), "unknown backend") {
+		t.Fatalf("codex-app-server was rejected as unknown: %s", stderr.String())
+	}
+}
