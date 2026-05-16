@@ -82,6 +82,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	permissionHandler := fs.String("permission-handler", "", "permission handler, supports file:<path>")
 	sentinelFile := fs.String("sentinel-file", "", "path to write a completion sentinel (also derives permission base unless --permission-handler is set)")
 	timeout := fs.Duration("timeout", 0, "overall session timeout")
+	progressTimeout := fs.Duration("progress-timeout", 0, "session progress timeout (fires if no event for duration)")
 	model := fs.String("model", "", "backend-specific model id")
 	backend := fs.String("backend", defaultBackend, "runtime backend")
 	runIDFlag := fs.String("run-id", "", "correlation id for this run (generated if not set)")
@@ -282,7 +283,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 					runLabel:               *label,
 					autoApprove:            *autoApprove,
 					permissionClaimTimeout: *permClaimTimeout,
-					progressTimeout:        0,
+					progressTimeout:        *progressTimeout,
 					timer:                  timer,
 				}, attemptDeps{
 					writer:        writer,
@@ -333,7 +334,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			runLabel:               *label,
 			autoApprove:            *autoApprove,
 			permissionClaimTimeout: *permClaimTimeout,
-			progressTimeout:        0,
+			progressTimeout:        *progressTimeout,
 			timer:                  timer,
 		}, attemptDeps{
 			writer:        writer,
@@ -499,6 +500,14 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 	var loopLabel string
 	tracker := newStatusTracker(cfg.SessionID, cfg.RunID, cfg.RunLabel)
 
+	var progressTimerC <-chan time.Time
+	var progressTimer *time.Timer
+	if cfg.ProgressTimeout > 0 {
+		progressTimer = time.NewTimer(cfg.ProgressTimeout)
+		defer progressTimer.Stop()
+		progressTimerC = progressTimer.C
+	}
+
 	writeStatus := func(ev events.Event, ok bool) bool {
 		if !ok {
 			return true
@@ -547,6 +556,14 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 					break
 				}
 				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel}
+			} else if progressTimer != nil {
+				if !progressTimer.Stop() {
+					select {
+					case <-progressTimer.C:
+					default:
+					}
+				}
+				progressTimer.Reset(cfg.ProgressTimeout)
 			}
 			markerHandled := false
 			if event.Event == "agent.message_chunk" || event.Event == "agent.thought_chunk" {
@@ -643,6 +660,8 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 			finalStopReason = "cancelled"
 		case <-ctx.Done():
 			return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "cancelled", deps.Stderr)
+		case <-progressTimerC:
+			return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "progress_timeout", deps.Stderr)
 		case <-cfg.Timeout:
 			return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "timeout", deps.Stderr)
 		}
