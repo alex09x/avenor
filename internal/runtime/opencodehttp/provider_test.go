@@ -587,6 +587,162 @@ func TestPublishDropsSlowSubscriberWithoutBlocking(t *testing.T) {
 	}
 }
 
+func TestSSESessionEndFallsBackWhenPOSTHasNoStopReason(t *testing.T) {
+	// When POST /message returns a response without a stop_reason,
+	// messageResultEndEvent returns false and Prompt does NOT emit
+	// session.end. The SSE stream's session.end must still be published
+	// so that WaitForSession doesn't hang.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/global/health":
+			w.WriteHeader(http.StatusOK)
+		case "/session":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": "ses_fallback"})
+		case "/session/ses_fallback/message":
+			w.Header().Set("Content-Type", "application/json")
+			// No stop_reason — simulates a response where messageResultEndEvent returns false.
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "msg_1"})
+		case "/event":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			// First mark the session as busy, then idle — mirrors real server behavior.
+			fmt.Fprint(w, `data: {"type":"session.status","properties":{"sessionID":"ses_fallback","status":{"type":"busy"}}}`+"\n\n")
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			fmt.Fprint(w, `data: {"type":"session.status","properties":{"sessionID":"ses_fallback","status":{"type":"idle"}}}`+"\n\n")
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p, err := NewWithOptions(runtime.StartOptions{})
+	if err != nil {
+		t.Fatalf("NewWithOptions error = %v", err)
+	}
+	session, err := p.Start(context.Background(), runtime.StartOptions{ServerURL: srv.URL})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	defer p.(*Provider).Close()
+
+	eventCtx, cancelEvents := context.WithCancel(context.Background())
+	defer cancelEvents()
+	ch, err := p.Events(eventCtx, session.SessionID)
+	if err != nil {
+		t.Fatalf("Events error = %v", err)
+	}
+
+	// Prompt returns successfully but without emitting session.end (no stop_reason).
+	err = p.Prompt(context.Background(), session.SessionID, "hello")
+	if err != nil {
+		t.Fatalf("Prompt error = %v", err)
+	}
+
+	// The SSE session.end must still arrive as a fallback.
+	select {
+	case evt := <-ch:
+		if evt.Event != "session.end" {
+			t.Fatalf("expected session.end, got %q", evt.Event)
+		}
+		if evt.SessionID != "ses_fallback" {
+			t.Fatalf("expected session ses_fallback, got %q", evt.SessionID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for SSE session.end fallback")
+	}
+}
+
+func TestSSESessionEndSkippedWhenPOSTAlreadyEmitted(t *testing.T) {
+	// When POST /message already emits session.end via publishSessionEnd,
+	// the SSE session.end should be deduplicated and not published again.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/global/health":
+			w.WriteHeader(http.StatusOK)
+		case "/session":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": "ses_dedup"})
+		case "/session/ses_dedup/message":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": "msg_1",
+				"info": map[string]any{
+					"finish": "stop",
+				},
+			})
+		case "/event":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			// Busy then idle — readSSEEvents maps the idle transition to session.end.
+			fmt.Fprint(w, `data: {"type":"session.status","properties":{"sessionID":"ses_dedup","status":{"type":"busy"}}}`+"\n\n")
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			fmt.Fprint(w, `data: {"type":"session.status","properties":{"sessionID":"ses_dedup","status":{"type":"idle"}}}`+"\n\n")
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p, err := NewWithOptions(runtime.StartOptions{})
+	if err != nil {
+		t.Fatalf("NewWithOptions error = %v", err)
+	}
+	session, err := p.Start(context.Background(), runtime.StartOptions{ServerURL: srv.URL})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	defer p.(*Provider).Close()
+
+	eventCtx, cancelEvents := context.WithCancel(context.Background())
+	defer cancelEvents()
+	ch, err := p.Events(eventCtx, session.SessionID)
+	if err != nil {
+		t.Fatalf("Events error = %v", err)
+	}
+
+	err = p.Prompt(context.Background(), session.SessionID, "hello")
+	if err != nil {
+		t.Fatalf("Prompt error = %v", err)
+	}
+
+	// First session.end should arrive from publishSessionEnd (called by Prompt).
+	var endCount int
+	timeout := time.After(2 * time.Second)
+loop:
+	for {
+		select {
+		case evt := <-ch:
+			if evt.Event == "session.end" {
+				endCount++
+			}
+		case <-timeout:
+			break loop
+		}
+	}
+	if endCount != 1 {
+		t.Fatalf("expected exactly 1 session.end event, got %d", endCount)
+	}
+}
+
 func TestStreamEventsReconnectsAfterDisconnect(t *testing.T) {
 	var eventRequests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

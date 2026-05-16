@@ -266,10 +266,13 @@ func (p *Provider) streamEvents(ctx context.Context, c *Client) {
 					goto reconnect
 				}
 				if evt.Event == "session.end" {
-					// POST /message is the authoritative terminal signal. SSE
-					// idle transitions can arrive late and otherwise terminate a
-					// later turn on the same session.
-					continue
+					// POST /message is the authoritative terminal signal. Use
+					// publishSessionEnd to deduplicate: if Prompt already
+					// emitted session.end from the synchronous POST response,
+					// publishSessionEnd skips this SSE event. If the POST
+					// response carried no stop reason, this SSE event serves as
+					// the fallback so subscribers don't hang.
+					p.publishSessionEnd(evt)
 				} else {
 					p.publish(evt)
 				}
