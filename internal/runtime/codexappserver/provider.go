@@ -210,7 +210,7 @@ func (p *Provider) AnswerPermission(ctx context.Context, sessionID string, reque
 	if requestID == "" {
 		return errors.New("permission request id is required")
 	}
-	return c.answerApproval(requestID, response.Allow)
+	return c.answerApprovalThreaded(requestID, sessionID, response.Allow)
 }
 
 func (p *Provider) Capabilities(ctx context.Context) (runtime.Capabilities, error) {

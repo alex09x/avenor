@@ -235,7 +235,7 @@ func TestClientAnswerApproval(t *testing.T) {
 	defer c.Close()
 
 	c.mu.Lock()
-	c.approvals["req_accept"] = pendingApproval{method: "item/commandExecution/requestApproval"}
+	c.approvals["req_accept"] = pendingApproval{threadID: "th_x", method: "item/commandExecution/requestApproval"}
 	c.mu.Unlock()
 
 	done := make(chan rpcMessage, 1)

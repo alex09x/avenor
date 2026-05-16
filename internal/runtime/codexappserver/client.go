@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sdougbrown/avenor/internal/events"
@@ -17,8 +19,9 @@ import (
 const stderrCap = 400 // max lines of stderr retained in rolling buffer
 
 type pendingApproval struct {
-	method string
-	params json.RawMessage
+	threadID string
+	method   string
+	params   json.RawMessage
 }
 
 type client struct {
@@ -160,20 +163,21 @@ func (c *client) request(method string, params any) (json.RawMessage, error) {
 		return nil, fmt.Errorf("marshal params: %w", err)
 	}
 
+	idBytes, _ := json.Marshal(id)
 	msg := rpcMessage{
-		ID:     json.RawMessage(`"` + id + `"`),
+		ID:     json.RawMessage(idBytes),
 		Method: method,
 		Params: pb,
 	}
 	data, _ := json.Marshal(msg)
 	data = append(data, '\n')
 
-	c.mu.Lock()
 	if _, err := c.stdin.Write(data); err != nil {
+		c.mu.Lock()
+		delete(c.pending, id)
 		c.mu.Unlock()
 		return nil, fmt.Errorf("write request: %w", err)
 	}
-	c.mu.Unlock()
 
 	result, ok := <-ch
 	if !ok {
@@ -195,9 +199,7 @@ func (c *client) notify(method string, params any) error {
 	data, _ := json.Marshal(msg)
 	data = append(data, '\n')
 
-	c.mu.Lock()
 	_, err = c.stdin.Write(data)
-	c.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("write notify: %w", err)
 	}
@@ -220,19 +222,53 @@ func (c *client) answerApproval(requestID string, allow bool) error {
 		decision = "accept"
 	}
 
+	// Safely serialize the request ID via json.Marshal to prevent injection.
+	idBytes, _ := json.Marshal(requestID)
 	msg := rpcMessage{
-		ID: json.RawMessage(`"` + requestID + `"`),
-		Result: mustRaw(map[string]any{
-			"decision": decision,
-		}),
+		ID:     json.RawMessage(idBytes),
+		Result: mustRaw(map[string]any{"decision": decision}),
 	}
 	data, _ := json.Marshal(msg)
 	data = append(data, '\n')
 
+	if _, err := c.stdin.Write(data); err != nil {
+		return err
+	}
+	return nil
+}
+
+// answerApprovalThreaded validates that the approval belongs to the given thread
+// before answering. Used by the provider to enforce session-scoped permission isolation.
+func (c *client) answerApprovalThreaded(requestID, threadID string, allow bool) error {
 	c.mu.Lock()
-	_, err := c.stdin.Write(data)
+	approval, ok := c.approvals[requestID]
+	if ok {
+		delete(c.approvals, requestID)
+	}
 	c.mu.Unlock()
-	return err
+	if !ok {
+		return fmt.Errorf("approval request %q not found", requestID)
+	}
+	if approval.threadID != threadID {
+		return fmt.Errorf("approval request %q belongs to thread %q, not %q", requestID, approval.threadID, threadID)
+	}
+
+	decision := "decline"
+	if allow {
+		decision = "accept"
+	}
+	idBytes, _ := json.Marshal(requestID)
+	msg := rpcMessage{
+		ID:     json.RawMessage(idBytes),
+		Result: mustRaw(map[string]any{"decision": decision}),
+	}
+	data, _ := json.Marshal(msg)
+	data = append(data, '\n')
+
+	if _, err := c.stdin.Write(data); err != nil {
+		return err
+	}
+	return nil
 }
 
 // subscribe registers a channel to receive events for a given threadID.
@@ -275,12 +311,18 @@ func (c *client) unregisterTurn(turnID string) {
 func (c *client) readLoop() {
 	defer close(c.done)
 	scanner := bufio.NewScanner(c.stdout)
+	// Allow up to 50MB per line (codex can emit large JSON payloads).
+	scanner.Buffer(make([]byte, 1024*1024), 50*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
 		}
 		c.dispatchLine(line)
+	}
+	if err := scanner.Err(); err != nil {
+		// Log stderr? For now, drain is best-effort.
+		_ = err
 	}
 }
 
@@ -349,7 +391,10 @@ func (c *client) routeNotification(method string, params json.RawMessage) {
 			ch, ok := c.turns[n.Turn.ID]
 			c.mu.Unlock()
 			if ok {
-				ch <- *ev
+				select {
+				case ch <- *ev:
+				default:
+				}
 			}
 		}
 	}
@@ -372,7 +417,7 @@ func (c *client) routeApprovalRequest(id json.RawMessage, method string, params 
 	ev.Fields["request_id"] = idStr
 
 	c.mu.Lock()
-	c.approvals[idStr] = pendingApproval{method: method, params: params}
+	c.approvals[idStr] = pendingApproval{threadID: ev.SessionID, method: method, params: params}
 	c.mu.Unlock()
 
 	c.fanout(ev)
@@ -382,7 +427,10 @@ func (c *client) fanout(ev *events.Event) {
 	if ev == nil {
 		return
 	}
-	c.eventsCh <- *ev
+	select {
+	case c.eventsCh <- *ev:
+	default:
+	}
 
 	c.mu.Lock()
 	chans := c.subs[ev.SessionID]
@@ -426,19 +474,18 @@ func (b *rollingBuffer) Append(line string) {
 func (b *rollingBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	out := ""
+	var sb strings.Builder
 	for _, line := range b.lines {
-		out += line + "\n"
+		sb.WriteString(line)
+		sb.WriteByte('\n')
 	}
-	return out
+	return sb.String()
 }
 
 var requestIDCounter int64
 
 func newRequestID() string {
-	// Simple counter-based IDs — enough for a single client.
-	requestIDCounter++
-	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), requestIDCounter)
+	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), atomic.AddInt64(&requestIDCounter, 1))
 }
 
 func mustRaw(v any) json.RawMessage {
