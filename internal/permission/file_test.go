@@ -65,7 +65,7 @@ func TestFileHandlerRoundTrip(t *testing.T) {
 			"tool":       "bash",
 			"question":   "Run command?",
 			"options": []any{
-				map[string]any{"optionId": "allow", "kind": "allow"},
+				map[string]any{"optionId": "allow_fh", "kind": "allow"},
 			},
 		},
 	}
@@ -102,7 +102,7 @@ func TestFileHandlerRoundTrip(t *testing.T) {
 		t.Fatalf("request = %+v", request)
 	}
 
-	response := []byte(`{"outcome":"selected","option_id":"allow"}`)
+	response := []byte(`{"outcome":"selected","option_id":"allow_fh"}`)
 	if err := os.WriteFile(reqPath+".response", response, 0o600); err != nil {
 		t.Fatalf("write response: %v", err)
 	}
@@ -119,12 +119,15 @@ func TestFileHandlerRoundTrip(t *testing.T) {
 	if provider.sessionID != "ses_1" || provider.requestID != "42" {
 		t.Fatalf("answered session=%q request=%q", provider.sessionID, provider.requestID)
 	}
-	if provider.response.Outcome != "selected" || provider.response.OptionID != "allow" {
-		t.Fatalf("response = %+v", provider.response)
+	if !provider.response.Allow {
+		t.Fatalf("response.Allow = false, want true")
+	}
+	if provider.response.OptionID != "allow_fh" {
+		t.Fatalf("response.OptionID = %q, want allow_fh", provider.response.OptionID)
 	}
 	select {
 	case res := <-resolved:
-		if res.RequestID != "42" || res.OptionID != "allow" {
+		if res.RequestID != "42" || res.OptionID != "allow_fh" {
 			t.Fatalf("resolution = %+v", res)
 		}
 	default:
@@ -138,5 +141,150 @@ func TestFileHandlerRoundTrip(t *testing.T) {
 		}
 	default:
 		t.Fatal("permission.request was not emitted")
+	}
+}
+
+func TestFileHandlerCancelledOutcomeDoesNotAnswerPermission(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "permission")
+	handler := NewFileHandler(base)
+	handler.Timeout = 2 * time.Second
+	handler.PollInterval = 10 * time.Millisecond
+
+	provider := &fakeProvider{}
+	event := events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_1",
+		Fields: map[string]any{
+			"request_id": "42",
+			"options": []any{
+				map[string]any{"optionId": "allow_fh", "kind": "allow"},
+			},
+		},
+	}
+
+	done := make(chan struct {
+		res Resolution
+		err error
+	}, 1)
+	go func() {
+		res, err := handler.Handle(context.Background(), provider, event, nil)
+		done <- struct {
+			res Resolution
+			err error
+		}{res: res, err: err}
+	}()
+
+	reqPath := base + ".req"
+	for i := 0; i < 100; i++ {
+		if _, err := os.Stat(reqPath); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(reqPath); err != nil {
+		t.Fatalf("request file was not created before response: %v", err)
+	}
+	if err := os.WriteFile(reqPath+".response", []byte(`{"outcome":"cancelled","option_id":"allow_fh"}`), 0o600); err != nil {
+		t.Fatalf("write response: %v", err)
+	}
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Handle returned error: %v", got.err)
+		}
+		if !got.res.Cancelled {
+			t.Fatalf("Resolution.Cancelled = false, want true: %+v", got.res)
+		}
+		if provider.requestID != "" {
+			t.Fatalf("AnswerPermission was called for request %q", provider.requestID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for handler")
+	}
+}
+
+func TestReadResponseMapping(t *testing.T) {
+	dir := t.TempDir()
+
+	tests := []struct {
+		name       string
+		json       string
+		options    any
+		wantAllow  bool
+		wantOptID  string
+		wantErrMsg string
+	}{
+		{
+			name:      "custom allow id maps to Allow=true",
+			json:      `{"outcome":"selected","option_id":"allow_fh"}`,
+			options:   []any{map[string]any{"optionId": "allow_fh", "kind": "allow"}},
+			wantAllow: true,
+			wantOptID: "allow_fh",
+		},
+		{
+			name:      "reject id maps to Allow=false",
+			json:      `{"outcome":"selected","option_id":"deny_fh"}`,
+			options:   []any{map[string]any{"optionId": "deny_fh", "kind": "reject"}},
+			wantAllow: false,
+			wantOptID: "deny_fh",
+		},
+		{
+			name:       "unknown option id errors",
+			json:       `{"outcome":"selected","option_id":"custom_deny"}`,
+			options:    []any{map[string]any{"optionId": "allow_fh", "kind": "allow"}},
+			wantErrMsg: `unknown permission option_id "custom_deny"`,
+		},
+		{
+			name:      "cancelled outcome is accepted",
+			json:      `{"outcome":"cancelled","option_id":"allow_fh"}`,
+			options:   []any{map[string]any{"optionId": "allow_fh", "kind": "allow"}},
+			wantAllow: true,
+			wantOptID: "allow_fh",
+		},
+		{
+			name:       "invalid outcome errors",
+			json:       `{"outcome":"ignored","option_id":"allow_fh"}`,
+			options:    []any{map[string]any{"optionId": "allow_fh", "kind": "allow"}},
+			wantErrMsg: `invalid permission response outcome "ignored"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(dir, "test.resp")
+			if err := os.WriteFile(path, []byte(tt.json), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			raw, err := readResponse(path)
+			if err != nil {
+				if tt.wantErrMsg == "" {
+					t.Fatalf("readResponse: %v", err)
+				}
+				if err.Error() != tt.wantErrMsg {
+					t.Fatalf("readResponse error = %q, want %q", err.Error(), tt.wantErrMsg)
+				}
+				return
+			}
+			resp, err := permissionResponseFromRequest(tt.options, raw, raw.OptionID)
+			if err != nil {
+				if tt.wantErrMsg == "" {
+					t.Fatalf("permissionResponseFromRequest: %v", err)
+				}
+				if err.Error() != tt.wantErrMsg {
+					t.Fatalf("permissionResponseFromRequest error = %q, want %q", err.Error(), tt.wantErrMsg)
+				}
+				return
+			}
+			if resp.Allow != tt.wantAllow {
+				t.Errorf("Allow = %v, want %v", resp.Allow, tt.wantAllow)
+			}
+			if resp.OptionID != tt.wantOptID {
+				t.Errorf("response.OptionID = %q, want %q", resp.OptionID, tt.wantOptID)
+			}
+			if raw.OptionID != tt.wantOptID {
+				t.Errorf("optionID = %q, want %q", raw.OptionID, tt.wantOptID)
+			}
+		})
 	}
 }

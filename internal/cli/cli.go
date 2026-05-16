@@ -22,9 +22,10 @@ import (
 )
 
 const (
-	defaultBackend      = "opencode-acp"
-	backendOpenCodeACP  = "opencode-acp"
-	backendOpenCodeHTTP = "opencode-http"
+	defaultBackend        = "opencode-acp"
+	backendOpenCodeACP    = "opencode-acp"
+	backendOpenCodeHTTP   = "opencode-http"
+	backendCodexAppServer = "codex-app-server"
 )
 
 // DefaultPermissionClaimTimeout is the default value for --permission-claim-timeout:
@@ -130,6 +131,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "avenor: --server-url is required for backend opencode-http\n")
 			return exitWithSentinel(1)
 		}
+	case backendCodexAppServer:
 	default:
 		fmt.Fprintf(stderr, "avenor: unknown backend %q\n", *backend)
 		return exitWithSentinel(1)
@@ -416,36 +418,13 @@ func writeSentinelForResult(result looprunner.RunResult, sentinelFile, runID str
 	}
 }
 
-// selectPermissionOption picks an option ID by matching the protocol kind:
-// allow when approve is true, reject otherwise.
-func selectPermissionOption(options []any, approve bool) (string, error) {
-	want := "reject"
-	if approve {
-		want = "allow"
-	}
-	for _, opt := range options {
-		m, ok := opt.(map[string]any)
-		if !ok {
-			continue
-		}
-		optID, _ := m["optionId"].(string)
-		kind := strings.ToLower(fmt.Sprint(m["kind"]))
-		if kind == want {
-			if optID == "" {
-				return "", fmt.Errorf("permission option with kind %q missing optionId", want)
-			}
-			return optID, nil
-		}
-	}
-	return "", fmt.Errorf("permission options missing kind %q", want)
-}
-
 // permissionResult carries the outcome of an async permission resolution.
 type permissionResult struct {
 	err       error
 	requestID string
 	optionID  string
 	kind      string
+	cancelled bool
 	// source is "avenor", "control", or "file".
 	source string
 }
@@ -498,6 +477,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 	var permissionDone <-chan permissionResult
 	var loopDirective string
 	var loopLabel string
+	eventChClosed := false
 	tracker := newStatusTracker(cfg.SessionID, cfg.RunID, cfg.RunLabel)
 
 	var progressTimerC <-chan time.Time
@@ -548,12 +528,13 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 			if !ok {
 				// Nil the channel so it no longer fires on subsequent iterations.
 				cfg.EventCh = nil
-				if finalStopReason == "" {
-					return sessionResult{ExitCode: 1}
-				}
+				eventChClosed = true
 				// Wait for any in-flight AnswerPermission goroutine before exiting.
 				if permissionDone != nil {
 					break
+				}
+				if finalStopReason == "" {
+					return sessionResult{ExitCode: 1}
 				}
 				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel}
 			} else if progressTimer != nil {
@@ -636,6 +617,9 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 			}
 		case res := <-permissionDone:
 			permissionDone = nil
+			if res.cancelled {
+				return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "cancelled", deps.Stderr)
+			}
 			if res.err != nil {
 				emitErrorEvent(deps.Writer, cfg.SessionID, cfg.RunID, "permission", fmt.Sprintf("permission handler: %v", res.err), deps.Stderr, cfg.RunLabel)
 				return sessionResult{ExitCode: 1}
@@ -650,6 +634,9 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 			// AnswerPermission, exit now that the permission goroutine has resolved.
 			if finalStopReason != "" && promptReturned {
 				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel}
+			}
+			if eventChClosed && finalStopReason == "" {
+				return sessionResult{ExitCode: 1}
 			}
 		case <-cfg.InterruptCh:
 			cancelCtx, cfn := context.WithTimeout(context.Background(), 5*time.Second)
@@ -735,6 +722,23 @@ func permissionKindFromOptionID(optionID string, options []any) string {
 	return "unknown"
 }
 
+// firstOptionKind returns the optionId and kind of the first option matching
+// the given kind. Used for logging in auto-approve flows.
+func firstOptionKind(options []any, wantKind string) (string, string) {
+	for _, opt := range options {
+		m, ok := opt.(map[string]any)
+		if !ok {
+			continue
+		}
+		kind, _ := m["kind"].(string)
+		if strings.ToLower(kind) == wantKind {
+			optID, _ := m["optionId"].(string)
+			return optID, wantKind
+		}
+	}
+	return "", ""
+}
+
 func resolvePermission(
 	ctx context.Context,
 	provider runtime.Provider,
@@ -749,15 +753,12 @@ func resolvePermission(
 ) permissionResult {
 	options, _ := event.Fields["options"].([]any)
 	if autoApprove {
-		optionID, err := selectPermissionOption(options, true)
-		if err != nil {
-			return permissionResult{err: err}
-		}
-		resp := runtime.PermissionResponse{Outcome: "selected", OptionID: optionID}
+		optionID, kind := firstOptionKind(options, "allow")
+		resp := runtime.PermissionResponse{Allow: true, OptionID: optionID}
 		if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 			return permissionResult{err: err}
 		}
-		return permissionResult{requestID: requestID, optionID: optionID, kind: permissionKindFromOptionID(optionID, options), source: "avenor"}
+		return permissionResult{requestID: requestID, optionID: optionID, kind: kind, source: "avenor"}
 	}
 
 	// Only consult the control plane when a client is actually connected to
@@ -780,49 +781,51 @@ func resolvePermission(
 			case ans := <-answerCh:
 				claimTimer.Stop()
 				controlServer.EndPermissionClaim(requestID)
-				resp := runtime.PermissionResponse{Outcome: "selected", OptionID: ans.OptionID}
+				kind := permissionKindFromOptionID(ans.OptionID, options)
+				switch kind {
+				case "allow", "reject":
+				default:
+					return permissionResult{err: fmt.Errorf("unknown option_id %q for request %q", ans.OptionID, requestID)}
+				}
+				resp := runtime.PermissionResponse{Allow: kind == "allow", OptionID: ans.OptionID}
 				if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 					return permissionResult{err: err}
 				}
-				return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
+				return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: kind, source: "control"}
 			case <-ctx.Done():
 				claimTimer.Stop()
-				// EndPermissionClaim clears pendingAnswer so the server's next
-				// ownership check sees no claim. Drain the channel afterwards to
-				// catch any answer the server sent in the window between reading
-				// pendingAnswer (under its lock) and our clear landing.
-				// Residual window: a send completing after the drain (between
-				// EndPermissionClaim's unlock and select{default}) is silently
-				// lost — no sleep added per policy.
 				controlServer.EndPermissionClaim(requestID)
 				select {
 				case ans := <-answerCh:
-					resp := runtime.PermissionResponse{Outcome: "selected", OptionID: ans.OptionID}
+					kind := permissionKindFromOptionID(ans.OptionID, options)
+					switch kind {
+					case "allow", "reject":
+					default:
+						return permissionResult{err: fmt.Errorf("unknown option_id %q for request %q", ans.OptionID, requestID)}
+					}
+					resp := runtime.PermissionResponse{Allow: kind == "allow", OptionID: ans.OptionID}
 					if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 						return permissionResult{err: err}
 					}
-					return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
+					return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: kind, source: "control"}
 				default:
 				}
 				return permissionResult{err: ctx.Err()}
 			case <-claimTimer.C:
-				// Client disconnected or went silent after HasClients() gate.
-				// EndPermissionClaim first: clears pendingAnswer so the server's
-				// ownership check sees no active claim and won't accept new sends.
-				// Then drain to catch any answer already queued in the buffered
-				// channel before or during our clear.
-				// Residual window: a send completing after the drain (between
-				// EndPermissionClaim's unlock and select{default}) is silently
-				// lost — the server already replied "accepted: true" to the client
-				// in that case. No sleep added per policy.
 				controlServer.EndPermissionClaim(requestID)
 				select {
 				case ans := <-answerCh:
-					resp := runtime.PermissionResponse{Outcome: "selected", OptionID: ans.OptionID}
+					kind := permissionKindFromOptionID(ans.OptionID, options)
+					switch kind {
+					case "allow", "reject":
+					default:
+						return permissionResult{err: fmt.Errorf("unknown option_id %q for request %q", ans.OptionID, requestID)}
+					}
+					resp := runtime.PermissionResponse{Allow: kind == "allow", OptionID: ans.OptionID}
 					if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 						return permissionResult{err: err}
 					}
-					return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: permissionKindFromOptionID(ans.OptionID, options), source: "control"}
+					return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: kind, source: "control"}
 				default:
 					// Nothing in the channel; fall through to the file-handler.
 				}
@@ -834,6 +837,9 @@ func resolvePermission(
 		res, err := fileHandler.Handle(ctx, provider, event, emit)
 		if err != nil {
 			return permissionResult{err: err}
+		}
+		if res.Cancelled {
+			return permissionResult{requestID: res.RequestID, optionID: res.OptionID, kind: permissionKindFromOptionID(res.OptionID, options), cancelled: true, source: "file"}
 		}
 		return permissionResult{requestID: res.RequestID, optionID: res.OptionID, kind: permissionKindFromOptionID(res.OptionID, options), source: "file"}
 	}

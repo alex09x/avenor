@@ -21,66 +21,6 @@ import (
 	"github.com/sdougbrown/avenor/internal/runtime"
 )
 
-func TestSelectPermissionOption(t *testing.T) {
-	opts := func(pairs ...string) []any {
-		out := make([]any, 0, len(pairs)/2)
-		for i := 0; i+1 < len(pairs); i += 2 {
-			out = append(out, map[string]any{"optionId": pairs[i], "kind": pairs[i+1]})
-		}
-		return out
-	}
-
-	tests := []struct {
-		name    string
-		options []any
-		approve bool
-		want    string
-		wantErr bool
-	}{
-		{
-			name:    "approve picks allow-kind",
-			options: opts("deny", "reject", "allow", "allow"),
-			approve: true,
-			want:    "allow",
-		},
-		{
-			name:    "reject picks reject-kind",
-			options: opts("allow", "allow", "deny", "reject"),
-			approve: false,
-			want:    "deny",
-		},
-		{
-			name:    "unknown kind returns error",
-			options: opts("x1", "other"),
-			approve: true,
-			wantErr: true,
-		},
-		{
-			name:    "empty options returns error",
-			options: nil,
-			approve: true,
-			wantErr: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := selectPermissionOption(tt.options, tt.approve)
-			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("selectPermissionOption() error = nil, want error")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("selectPermissionOption() error = %v", err)
-			}
-			if got != tt.want {
-				t.Errorf("selectPermissionOption(approve=%v) = %q, want %q", tt.approve, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestEffectivePermissionHandlerAutoApproveSkipsDerivedSentinelHandler(t *testing.T) {
 	sentinel := filepath.Join(t.TempDir(), "run.done")
 
@@ -99,6 +39,7 @@ type cliFakeProvider struct {
 	answerSessionID string
 	answerRequestID string
 	answerResponse  runtime.PermissionResponse
+	cancelSessionID string
 }
 
 func (f *cliFakeProvider) Start(ctx context.Context, opts runtime.StartOptions) (runtime.Session, error) {
@@ -114,6 +55,7 @@ func (f *cliFakeProvider) Prompt(ctx context.Context, sessionID string, prompt s
 }
 
 func (f *cliFakeProvider) Cancel(ctx context.Context, sessionID string) error {
+	f.cancelSessionID = sessionID
 	return nil
 }
 
@@ -167,6 +109,20 @@ func waitForSessionForTest(
 	})
 }
 
+func waitForPendingPermissionForTest(t *testing.T, cs *control.ControlServer) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if cs.HasPendingPermission() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for pending permission claim")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
@@ -209,8 +165,11 @@ func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) 
 	if provider.answerSessionID != "ses_1" || provider.answerRequestID != "req_1" {
 		t.Fatalf("answered session=%q request=%q", provider.answerSessionID, provider.answerRequestID)
 	}
+	if !provider.answerResponse.Allow {
+		t.Fatal("answerResponse.Allow = false, want true")
+	}
 	if provider.answerResponse.OptionID != "allow" {
-		t.Fatalf("answer option = %q, want allow", provider.answerResponse.OptionID)
+		t.Fatalf("answerResponse.OptionID = %q, want allow", provider.answerResponse.OptionID)
 	}
 
 	got := readEventLogForTest(t, eventsPath)
@@ -982,9 +941,7 @@ func TestControlPermissionResolution(t *testing.T) {
 		result = waitForSessionForTest(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_ctrl", "run_1", "mylabel", false, 5*time.Second, nil, io.Discard)
 	}()
 
-	// Wait for the permission.request to be processed by the event loop
-	// before sending the answer so the claim window is open.
-	time.Sleep(100 * time.Millisecond)
+	waitForPendingPermissionForTest(t, cs)
 
 	// Answer the pending permission via the control socket.
 	params, _ := json.Marshal(control.PermissionAnswer{RequestID: "req_ctrl", OptionID: "allow_x"})
@@ -1018,8 +975,293 @@ func TestControlPermissionResolution(t *testing.T) {
 	if provider.answerRequestID != "req_ctrl" {
 		t.Fatalf("answerRequestID = %q, want req_ctrl", provider.answerRequestID)
 	}
-	if provider.answerResponse.OptionID != "allow_x" {
-		t.Fatalf("optionID = %q, want allow_x", provider.answerResponse.OptionID)
+	if !provider.answerResponse.Allow {
+		t.Fatal("answerResponse.Allow = false, want true")
+	}
+}
+
+// TestControlPermissionNonLiteralOptionIDMapsByKind verifies that the control
+// answer path maps the optionID to Allow by looking up the option kind from
+// the permission.request options, even when the option ID is not the literal
+// string "allow". It tests both the allow path (kind "allow" → Allow=true)
+// and the reject path (kind "reject" → Allow=false).
+func TestControlPermissionNonLiteralOptionIDMapsByKind(t *testing.T) {
+	run := func(t *testing.T, optionID string, expectAllow bool) {
+		t.Helper()
+
+		dir := t.TempDir()
+		eventsPath := filepath.Join(dir, "events.ndjson")
+
+		sockDir, err := os.MkdirTemp("", "av-pnl-*")
+		if err != nil {
+			t.Fatalf("mkdirtemp: %v", err)
+		}
+		t.Cleanup(func() { os.RemoveAll(sockDir) })
+
+		state := control.NewState("run_map", "label", 0)
+		cs := control.NewServer(state)
+		socketPath := filepath.Join(sockDir, "m.sock")
+		if err := cs.Start(socketPath); err != nil {
+			t.Fatalf("start control: %v", err)
+		}
+		defer cs.Stop()
+
+		writer, err := NewEventWriter(eventsPath)
+		if err != nil {
+			t.Fatalf("newEventWriter: %v", err)
+		}
+
+		eventCh := make(chan events.Event, 2)
+		eventCh <- events.Event{
+			Event:     "permission.request",
+			SessionID: "ses_map",
+			Fields: map[string]any{
+				"request_id": "req_map",
+				"options": []any{
+					map[string]any{"optionId": "nope_please", "kind": "reject"},
+					map[string]any{"optionId": "yes_please", "kind": "allow"},
+				},
+			},
+		}
+		eventCh <- events.Event{
+			Event:     "session.end",
+			SessionID: "ses_map",
+			Fields:    map[string]any{"stop_reason": "end_turn"},
+		}
+		close(eventCh)
+		promptDone := make(chan error, 1)
+		promptDone <- nil
+
+		provider := &cliFakeProvider{}
+
+		deadline := time.Now().Add(5 * time.Second)
+		var ctrlConn net.Conn
+		for {
+			ctrlConn, err = net.DialTimeout("unix", socketPath, 2*time.Second)
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("dial control socket: %v", err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		defer ctrlConn.Close()
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		var result sessionResult
+		go func() {
+			defer wg.Done()
+			result = waitForSessionForTest(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_map", "run_map", "", false, 5*time.Second, nil, io.Discard)
+		}()
+
+		waitForPendingPermissionForTest(t, cs)
+
+		params, _ := json.Marshal(control.PermissionAnswer{RequestID: "req_map", OptionID: optionID})
+		req := control.Request{JSONRPC: "2.0", ID: 1, Method: "answer_permission", Params: params}
+		b, _ := json.Marshal(req)
+		b = append(b, '\n')
+		if _, err := ctrlConn.Write(b); err != nil {
+			t.Fatalf("write answer_permission: %v", err)
+		}
+
+		_ = ctrlConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		scanner := bufio.NewScanner(ctrlConn)
+		if !scanner.Scan() {
+			t.Fatal("no response to answer_permission")
+		}
+		var resp control.Response
+		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("answer_permission error: %+v", resp.Error)
+		}
+
+		wg.Wait()
+		if err := writer.Close(); err != nil {
+			t.Fatalf("close writer: %v", err)
+		}
+		if result.ExitCode != 0 {
+			t.Fatalf("WaitForSession() = %d, want 0", result.ExitCode)
+		}
+		if provider.answerResponse.Allow != expectAllow {
+			t.Fatalf("answerResponse.Allow = %v, want %v (optionID=%q)", provider.answerResponse.Allow, expectAllow, optionID)
+		}
+		if provider.answerResponse.OptionID != optionID {
+			t.Fatalf("answerResponse.OptionID = %q, want %q", provider.answerResponse.OptionID, optionID)
+		}
+	}
+
+	t.Run("allow_by_kind", func(t *testing.T) {
+		run(t, "yes_please", true)
+	})
+	t.Run("reject_by_kind", func(t *testing.T) {
+		run(t, "nope_please", false)
+	})
+}
+
+func TestControlPermissionRejectsUnknownOptionID(t *testing.T) {
+	sockDir, err := os.MkdirTemp("", "av-bad-*")
+	if err != nil {
+		t.Fatalf("mkdirtemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+
+	state := control.NewState("run_bad", "label", 0)
+	cs := control.NewServer(state)
+	socketPath := filepath.Join(sockDir, "cs.sock")
+	if err := cs.Start(socketPath); err != nil {
+		t.Fatalf("start control: %v", err)
+	}
+	defer cs.Stop()
+
+	dir := t.TempDir()
+	eventsPath := filepath.Join(dir, "events.ndjson")
+	writer, err := NewEventWriter(eventsPath)
+	if err != nil {
+		t.Fatalf("newEventWriter: %v", err)
+	}
+
+	eventCh := make(chan events.Event, 1)
+	eventCh <- events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_bad",
+		Fields: map[string]any{
+			"request_id": "req_bad",
+			"options": []any{
+				map[string]any{"optionId": "allow_x", "kind": "allow"},
+				map[string]any{"optionId": "deny_x", "kind": "reject"},
+			},
+		},
+	}
+	close(eventCh)
+	promptDone := make(chan error, 1)
+	promptDone <- nil
+
+	provider := &cliFakeProvider{}
+	deadline := time.Now().Add(5 * time.Second)
+	var ctrlConn net.Conn
+	for {
+		ctrlConn, err = net.DialTimeout("unix", socketPath, 2*time.Second)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dial control socket: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	defer ctrlConn.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var result sessionResult
+	go func() {
+		defer wg.Done()
+		result = waitForSessionForTest(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_bad", "run_bad", "", false, 5*time.Second, nil, io.Discard)
+	}()
+	waitForPendingPermissionForTest(t, cs)
+
+	params, _ := json.Marshal(control.PermissionAnswer{RequestID: "req_bad", OptionID: "missing"})
+	req := control.Request{JSONRPC: "2.0", ID: 1, Method: "answer_permission", Params: params}
+	b, _ := json.Marshal(req)
+	b = append(b, '\n')
+	if _, err := ctrlConn.Write(b); err != nil {
+		t.Fatalf("write answer_permission: %v", err)
+	}
+
+	wg.Wait()
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	if result.ExitCode != 1 {
+		t.Fatalf("WaitForSession() = %d, want 1", result.ExitCode)
+	}
+	if provider.answerRequestID != "" {
+		t.Fatalf("AnswerPermission was called for request %q", provider.answerRequestID)
+	}
+}
+
+func TestControlPermissionRejectsUnsupportedKind(t *testing.T) {
+	sockDir, err := os.MkdirTemp("", "av-bad-kind-*")
+	if err != nil {
+		t.Fatalf("mkdirtemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+
+	state := control.NewState("run_bad_kind", "label", 0)
+	cs := control.NewServer(state)
+	socketPath := filepath.Join(sockDir, "cs.sock")
+	if err := cs.Start(socketPath); err != nil {
+		t.Fatalf("start control: %v", err)
+	}
+	defer cs.Stop()
+
+	dir := t.TempDir()
+	eventsPath := filepath.Join(dir, "events.ndjson")
+	writer, err := NewEventWriter(eventsPath)
+	if err != nil {
+		t.Fatalf("newEventWriter: %v", err)
+	}
+
+	eventCh := make(chan events.Event, 1)
+	eventCh <- events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_bad_kind",
+		Fields: map[string]any{
+			"request_id": "req_bad_kind",
+			"options": []any{
+				map[string]any{"optionId": "weird", "kind": "maybe"},
+			},
+		},
+	}
+	close(eventCh)
+	promptDone := make(chan error, 1)
+	promptDone <- nil
+
+	provider := &cliFakeProvider{}
+	deadline := time.Now().Add(5 * time.Second)
+	var ctrlConn net.Conn
+	for {
+		ctrlConn, err = net.DialTimeout("unix", socketPath, 2*time.Second)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dial control socket: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	defer ctrlConn.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var result sessionResult
+	go func() {
+		defer wg.Done()
+		result = waitForSessionForTest(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_bad_kind", "run_bad_kind", "", false, 5*time.Second, nil, io.Discard)
+	}()
+	waitForPendingPermissionForTest(t, cs)
+
+	params, _ := json.Marshal(control.PermissionAnswer{RequestID: "req_bad_kind", OptionID: "weird"})
+	req := control.Request{JSONRPC: "2.0", ID: 1, Method: "answer_permission", Params: params}
+	b, _ := json.Marshal(req)
+	b = append(b, '\n')
+	if _, err := ctrlConn.Write(b); err != nil {
+		t.Fatalf("write answer_permission: %v", err)
+	}
+
+	wg.Wait()
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	if result.ExitCode != 1 {
+		t.Fatalf("WaitForSession() = %d, want 1", result.ExitCode)
+	}
+	if provider.answerRequestID != "" {
+		t.Fatalf("AnswerPermission was called for request %q", provider.answerRequestID)
 	}
 }
 
@@ -1279,8 +1521,175 @@ func TestControlPermissionClaimTimeoutFallsToFileHandler(t *testing.T) {
 	if provider.answerRequestID != "req_fh" {
 		t.Fatalf("provider.answerRequestID = %q, want \"req_fh\"", provider.answerRequestID)
 	}
+	if !provider.answerResponse.Allow {
+		t.Fatal("provider.answerResponse.Allow = false, want true")
+	}
 	if provider.answerResponse.OptionID != "allow_fh" {
-		t.Fatalf("provider.answerResponse.OptionID = %q, want \"allow_fh\"", provider.answerResponse.OptionID)
+		t.Fatalf("provider.answerResponse.OptionID = %q, want allow_fh", provider.answerResponse.OptionID)
+	}
+}
+
+func TestFilePermissionCancelledOutcomeDoesNotError(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "perm")
+	fh := permission.NewFileHandler(base)
+	fh.Timeout = 5 * time.Second
+	fh.PollInterval = 20 * time.Millisecond
+
+	reqPath := base + ".req"
+	respPath := base + ".req.response"
+	go func() {
+		pollDeadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, statErr := os.Stat(reqPath); statErr == nil {
+				break
+			}
+			if time.Now().After(pollDeadline) {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		_ = os.WriteFile(respPath, []byte(`{"outcome":"cancelled","option_id":"allow_fh"}`+"\n"), 0o600)
+	}()
+
+	event := events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_fh",
+		Fields: map[string]any{
+			"request_id": "req_fh",
+			"options": []any{
+				map[string]any{"optionId": "allow_fh", "kind": "allow"},
+			},
+		},
+	}
+
+	provider := &cliFakeProvider{}
+	res := resolvePermission(context.Background(), provider, fh, nil, event, "ses_fh", "req_fh", false, DefaultPermissionClaimTimeout, nil)
+
+	if res.err != nil {
+		t.Fatalf("unexpected error: %v", res.err)
+	}
+	if !res.cancelled {
+		t.Fatalf("permissionResult.cancelled = false, want true: %+v", res)
+	}
+	if provider.answerRequestID != "" {
+		t.Fatalf("AnswerPermission was called for request %q", provider.answerRequestID)
+	}
+}
+
+func TestWaitForSessionCancelledFilePermissionCancelsRun(t *testing.T) {
+	dir := t.TempDir()
+	eventsPath := filepath.Join(dir, "events.ndjson")
+	writer, err := NewEventWriter(eventsPath)
+	if err != nil {
+		t.Fatalf("newEventWriter: %v", err)
+	}
+
+	base := filepath.Join(dir, "perm")
+	fh := permission.NewFileHandler(base)
+	fh.Timeout = 5 * time.Second
+	fh.PollInterval = 20 * time.Millisecond
+
+	reqPath := base + ".req"
+	respPath := base + ".req.response"
+	go func() {
+		pollDeadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, statErr := os.Stat(reqPath); statErr == nil {
+				break
+			}
+			if time.Now().After(pollDeadline) {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		_ = os.WriteFile(respPath, []byte(`{"outcome":"cancelled","option_id":"allow_fh"}`+"\n"), 0o600)
+	}()
+
+	eventCh := make(chan events.Event, 1)
+	eventCh <- events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_cancel_file",
+		Fields: map[string]any{
+			"request_id": "req_cancel_file",
+			"options": []any{
+				map[string]any{"optionId": "allow_fh", "kind": "allow"},
+			},
+		},
+	}
+	close(eventCh)
+	promptDone := make(chan error)
+
+	provider := &cliFakeProvider{}
+	result := waitForSessionForTest(context.Background(), provider, writer, fh, nil, eventCh, promptDone, nil, "ses_cancel_file", "run_cancel_file", "", false, DefaultPermissionClaimTimeout, nil, io.Discard)
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	if result.ExitCode != 130 {
+		t.Fatalf("WaitForSession() = %d, want 130", result.ExitCode)
+	}
+	if provider.cancelSessionID != "ses_cancel_file" {
+		t.Fatalf("Cancel session = %q, want ses_cancel_file", provider.cancelSessionID)
+	}
+	got := readEventLogForTest(t, eventsPath)
+	last := got[len(got)-1]
+	if last.Event != "session.end" || last.Fields["stop_reason"] != "cancelled" {
+		t.Fatalf("last event = %+v, want cancelled session.end", last)
+	}
+}
+
+func TestWaitForSessionClosedEventChannelWaitsForPermissionThenErrors(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "perm")
+	fh := permission.NewFileHandler(base)
+	fh.Timeout = 5 * time.Second
+	fh.PollInterval = 20 * time.Millisecond
+
+	reqPath := base + ".req"
+	respPath := base + ".req.response"
+	go func() {
+		pollDeadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, statErr := os.Stat(reqPath); statErr == nil {
+				break
+			}
+			if time.Now().After(pollDeadline) {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		_ = os.WriteFile(respPath, []byte(`{"outcome":"selected","option_id":"allow_fh"}`+"\n"), 0o600)
+	}()
+
+	eventCh := make(chan events.Event, 1)
+	eventCh <- events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_closed",
+		Fields: map[string]any{
+			"request_id": "req_closed",
+			"options": []any{
+				map[string]any{"optionId": "allow_fh", "kind": "allow"},
+			},
+		},
+	}
+	close(eventCh)
+	promptDone := make(chan error)
+
+	writer, err := NewEventWriter("")
+	if err != nil {
+		t.Fatalf("new event writer: %v", err)
+	}
+	defer writer.Close()
+
+	provider := &cliFakeProvider{}
+	result := waitForSessionForTest(context.Background(), provider, writer, fh, nil, eventCh, promptDone, nil, "ses_closed", "run_closed", "", false, DefaultPermissionClaimTimeout, nil, io.Discard)
+
+	if result.ExitCode != 1 {
+		t.Fatalf("WaitForSession() = %d, want 1", result.ExitCode)
+	}
+	if provider.answerRequestID != "req_closed" {
+		t.Fatalf("AnswerPermission request = %q, want req_closed", provider.answerRequestID)
 	}
 }
 
@@ -1541,5 +1950,34 @@ func TestRunOpenCodeHTTPWithoutServerURL(t *testing.T) {
 	}
 	if stderr.String() != "avenor: --server-url is required for backend opencode-http\n" {
 		t.Fatalf("stderr = %q, want exact --server-url message", stderr.String())
+	}
+}
+
+func TestRunCodexAppServerBackend(t *testing.T) {
+	oldRunAttempt := runAttempt
+	oldRetryAfter := retryAfter
+	t.Cleanup(func() {
+		runAttempt = oldRunAttempt
+		retryAfter = oldRetryAfter
+	})
+
+	var gotBackend string
+	runAttempt = func(
+		ctx context.Context,
+		cfg attemptConfig,
+		deps attemptDeps,
+	) attemptResult {
+		gotBackend = cfg.backend
+		return attemptResult{exitCode: 0}
+	}
+	retryAfter = func(time.Duration) <-chan time.Time { return make(chan time.Time) }
+
+	var stderr strings.Builder
+	code := run([]string{"--backend", "codex-app-server", "--prompt", "hello"}, func(string) string { return "" }, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if gotBackend != "codex-app-server" {
+		t.Fatalf("runAttempt backend = %q, want %q", gotBackend, "codex-app-server")
 	}
 }

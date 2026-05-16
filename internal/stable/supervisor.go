@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -88,6 +89,7 @@ type Supervisor struct {
 	shutdownCh      chan struct{}
 	runtimeActivity chan struct{}
 	httpServer      *control.HTTPDebugServer
+	permOptions     map[string][]any // keyed by "runtimeID:requestID"
 }
 
 func NewSupervisor(cfg Config) *Supervisor {
@@ -101,6 +103,7 @@ func NewSupervisor(cfg Config) *Supervisor {
 		runtimes:        map[string]*childRuntime{},
 		shutdownCh:      make(chan struct{}),
 		runtimeActivity: make(chan struct{}),
+		permOptions:     map[string][]any{},
 	}
 	sup.control.SetStableHandler(sup)
 	return sup
@@ -384,6 +387,7 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 			}
 		}
 		close(child.done)
+		s.clearRuntimePermissionOptions(child.id)
 		_ = child.eventWriter.Close()
 		if closer, ok := child.provider.(interface{ Close() error }); ok {
 			_ = closer.Close()
@@ -491,15 +495,17 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 		child.completed = true
 		child.mu.Unlock()
 		close(child.done)
+		s.clearRuntimePermissionOptions(child.id)
 		s.controlMu.Lock()
 		delete(s.runtimes, child.id)
 		s.controlMu.Unlock()
 	}()
 
 	taggedWriter := &runtimeFanoutWriter{
-		base:      child.eventWriter,
-		runtimeID: child.id,
-		control:   s.control,
+		base:            child.eventWriter,
+		runtimeID:       child.id,
+		control:         s.control,
+		onPermissionReq: s.cachePermissionOptions,
 	}
 
 	opts := looprunner.RunOptions{
@@ -699,9 +705,10 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 
 	// Tag events with runtime_id and fan out to both file and control subscribers.
 	taggedWriter := &runtimeFanoutWriter{
-		base:      child.eventWriter,
-		runtimeID: child.id,
-		control:   s.control,
+		base:            child.eventWriter,
+		runtimeID:       child.id,
+		control:         s.control,
+		onPermissionReq: s.cachePermissionOptions,
 	}
 	result := cli.WaitForSession(turnCtx, child.provider, cli.SessionWaitConfig{
 		EventCh:                eventCh,
@@ -885,6 +892,39 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 	if rt == nil {
 		return fmt.Errorf("runtime %q not found", rtID)
 	}
+
+	s.controlMu.Lock()
+	key := rtID + ":" + requestID
+	options := s.permOptions[key]
+	s.controlMu.Unlock()
+	if options == nil {
+		return fmt.Errorf("permission request %q not found for runtime %q", requestID, rtID)
+	}
+
+	kind := ""
+	found := false
+	for _, opt := range options {
+		m, ok := opt.(map[string]any)
+		if !ok {
+			continue
+		}
+		oid, _ := m["optionId"].(string)
+		if oid == optionID {
+			k, _ := m["kind"].(string)
+			kind = strings.ToLower(k)
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("unknown option_id %q for request %q on runtime %q", optionID, requestID, rtID)
+	}
+	switch kind {
+	case "allow", "reject":
+	default:
+		return fmt.Errorf("unsupported option kind %q for option_id %q on request %q", kind, optionID, requestID)
+	}
+
 	rt.mu.Lock()
 	provider := rt.provider
 	sessionID := rt.session.SessionID
@@ -892,16 +932,40 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 	if provider == nil || sessionID == "" {
 		return fmt.Errorf("runtime %q has no active session for permission response", rtID)
 	}
-	return provider.AnswerPermission(context.Background(), sessionID, requestID, runtime.PermissionResponse{
-		Outcome:  "selected",
+	if err := provider.AnswerPermission(context.Background(), sessionID, requestID, runtime.PermissionResponse{
+		Allow:    kind == "allow",
 		OptionID: optionID,
-	})
+	}); err != nil {
+		return err
+	}
+	s.controlMu.Lock()
+	delete(s.permOptions, key)
+	s.controlMu.Unlock()
+	return nil
+}
+
+func (s *Supervisor) cachePermissionOptions(runtimeID, requestID string, options []any) {
+	s.controlMu.Lock()
+	s.permOptions[runtimeID+":"+requestID] = options
+	s.controlMu.Unlock()
+}
+
+func (s *Supervisor) clearRuntimePermissionOptions(runtimeID string) {
+	s.controlMu.Lock()
+	prefix := runtimeID + ":"
+	for k := range s.permOptions {
+		if len(k) > len(prefix) && k[:len(prefix)] == prefix {
+			delete(s.permOptions, k)
+		}
+	}
+	s.controlMu.Unlock()
 }
 
 type runtimeFanoutWriter struct {
-	base      cli.EventSink
-	runtimeID string
-	control   *control.ControlServer
+	base            cli.EventSink
+	runtimeID       string
+	control         *control.ControlServer
+	onPermissionReq func(runtimeID, requestID string, options []any)
 }
 
 func (w *runtimeFanoutWriter) Write(ev events.Event) error {
@@ -909,6 +973,13 @@ func (w *runtimeFanoutWriter) Write(ev events.Event) error {
 		ev.Fields = map[string]any{}
 	}
 	ev.Fields["runtime_id"] = w.runtimeID
+	if ev.Event == "permission.request" && w.onPermissionReq != nil {
+		if requestID, _ := ev.Fields["request_id"].(string); requestID != "" {
+			if options, _ := ev.Fields["options"].([]any); options != nil {
+				w.onPermissionReq(w.runtimeID, requestID, options)
+			}
+		}
+	}
 	if w.control != nil {
 		w.control.PublishEvent(ev)
 	}
