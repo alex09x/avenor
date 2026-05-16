@@ -300,7 +300,7 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 		}
 
 		releaseReservation = nil
-		go s.runLoopChild(childCtx, child, cfg, params.MaxRetries, params.Agent, params.Model, params.ServerURL)
+		go s.runLoopChild(childCtx, child, cfg, params.MaxRetries, params.Agent, params.Model, params.ServerURL, params.Backend)
 
 		return result, nil
 	}
@@ -470,7 +470,7 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 	}
 }
 
-func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg *looprunner.LoopConfig, maxRetries int, agent, model, serverURL string) {
+func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg *looprunner.LoopConfig, maxRetries int, agent, model, serverURL, backend string) {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Fprintf(os.Stderr, "avenor stable: child %s panic: %v\n", child.id, r)
@@ -521,7 +521,10 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 				resumeID = prevSessionID
 			}
 
-			provider := opencodeacp.NewWithOptions(startOpts)
+			provider, err := factory.NewProvider(startOpts, backend)
+			if err != nil {
+				return looprunner.PhaseAttemptResult{ExitCode: 1}, fmt.Errorf("create provider: %w", err)
+			}
 			defer func() {
 				if closer, ok := provider.(interface{ Close() error }); ok {
 					_ = closer.Close()
@@ -560,15 +563,19 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 				promptDone <- provider.Prompt(context.Background(), session.SessionID, phase.Prompt)
 			}()
 
-			result := cli.WaitForSession(
-				ctx, provider, taggedWriter,
-				child.fileHandler, nil,
-				eventCh, promptDone, nil,
-				session.SessionID, s.runID, child.label,
-				child.autoApprove, child.permClaimTimeout,
-				nil,
-				os.Stderr,
-			)
+			result := cli.WaitForSession(ctx, provider, cli.SessionWaitConfig{
+				EventCh:                eventCh,
+				PromptDone:             promptDone,
+				SessionID:              session.SessionID,
+				RunID:                  s.runID,
+				RunLabel:               child.label,
+				AutoApprove:            child.autoApprove,
+				PermissionClaimTimeout: child.permClaimTimeout,
+			}, cli.SessionWaitDeps{
+				Writer:      taggedWriter,
+				FileHandler: child.fileHandler,
+				Stderr:      os.Stderr,
+			})
 
 			return looprunner.PhaseAttemptResult{
 				ExitCode:      result.ExitCode,
@@ -696,7 +703,20 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 		runtimeID: child.id,
 		control:   s.control,
 	}
-	result := cli.WaitForSession(turnCtx, child.provider, taggedWriter, child.fileHandler, nil, eventCh, promptDone, nil, session.SessionID, s.runID, child.label, child.autoApprove, child.permClaimTimeout, timer, os.Stderr)
+	result := cli.WaitForSession(turnCtx, child.provider, cli.SessionWaitConfig{
+		EventCh:                eventCh,
+		PromptDone:             promptDone,
+		SessionID:              session.SessionID,
+		RunID:                  s.runID,
+		RunLabel:               child.label,
+		AutoApprove:            child.autoApprove,
+		PermissionClaimTimeout: child.permClaimTimeout,
+		Timeout:                timer,
+	}, cli.SessionWaitDeps{
+		Writer:      taggedWriter,
+		FileHandler: child.fileHandler,
+		Stderr:      os.Stderr,
+	})
 	exitCode := result.ExitCode
 	return childAttemptResult{exitCode: exitCode, sessionID: session.SessionID}
 }

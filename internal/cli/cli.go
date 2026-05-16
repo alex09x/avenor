@@ -268,13 +268,22 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 					resumeID = prevSessionID
 				}
 
-				result := runSingleAttempt(
-					ctx, startOpts, resumeID, writer,
-					fileHandler, controlServer,
-					phase.Prompt,
-					runID, *label, *autoApprove, *permClaimTimeout, timer,
-					os.Stderr,
-				)
+				result := runSingleAttempt(ctx, attemptConfig{
+					startOptions:           startOpts,
+					backend:                *backend,
+					resumeID:               resumeID,
+					initialPrompt:          phase.Prompt,
+					runID:                  runID,
+					runLabel:               *label,
+					autoApprove:            *autoApprove,
+					permissionClaimTimeout: *permClaimTimeout,
+					timer:                  timer,
+				}, attemptDeps{
+					writer:        writer,
+					fileHandler:   fileHandler,
+					controlServer: controlServer,
+					stderr:        os.Stderr,
+				})
 
 				return looprunner.PhaseAttemptResult{
 					ExitCode:      result.exitCode,
@@ -308,7 +317,22 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		if controlServer != nil {
 			state.Update(func(s *control.Snapshot) { s.RetryAttempt = attempt })
 		}
-		result = runAttempt(ctx, startOptions, *backend, resumeID, writer, fileHandler, controlServer, string(promptText), runID, *label, *autoApprove, *permClaimTimeout, timer, stderr)
+		result = runAttempt(ctx, attemptConfig{
+			startOptions:           startOptions,
+			backend:                *backend,
+			resumeID:               resumeID,
+			initialPrompt:          string(promptText),
+			runID:                  runID,
+			runLabel:               *label,
+			autoApprove:            *autoApprove,
+			permissionClaimTimeout: *permClaimTimeout,
+			timer:                  timer,
+		}, attemptDeps{
+			writer:        writer,
+			fileHandler:   fileHandler,
+			controlServer: controlServer,
+			stderr:        stderr,
+		})
 		finalSessionID = result.sessionID
 
 		if result.exitCode != 1 || attempt > *maxRetries {
@@ -437,36 +461,39 @@ func loopDirectiveSeverity(d string) int {
 	}
 }
 
-func WaitForSession(
-	ctx context.Context,
-	provider runtime.Provider,
-	writer EventSink,
-	fileHandler *permission.FileHandler,
-	controlServer *control.ControlServer,
-	eventCh <-chan events.Event,
-	promptDone <-chan error,
-	interruptCh <-chan struct{},
-	sessionID string,
-	runID string,
-	runLabel string,
-	autoApprove bool,
-	permClaimTimeout time.Duration,
-	timeout <-chan time.Time,
-	stderr io.Writer,
-) sessionResult {
+type SessionWaitConfig struct {
+	EventCh                <-chan events.Event
+	PromptDone             <-chan error
+	InterruptCh            <-chan struct{}
+	SessionID              string
+	RunID                  string
+	RunLabel               string
+	AutoApprove            bool
+	PermissionClaimTimeout time.Duration
+	Timeout                <-chan time.Time
+}
+
+type SessionWaitDeps struct {
+	Writer        EventSink
+	FileHandler   *permission.FileHandler
+	ControlServer *control.ControlServer
+	Stderr        io.Writer
+}
+
+func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionWaitConfig, deps SessionWaitDeps) sessionResult {
 	var finalStopReason string
 	promptReturned := false
 	var permissionDone <-chan permissionResult
 	var loopDirective string
 	var loopLabel string
-	tracker := newStatusTracker(sessionID, runID, runLabel)
+	tracker := newStatusTracker(cfg.SessionID, cfg.RunID, cfg.RunLabel)
 
 	writeStatus := func(ev events.Event, ok bool) bool {
 		if !ok {
 			return true
 		}
-		if err := writer.Write(ev); err != nil {
-			fmt.Fprintf(stderr, "avenor: write event: %v\n", err)
+		if err := deps.Writer.Write(ev); err != nil {
+			fmt.Fprintf(deps.Stderr, "avenor: write event: %v\n", err)
 			return false
 		}
 		return true
@@ -480,27 +507,27 @@ func WaitForSession(
 			"source":     source,
 			"ts":         time.Now().UnixMilli(),
 		}
-		if runID != "" {
-			fields["run_id"] = runID
+		if cfg.RunID != "" {
+			fields["run_id"] = cfg.RunID
 		}
-		if runLabel != "" {
-			fields["run_label"] = runLabel
+		if cfg.RunLabel != "" {
+			fields["run_label"] = cfg.RunLabel
 		}
-		if err := writer.Write(events.Event{
+		if err := deps.Writer.Write(events.Event{
 			Event:     "permission.response",
-			SessionID: sessionID,
+			SessionID: cfg.SessionID,
 			Fields:    fields,
 		}); err != nil {
-			fmt.Fprintf(stderr, "avenor: write permission.response event: %v\n", err)
+			fmt.Fprintf(deps.Stderr, "avenor: write permission.response event: %v\n", err)
 		}
 	}
 
 	for {
 		select {
-		case event, ok := <-eventCh:
+		case event, ok := <-cfg.EventCh:
 			if !ok {
 				// Nil the channel so it no longer fires on subsequent iterations.
-				eventCh = nil
+				cfg.EventCh = nil
 				if finalStopReason == "" {
 					return sessionResult{ExitCode: 1}
 				}
@@ -534,25 +561,25 @@ func WaitForSession(
 			}
 			if event.Event == "permission.request" {
 				// Auto-answer / control-owner / file fallback resolver.
-				if err := writer.Write(event); err != nil {
-					fmt.Fprintf(stderr, "avenor: write event: %v\n", err)
+				if err := deps.Writer.Write(event); err != nil {
+					fmt.Fprintf(deps.Stderr, "avenor: write event: %v\n", err)
 					return sessionResult{ExitCode: 1}
 				}
 				requestID, _ := event.Fields["request_id"].(string)
 				if requestID == "" {
 					// Malformed request from backend: no request_id means we cannot
 					// call AnswerPermission. Emit an error and stay in waiting state.
-					emitErrorEvent(writer, sessionID, runID, "permission", "permission.request missing request_id", stderr, runLabel)
+					emitErrorEvent(deps.Writer, cfg.SessionID, cfg.RunID, "permission", "permission.request missing request_id", deps.Stderr, cfg.RunLabel)
 					continue
 				}
 				if permissionDone != nil {
-					emitErrorEvent(writer, sessionID, runID, "permission", "another permission request is already pending", stderr, runLabel)
+					emitErrorEvent(deps.Writer, cfg.SessionID, cfg.RunID, "permission", "another permission request is already pending", deps.Stderr, cfg.RunLabel)
 					return sessionResult{ExitCode: 1}
 				}
 				done := make(chan permissionResult, 1)
 				permissionDone = done
 				go func() {
-					res := resolvePermission(ctx, provider, fileHandler, controlServer, event, sessionID, requestID, autoApprove, permClaimTimeout, writer.Write)
+					res := resolvePermission(ctx, provider, deps.FileHandler, deps.ControlServer, event, cfg.SessionID, requestID, cfg.AutoApprove, cfg.PermissionClaimTimeout, deps.Writer.Write)
 					done <- res
 				}()
 				continue
@@ -560,20 +587,20 @@ func WaitForSession(
 			if event.Event == "session.end" {
 				finalStopReason, _ = event.Fields["stop_reason"].(string)
 			}
-			if err := writer.Write(event); err != nil {
-				fmt.Fprintf(stderr, "avenor: write event: %v\n", err)
+			if err := deps.Writer.Write(event); err != nil {
+				fmt.Fprintf(deps.Stderr, "avenor: write event: %v\n", err)
 				return sessionResult{ExitCode: 1}
 			}
 			if event.Event == "session.end" && promptReturned && permissionDone == nil {
 				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel}
 			}
-		case err := <-promptDone:
+		case err := <-cfg.PromptDone:
 			promptReturned = true
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
-					return cancelAndEnd(provider, writer, sessionID, runID, runLabel, "cancelled", stderr)
+					return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "cancelled", deps.Stderr)
 				}
-				emitErrorEvent(writer, sessionID, runID, "prompt", fmt.Sprintf("prompt: %v", err), stderr, runLabel)
+				emitErrorEvent(deps.Writer, cfg.SessionID, cfg.RunID, "prompt", fmt.Sprintf("prompt: %v", err), deps.Stderr, cfg.RunLabel)
 				return sessionResult{ExitCode: 1}
 			}
 			if finalStopReason != "" && permissionDone == nil {
@@ -582,7 +609,7 @@ func WaitForSession(
 		case res := <-permissionDone:
 			permissionDone = nil
 			if res.err != nil {
-				emitErrorEvent(writer, sessionID, runID, "permission", fmt.Sprintf("permission handler: %v", res.err), stderr, runLabel)
+				emitErrorEvent(deps.Writer, cfg.SessionID, cfg.RunID, "permission", fmt.Sprintf("permission handler: %v", res.err), deps.Stderr, cfg.RunLabel)
 				return sessionResult{ExitCode: 1}
 			}
 			if res.requestID != "" {
@@ -596,17 +623,17 @@ func WaitForSession(
 			if finalStopReason != "" && promptReturned {
 				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel}
 			}
-		case <-interruptCh:
+		case <-cfg.InterruptCh:
 			cancelCtx, cfn := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := provider.Cancel(cancelCtx, sessionID); err != nil {
-				emitErrorEvent(writer, sessionID, runID, "cancel", fmt.Sprintf("cancel session: %v", err), stderr, runLabel)
+			if err := provider.Cancel(cancelCtx, cfg.SessionID); err != nil {
+				emitErrorEvent(deps.Writer, cfg.SessionID, cfg.RunID, "cancel", fmt.Sprintf("cancel session: %v", err), deps.Stderr, cfg.RunLabel)
 			}
 			cfn()
 			finalStopReason = "cancelled"
 		case <-ctx.Done():
-			return cancelAndEnd(provider, writer, sessionID, runID, runLabel, "cancelled", stderr)
-		case <-timeout:
-			return cancelAndEnd(provider, writer, sessionID, runID, runLabel, "timeout", stderr)
+			return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "cancelled", deps.Stderr)
+		case <-cfg.Timeout:
+			return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "timeout", deps.Stderr)
 		}
 	}
 }

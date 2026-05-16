@@ -118,6 +118,7 @@ func (p *Provider) Prompt(ctx context.Context, sessionID string, prompt string) 
 	if err != nil {
 		return err
 	}
+	p.beginSessionTurn(sessionID)
 	opts := p.sessionOptions(sessionID)
 	payload := map[string]any{
 		"parts": []map[string]any{
@@ -324,6 +325,12 @@ func (p *Provider) publish(event events.Event) {
 			}
 		}
 	}
+}
+
+func (p *Provider) beginSessionTurn(sessionID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.endedSessions, sessionID)
 }
 
 // publishSessionEnd emits a session.end event, skipping if the session has

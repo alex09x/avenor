@@ -375,6 +375,64 @@ func TestPromptPublishesSessionEndFromMessageResponse(t *testing.T) {
 	}
 }
 
+func TestPromptResetsSessionEndGuardForNextTurn(t *testing.T) {
+	var messageRequests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/global/health":
+			w.WriteHeader(http.StatusOK)
+		case "/event":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			<-r.Context().Done()
+		case "/session":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"id": "ses_test"})
+		case "/session/ses_test/message":
+			messageRequests.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"info": map[string]any{"finish": "stop"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	p, err := NewWithOptions(runtime.StartOptions{})
+	if err != nil {
+		t.Fatalf("NewWithOptions error = %v", err)
+	}
+	session, err := p.Start(context.Background(), runtime.StartOptions{ServerURL: srv.URL})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	defer p.(*Provider).Close()
+
+	eventCtx, cancelEvents := context.WithCancel(context.Background())
+	defer cancelEvents()
+	ch, err := p.Events(eventCtx, session.SessionID)
+	if err != nil {
+		t.Fatalf("Events error = %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := p.Prompt(context.Background(), session.SessionID, fmt.Sprintf("hello %d", i)); err != nil {
+			t.Fatalf("Prompt %d error = %v", i, err)
+		}
+		select {
+		case evt := <-ch:
+			if evt.Event != "session.end" || evt.Fields["stop_reason"] != "end_turn" {
+				t.Fatalf("turn %d event = %+v, want session.end end_turn", i, evt)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for turn %d session.end", i)
+		}
+	}
+	if got := messageRequests.Load(); got != 2 {
+		t.Fatalf("message requests = %d, want 2", got)
+	}
+}
+
 func TestPublishDropsSlowSubscriberWithoutBlocking(t *testing.T) {
 	p, err := NewWithOptions(runtime.StartOptions{})
 	if err != nil {
