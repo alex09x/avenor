@@ -144,6 +144,67 @@ func TestFileHandlerRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFileHandlerCancelledOutcomeDoesNotAnswerPermission(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "permission")
+	handler := NewFileHandler(base)
+	handler.Timeout = 2 * time.Second
+	handler.PollInterval = 10 * time.Millisecond
+
+	provider := &fakeProvider{}
+	event := events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_1",
+		Fields: map[string]any{
+			"request_id": "42",
+			"options": []any{
+				map[string]any{"optionId": "allow_fh", "kind": "allow"},
+			},
+		},
+	}
+
+	done := make(chan struct {
+		res Resolution
+		err error
+	}, 1)
+	go func() {
+		res, err := handler.Handle(context.Background(), provider, event, nil)
+		done <- struct {
+			res Resolution
+			err error
+		}{res: res, err: err}
+	}()
+
+	reqPath := base + ".req"
+	for i := 0; i < 100; i++ {
+		if _, err := os.Stat(reqPath); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(reqPath); err != nil {
+		t.Fatalf("request file was not created before response: %v", err)
+	}
+	if err := os.WriteFile(reqPath+".response", []byte(`{"outcome":"cancelled","option_id":"allow_fh"}`), 0o600); err != nil {
+		t.Fatalf("write response: %v", err)
+	}
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Handle returned error: %v", got.err)
+		}
+		if !got.res.Cancelled {
+			t.Fatalf("Resolution.Cancelled = false, want true: %+v", got.res)
+		}
+		if provider.requestID != "" {
+			t.Fatalf("AnswerPermission was called for request %q", provider.requestID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for handler")
+	}
+}
+
 func TestReadResponseMapping(t *testing.T) {
 	dir := t.TempDir()
 
@@ -174,6 +235,13 @@ func TestReadResponseMapping(t *testing.T) {
 			json:       `{"outcome":"selected","option_id":"custom_deny"}`,
 			options:    []any{map[string]any{"optionId": "allow_fh", "kind": "allow"}},
 			wantErrMsg: `unknown permission option_id "custom_deny"`,
+		},
+		{
+			name:      "cancelled outcome is accepted",
+			json:      `{"outcome":"cancelled","option_id":"allow_fh"}`,
+			options:   []any{map[string]any{"optionId": "allow_fh", "kind": "allow"}},
+			wantAllow: true,
+			wantOptID: "allow_fh",
 		},
 		{
 			name:       "invalid outcome errors",

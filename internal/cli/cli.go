@@ -414,6 +414,7 @@ type permissionResult struct {
 	requestID string
 	optionID  string
 	kind      string
+	cancelled bool
 	// source is "avenor", "control", or "file".
 	source string
 }
@@ -464,6 +465,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 	var permissionDone <-chan permissionResult
 	var loopDirective string
 	var loopLabel string
+	eventChClosed := false
 	tracker := newStatusTracker(cfg.SessionID, cfg.RunID, cfg.RunLabel)
 
 	writeStatus := func(ev events.Event, ok bool) bool {
@@ -506,12 +508,13 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 			if !ok {
 				// Nil the channel so it no longer fires on subsequent iterations.
 				cfg.EventCh = nil
-				if finalStopReason == "" {
-					return sessionResult{ExitCode: 1}
-				}
+				eventChClosed = true
 				// Wait for any in-flight AnswerPermission goroutine before exiting.
 				if permissionDone != nil {
 					break
+				}
+				if finalStopReason == "" {
+					return sessionResult{ExitCode: 1}
 				}
 				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel}
 			}
@@ -586,6 +589,9 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 			}
 		case res := <-permissionDone:
 			permissionDone = nil
+			if res.cancelled {
+				return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "cancelled", deps.Stderr)
+			}
 			if res.err != nil {
 				emitErrorEvent(deps.Writer, cfg.SessionID, cfg.RunID, "permission", fmt.Sprintf("permission handler: %v", res.err), deps.Stderr, cfg.RunLabel)
 				return sessionResult{ExitCode: 1}
@@ -600,6 +606,9 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 			// AnswerPermission, exit now that the permission goroutine has resolved.
 			if finalStopReason != "" && promptReturned {
 				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel}
+			}
+			if eventChClosed && finalStopReason == "" {
+				return sessionResult{ExitCode: 1}
 			}
 		case <-cfg.InterruptCh:
 			cancelCtx, cfn := context.WithTimeout(context.Background(), 5*time.Second)
@@ -798,6 +807,9 @@ func resolvePermission(
 		res, err := fileHandler.Handle(ctx, provider, event, emit)
 		if err != nil {
 			return permissionResult{err: err}
+		}
+		if res.Cancelled {
+			return permissionResult{requestID: res.RequestID, optionID: res.OptionID, kind: permissionKindFromOptionID(res.OptionID, options), cancelled: true, source: "file"}
 		}
 		return permissionResult{requestID: res.RequestID, optionID: res.OptionID, kind: permissionKindFromOptionID(res.OptionID, options), source: "file"}
 	}

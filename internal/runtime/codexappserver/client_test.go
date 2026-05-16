@@ -174,23 +174,24 @@ func TestClientTurnWaiter(t *testing.T) {
 }
 
 func TestClientTurnCompletionBufferedBeforeRegister(t *testing.T) {
-	c, wOut, _ := fakeClient()
+	c, _, _ := fakeClient()
 	defer c.Close()
 
-	go func() {
-		writeLine(wOut, map[string]any{
-			"method": "turn/completed",
-			"params": map[string]any{
-				"threadId": "th_x",
-				"turn": map[string]any{
-					"id":     "turn_buf",
-					"status": "completed",
-				},
-			},
-		})
-	}()
+	params := mustRaw(map[string]any{
+		"threadId": "th_x",
+		"turn": map[string]any{
+			"id":     "turn_buf",
+			"status": "completed",
+		},
+	})
+	c.routeNotification("turn/completed", params)
 
-	time.Sleep(10 * time.Millisecond)
+	c.mu.Lock()
+	_, buffered := c.turnDone["turn_buf"]
+	c.mu.Unlock()
+	if !buffered {
+		t.Fatal("turn completion was not buffered before registerTurn")
+	}
 
 	turnCh := c.registerTurn("turn_buf")
 
@@ -201,6 +202,76 @@ func TestClientTurnCompletionBufferedBeforeRegister(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for buffered turn completion")
+	}
+}
+
+func TestClientTurnCompletedClearsPendingApprovals(t *testing.T) {
+	c, _, _ := fakeClient()
+	defer c.Close()
+
+	c.mu.Lock()
+	c.approvals["req_turn"] = pendingApproval{threadID: "th_x", turnID: "turn_done"}
+	c.mu.Unlock()
+
+	c.routeNotification("turn/completed", mustRaw(map[string]any{
+		"threadId": "th_x",
+		"turn": map[string]any{
+			"id":     "turn_done",
+			"status": "completed",
+		},
+	}))
+
+	c.mu.Lock()
+	_, ok := c.approvals["req_turn"]
+	c.mu.Unlock()
+	if ok {
+		t.Fatal("approval should be cleared after its turn completes")
+	}
+}
+
+func TestClientApprovalRoutingPreservesRawNumericID(t *testing.T) {
+	c, wOut, rIn := fakeClient()
+	defer c.Close()
+
+	go func() {
+		writeLine(wOut, map[string]any{
+			"id":     42,
+			"method": "item/commandExecution/requestApproval",
+			"params": map[string]any{
+				"threadId": "th_perm",
+				"turnId":   "turn_perm",
+				"command":  "rm -rf /",
+			},
+		})
+	}()
+
+	select {
+	case <-c.eventsCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for approval event")
+	}
+
+	done := make(chan rpcMessage, 1)
+	go func() {
+		msg, err := readLine(rIn)
+		if err != nil {
+			t.Logf("read error: %v", err)
+			return
+		}
+		done <- msg
+	}()
+
+	if err := c.answerApprovalThreaded("42", "th_perm", true); err != nil {
+		t.Fatalf("answerApprovalThreaded: %v", err)
+	}
+
+	select {
+	case msg := <-done:
+		if string(msg.ID) != "42" {
+			t.Fatalf("response ID = %s, want numeric 42", msg.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for answer write")
 	}
 }
 
@@ -262,7 +333,7 @@ func TestClientAnswerApproval(t *testing.T) {
 	defer c.Close()
 
 	c.mu.Lock()
-	c.approvals["req_accept"] = pendingApproval{threadID: "th_x", method: "item/commandExecution/requestApproval"}
+	c.approvals["req_accept"] = pendingApproval{threadID: "th_x"}
 	c.mu.Unlock()
 
 	done := make(chan rpcMessage, 1)
@@ -308,7 +379,7 @@ func TestClientAnswerApprovalWrongThreadPreservesRequest(t *testing.T) {
 	defer c.Close()
 
 	c.mu.Lock()
-	c.approvals["req_keep"] = pendingApproval{threadID: "th_right", method: "item/commandExecution/requestApproval"}
+	c.approvals["req_keep"] = pendingApproval{threadID: "th_right"}
 	c.mu.Unlock()
 
 	err := c.answerApprovalThreaded("req_keep", "th_wrong", true)
@@ -321,6 +392,85 @@ func TestClientAnswerApprovalWrongThreadPreservesRequest(t *testing.T) {
 	c.mu.Unlock()
 	if !ok {
 		t.Fatal("approval should remain pending after wrong-thread answer")
+	}
+}
+
+func TestClientUnknownApprovalRequestWritesRPCError(t *testing.T) {
+	c, _, rIn := fakeClient()
+	defer c.Close()
+
+	done := make(chan rpcMessage, 1)
+	go func() {
+		msg, err := readLine(rIn)
+		if err != nil {
+			t.Logf("read error: %v", err)
+			return
+		}
+		done <- msg
+	}()
+
+	c.routeApprovalRequest(json.RawMessage(`"req_unknown_method"`), "item/unknown/requestApproval", mustRaw(map[string]any{"threadId": "th_x"}))
+
+	select {
+	case msg := <-done:
+		if string(msg.ID) != `"req_unknown_method"` {
+			t.Fatalf("response ID = %s, want req_unknown_method", msg.ID)
+		}
+		if msg.Error == nil || msg.Error.Code != -32601 {
+			t.Fatalf("error = %+v, want method-not-found", msg.Error)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for unknown method error response")
+	}
+}
+
+func TestClientMalformedKnownApprovalRequestWritesInvalidParams(t *testing.T) {
+	c, _, rIn := fakeClient()
+	defer c.Close()
+
+	done := make(chan rpcMessage, 1)
+	go func() {
+		msg, err := readLine(rIn)
+		if err != nil {
+			t.Logf("read error: %v", err)
+			return
+		}
+		done <- msg
+	}()
+
+	c.routeApprovalRequest(json.RawMessage(`"req_bad_params"`), "item/commandExecution/requestApproval", json.RawMessage(`{bad`))
+
+	select {
+	case msg := <-done:
+		if string(msg.ID) != `"req_bad_params"` {
+			t.Fatalf("response ID = %s, want req_bad_params", msg.ID)
+		}
+		if msg.Error == nil || msg.Error.Code != -32602 {
+			t.Fatalf("error = %+v, want invalid params", msg.Error)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for invalid params response")
+	}
+}
+
+func TestClientFanoutRecordsDroppedEvents(t *testing.T) {
+	c, _, _ := fakeClient()
+	defer c.Close()
+
+	for i := 0; i < cap(c.eventsCh); i++ {
+		c.eventsCh <- events.Event{Event: "existing"}
+	}
+
+	sub := make(chan events.Event)
+	c.subscribe("th_drop", sub)
+	c.fanout(&events.Event{Event: "agent.message", SessionID: "th_drop"})
+
+	stderr := c.Stderr()
+	if !strings.Contains(stderr, "global event buffer full") {
+		t.Fatalf("stderr = %q, want global drop note", stderr)
+	}
+	if !strings.Contains(stderr, "subscriber buffer full") {
+		t.Fatalf("stderr = %q, want subscriber drop note", stderr)
 	}
 }
 
@@ -343,6 +493,9 @@ func TestClientMalformedJSON(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for event after malformed line")
+	}
+	if !strings.Contains(c.Stderr(), "dropped malformed JSON-RPC line") {
+		t.Fatalf("stderr = %q, want malformed JSON diagnostic", c.Stderr())
 	}
 }
 

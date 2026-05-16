@@ -77,6 +77,12 @@ func TestTranslateNotificationDrop(t *testing.T) {
 	}
 }
 
+func TestTranslateNotificationDropsMalformedInformationalEvent(t *testing.T) {
+	if ev := translateNotification("turn/started", json.RawMessage(`{bad`)); ev != nil {
+		t.Fatalf("malformed informational event should be dropped, got %+v", ev)
+	}
+}
+
 func TestTranslateApprovalCommand(t *testing.T) {
 	params := json.RawMessage(`{"threadId":"th1","command":"rm -rf /","summary":"run command"}`)
 	ev, ar := translateApprovalRequest("item/commandExecution/requestApproval", params)
@@ -93,12 +99,24 @@ func TestTranslateApprovalCommand(t *testing.T) {
 	if kind != "command" {
 		t.Errorf("kind = %q, want command", kind)
 	}
+	options, _ := ev.Fields["options"].([]any)
+	if len(options) != 2 {
+		t.Fatalf("options = %#v, want allow/reject options", ev.Fields["options"])
+	}
 	desc, _ := ev.Fields["description"].(string)
 	if desc != "rm -rf /" {
 		t.Errorf("description = %q, want 'rm -rf /'", desc)
 	}
 	if ar.Command != "rm -rf /" {
 		t.Errorf("ar.Command = %q", ar.Command)
+	}
+}
+
+func TestTranslateApprovalUnknownMethodDropped(t *testing.T) {
+	params := json.RawMessage(`{"threadId":"th1","summary":"new approval type"}`)
+	ev, ar := translateApprovalRequest("item/unknown/requestApproval", params)
+	if ev != nil || ar != nil {
+		t.Fatalf("unknown approval method should be dropped, got ev=%+v ar=%+v", ev, ar)
 	}
 }
 

@@ -26,6 +26,10 @@ func translateNotification(method string, params json.RawMessage) *events.Event 
 // translateApprovalRequest converts a server-initiated approval request to
 // a permission.request event. Returns the parsed params for diagnostics.
 func translateApprovalRequest(method string, params json.RawMessage) (*events.Event, *approvalRequestParams) {
+	kind, ok := approvalKind(method)
+	if !ok {
+		return nil, nil
+	}
 	if params == nil {
 		return nil, nil
 	}
@@ -34,12 +38,16 @@ func translateApprovalRequest(method string, params json.RawMessage) (*events.Ev
 		return nil, nil
 	}
 
-	kind, description := extractApprovalKind(method, ar)
+	description := approvalDescription(kind, ar)
 
 	fields := map[string]any{
 		"kind":        kind,
 		"description": description,
 		"tool":        method,
+		"options": []any{
+			map[string]any{"optionId": "reject", "kind": "reject"},
+			map[string]any{"optionId": "allow", "kind": "allow"},
+		},
 	}
 	if ar.Command != "" {
 		fields["command"] = ar.Command
@@ -68,8 +76,8 @@ func translateTurnCompleted(params json.RawMessage) *events.Event {
 	}
 
 	fields := map[string]any{
-		"turn_id":  n.Turn.ID,
-		"reason":   n.Turn.Status,
+		"turn_id": n.Turn.ID,
+		"reason":  n.Turn.Status,
 	}
 
 	switch n.Turn.Status {
@@ -95,7 +103,9 @@ func translateTurnCompleted(params json.RawMessage) *events.Event {
 
 func informationalEvent(eventType string, params json.RawMessage) *events.Event {
 	var n itemNotification
-	_ = json.Unmarshal(params, &n)
+	if err := json.Unmarshal(params, &n); err != nil {
+		return nil
+	}
 	return &events.Event{
 		Event:     eventType,
 		SessionID: n.ThreadID,
@@ -105,19 +115,29 @@ func informationalEvent(eventType string, params json.RawMessage) *events.Event 
 	}
 }
 
-func extractApprovalKind(method string, ar approvalRequestParams) (string, string) {
+func approvalKind(method string) (string, bool) {
 	switch method {
 	case "item/commandExecution/requestApproval":
-		desc := firstNonEmpty(ar.Command, ar.Summary, ar.Message)
-		return "command", desc
+		return "command", true
 	case "item/fileChange/requestApproval":
-		desc := firstNonEmpty(ar.Path, ar.Summary, ar.Message)
-		return "file", desc
+		return "file", true
 	case "item/permissions/requestApproval":
-		desc := firstNonEmpty(ar.Summary, ar.Message)
-		return "permissions", desc
+		return "permissions", true
 	default:
-		return "unknown", ""
+		return "", false
+	}
+}
+
+func approvalDescription(kind string, ar approvalRequestParams) string {
+	switch kind {
+	case "command":
+		return firstNonEmpty(ar.Command, ar.Summary, ar.Message)
+	case "file":
+		return firstNonEmpty(ar.Path, ar.Summary, ar.Message)
+	case "permissions":
+		return firstNonEmpty(ar.Summary, ar.Message)
+	default:
+		return ""
 	}
 }
 

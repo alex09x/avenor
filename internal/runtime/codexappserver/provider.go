@@ -79,7 +79,7 @@ func (p *Provider) Resume(ctx context.Context, sessionID string) (runtime.Sessio
 	p.mu.Lock()
 	if _, ok := p.threads[sessionID]; ok {
 		p.mu.Unlock()
-		return runtime.Session{SessionID: sessionID, Backend: backendID}, nil
+		return runtime.Session{SessionID: sessionID, Backend: backendID, Dir: p.opts.Dir}, nil
 	}
 	p.mu.Unlock()
 
@@ -107,6 +107,7 @@ func (p *Provider) Resume(ctx context.Context, sessionID string) (runtime.Sessio
 	return runtime.Session{
 		SessionID: threadID,
 		Backend:   backendID,
+		Dir:       p.opts.Dir,
 	}, nil
 }
 

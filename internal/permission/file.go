@@ -52,6 +52,7 @@ type FileHandler struct {
 type Resolution struct {
 	RequestID string
 	OptionID  string
+	Cancelled bool
 }
 
 func NewFileHandler(basePath string) *FileHandler {
@@ -100,6 +101,9 @@ func (h *FileHandler) Handle(ctx context.Context, provider runtime.Provider, eve
 	rawResponse, optionID, err := h.waitForResponse(ctx, responsePath)
 	if err != nil {
 		return Resolution{}, err
+	}
+	if rawResponse.Outcome == "cancelled" {
+		return Resolution{RequestID: request.RequestID, OptionID: optionID, Cancelled: true}, nil
 	}
 	response, err := permissionResponseFromRequest(request.Options, rawResponse, optionID)
 	if err != nil {
@@ -164,8 +168,9 @@ func readResponse(path string) (fileResponse, error) {
 		return fileResponse{}, err
 	}
 	switch raw.Outcome {
-	case "", "selected":
+	case "":
 		raw.Outcome = "selected"
+	case "selected", "cancelled":
 	default:
 		return fileResponse{}, fmt.Errorf("invalid permission response outcome %q", raw.Outcome)
 	}

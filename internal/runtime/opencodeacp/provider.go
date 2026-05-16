@@ -379,9 +379,6 @@ func selectPermissionResponseOption(options []any, response runtime.PermissionRe
 		if optID != response.OptionID {
 			continue
 		}
-		if optID == "" {
-			return "", fmt.Errorf("permission option with kind %q missing optionId", want)
-		}
 		kind := strings.ToLower(fmt.Sprint(m["kind"]))
 		if kind != want {
 			return "", fmt.Errorf("permission option %q has kind %q, want %q", response.OptionID, kind, want)

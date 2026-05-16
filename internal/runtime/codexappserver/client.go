@@ -20,8 +20,8 @@ const stderrCap = 400 // max lines of stderr retained in rolling buffer
 
 type pendingApproval struct {
 	threadID string
-	method   string
-	params   json.RawMessage
+	turnID   string
+	id       json.RawMessage
 }
 
 type client struct {
@@ -247,7 +247,7 @@ func (c *client) notify(method string, params any) error {
 
 func (c *client) answerApproval(requestID string, allow bool) error {
 	c.mu.Lock()
-	_, ok := c.approvals[requestID]
+	approval, ok := c.approvals[requestID]
 	if ok {
 		delete(c.approvals, requestID)
 	}
@@ -256,24 +256,7 @@ func (c *client) answerApproval(requestID string, allow bool) error {
 		return fmt.Errorf("approval request %q not found", requestID)
 	}
 
-	decision := "decline"
-	if allow {
-		decision = "accept"
-	}
-
-	// Safely serialize the request ID via json.Marshal to prevent injection.
-	idBytes, _ := json.Marshal(requestID)
-	msg := rpcMessage{
-		ID:     json.RawMessage(idBytes),
-		Result: mustRaw(map[string]any{"decision": decision}),
-	}
-	data, _ := json.Marshal(msg)
-	data = append(data, '\n')
-
-	if err := c.writeStdin(data); err != nil {
-		return err
-	}
-	return nil
+	return c.writeApprovalResponse(requestID, approval.id, allow)
 }
 
 // answerApprovalThreaded validates that the approval belongs to the given thread
@@ -292,13 +275,19 @@ func (c *client) answerApprovalThreaded(requestID, threadID string, allow bool) 
 	delete(c.approvals, requestID)
 	c.mu.Unlock()
 
+	return c.writeApprovalResponse(requestID, approval.id, allow)
+}
+
+func (c *client) writeApprovalResponse(requestID string, id json.RawMessage, allow bool) error {
+	if len(id) == 0 {
+		id, _ = json.Marshal(requestID)
+	}
 	decision := "decline"
 	if allow {
 		decision = "accept"
 	}
-	idBytes, _ := json.Marshal(requestID)
 	msg := rpcMessage{
-		ID:     json.RawMessage(idBytes),
+		ID:     id,
 		Result: mustRaw(map[string]any{"decision": decision}),
 	}
 	data, _ := json.Marshal(msg)
@@ -377,7 +366,8 @@ func (c *client) readLoop() {
 func (c *client) dispatchLine(line []byte) {
 	var msg rpcMessage
 	if err := json.Unmarshal(line, &msg); err != nil {
-		return // malformed line, drop
+		c.stderr.Append(fmt.Sprintf("dropped malformed JSON-RPC line: %v", err))
+		return
 	}
 
 	hasID := len(msg.ID) > 0 && string(msg.ID) != "null"
@@ -439,6 +429,7 @@ func (c *client) routeNotification(method string, params json.RawMessage) {
 			if !ok {
 				c.turnDone[n.Turn.ID] = *ev
 			}
+			c.clearApprovalsForTurnLocked(n.ThreadID, n.Turn.ID)
 			c.mu.Unlock()
 			if ok {
 				select {
@@ -458,8 +449,14 @@ func (c *client) routeApprovalRequest(id json.RawMessage, method string, params 
 		idStr = idStr[1 : len(idStr)-1]
 	}
 
-	ev, _ := translateApprovalRequest(method, params)
+	_, knownApprovalMethod := approvalKind(method)
+	ev, ar := translateApprovalRequest(method, params)
 	if ev == nil {
+		if knownApprovalMethod {
+			_ = c.writeRPCError(id, -32602, fmt.Sprintf("invalid params for app-server request method %q", method))
+		} else {
+			_ = c.writeRPCError(id, -32601, fmt.Sprintf("unsupported app-server request method %q", method))
+		}
 		return
 	}
 
@@ -467,7 +464,7 @@ func (c *client) routeApprovalRequest(id json.RawMessage, method string, params 
 	ev.Fields["request_id"] = idStr
 
 	c.mu.Lock()
-	c.approvals[idStr] = pendingApproval{threadID: ev.SessionID, method: method, params: params}
+	c.approvals[idStr] = pendingApproval{threadID: ev.SessionID, turnID: ar.TurnID, id: append(json.RawMessage(nil), id...)}
 	c.mu.Unlock()
 
 	c.fanout(ev)
@@ -480,17 +477,56 @@ func (c *client) fanout(ev *events.Event) {
 	select {
 	case c.eventsCh <- *ev:
 	default:
+		c.stderr.Append(fmt.Sprintf("dropped event %q for session %q: global event buffer full", ev.Event, ev.SessionID))
 	}
 
 	c.mu.Lock()
 	chans := c.subs[ev.SessionID]
 	for _, ch := range chans {
-		select {
-		case ch <- *ev:
-		default:
+		if isCriticalEvent(ev.Event) {
+			ch <- *ev
+		} else {
+			select {
+			case ch <- *ev:
+			default:
+				c.stderr.Append(fmt.Sprintf("dropped event %q for session %q: subscriber buffer full", ev.Event, ev.SessionID))
+			}
 		}
 	}
 	c.mu.Unlock()
+}
+
+func (c *client) writeRPCError(id json.RawMessage, code int, message string) error {
+	msg := rpcMessage{
+		ID: id,
+		Error: &rpcError{
+			Code:    code,
+			Message: message,
+		},
+	}
+	data, _ := json.Marshal(msg)
+	data = append(data, '\n')
+	return c.writeStdin(data)
+}
+
+func (c *client) clearApprovalsForTurnLocked(threadID, turnID string) {
+	if turnID == "" {
+		return
+	}
+	for requestID, approval := range c.approvals {
+		if approval.threadID == threadID && approval.turnID == turnID {
+			delete(c.approvals, requestID)
+		}
+	}
+}
+
+func isCriticalEvent(event string) bool {
+	switch event {
+	case "permission.request", "session.end":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *client) drainStderr(r io.ReadCloser) {

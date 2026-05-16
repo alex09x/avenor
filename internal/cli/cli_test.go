@@ -39,6 +39,7 @@ type cliFakeProvider struct {
 	answerSessionID string
 	answerRequestID string
 	answerResponse  runtime.PermissionResponse
+	cancelSessionID string
 }
 
 func (f *cliFakeProvider) Start(ctx context.Context, opts runtime.StartOptions) (runtime.Session, error) {
@@ -54,6 +55,7 @@ func (f *cliFakeProvider) Prompt(ctx context.Context, sessionID string, prompt s
 }
 
 func (f *cliFakeProvider) Cancel(ctx context.Context, sessionID string) error {
+	f.cancelSessionID = sessionID
 	return nil
 }
 
@@ -1524,6 +1526,170 @@ func TestControlPermissionClaimTimeoutFallsToFileHandler(t *testing.T) {
 	}
 	if provider.answerResponse.OptionID != "allow_fh" {
 		t.Fatalf("provider.answerResponse.OptionID = %q, want allow_fh", provider.answerResponse.OptionID)
+	}
+}
+
+func TestFilePermissionCancelledOutcomeDoesNotError(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "perm")
+	fh := permission.NewFileHandler(base)
+	fh.Timeout = 5 * time.Second
+	fh.PollInterval = 20 * time.Millisecond
+
+	reqPath := base + ".req"
+	respPath := base + ".req.response"
+	go func() {
+		pollDeadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, statErr := os.Stat(reqPath); statErr == nil {
+				break
+			}
+			if time.Now().After(pollDeadline) {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		_ = os.WriteFile(respPath, []byte(`{"outcome":"cancelled","option_id":"allow_fh"}`+"\n"), 0o600)
+	}()
+
+	event := events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_fh",
+		Fields: map[string]any{
+			"request_id": "req_fh",
+			"options": []any{
+				map[string]any{"optionId": "allow_fh", "kind": "allow"},
+			},
+		},
+	}
+
+	provider := &cliFakeProvider{}
+	res := resolvePermission(context.Background(), provider, fh, nil, event, "ses_fh", "req_fh", false, DefaultPermissionClaimTimeout, nil)
+
+	if res.err != nil {
+		t.Fatalf("unexpected error: %v", res.err)
+	}
+	if !res.cancelled {
+		t.Fatalf("permissionResult.cancelled = false, want true: %+v", res)
+	}
+	if provider.answerRequestID != "" {
+		t.Fatalf("AnswerPermission was called for request %q", provider.answerRequestID)
+	}
+}
+
+func TestWaitForSessionCancelledFilePermissionCancelsRun(t *testing.T) {
+	dir := t.TempDir()
+	eventsPath := filepath.Join(dir, "events.ndjson")
+	writer, err := NewEventWriter(eventsPath)
+	if err != nil {
+		t.Fatalf("newEventWriter: %v", err)
+	}
+
+	base := filepath.Join(dir, "perm")
+	fh := permission.NewFileHandler(base)
+	fh.Timeout = 5 * time.Second
+	fh.PollInterval = 20 * time.Millisecond
+
+	reqPath := base + ".req"
+	respPath := base + ".req.response"
+	go func() {
+		pollDeadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, statErr := os.Stat(reqPath); statErr == nil {
+				break
+			}
+			if time.Now().After(pollDeadline) {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		_ = os.WriteFile(respPath, []byte(`{"outcome":"cancelled","option_id":"allow_fh"}`+"\n"), 0o600)
+	}()
+
+	eventCh := make(chan events.Event, 1)
+	eventCh <- events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_cancel_file",
+		Fields: map[string]any{
+			"request_id": "req_cancel_file",
+			"options": []any{
+				map[string]any{"optionId": "allow_fh", "kind": "allow"},
+			},
+		},
+	}
+	close(eventCh)
+	promptDone := make(chan error)
+
+	provider := &cliFakeProvider{}
+	result := waitForSessionForTest(context.Background(), provider, writer, fh, nil, eventCh, promptDone, nil, "ses_cancel_file", "run_cancel_file", "", false, DefaultPermissionClaimTimeout, nil, io.Discard)
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	if result.ExitCode != 130 {
+		t.Fatalf("WaitForSession() = %d, want 130", result.ExitCode)
+	}
+	if provider.cancelSessionID != "ses_cancel_file" {
+		t.Fatalf("Cancel session = %q, want ses_cancel_file", provider.cancelSessionID)
+	}
+	got := readEventLogForTest(t, eventsPath)
+	last := got[len(got)-1]
+	if last.Event != "session.end" || last.Fields["stop_reason"] != "cancelled" {
+		t.Fatalf("last event = %+v, want cancelled session.end", last)
+	}
+}
+
+func TestWaitForSessionClosedEventChannelWaitsForPermissionThenErrors(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "perm")
+	fh := permission.NewFileHandler(base)
+	fh.Timeout = 5 * time.Second
+	fh.PollInterval = 20 * time.Millisecond
+
+	reqPath := base + ".req"
+	respPath := base + ".req.response"
+	go func() {
+		pollDeadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, statErr := os.Stat(reqPath); statErr == nil {
+				break
+			}
+			if time.Now().After(pollDeadline) {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		_ = os.WriteFile(respPath, []byte(`{"outcome":"selected","option_id":"allow_fh"}`+"\n"), 0o600)
+	}()
+
+	eventCh := make(chan events.Event, 1)
+	eventCh <- events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_closed",
+		Fields: map[string]any{
+			"request_id": "req_closed",
+			"options": []any{
+				map[string]any{"optionId": "allow_fh", "kind": "allow"},
+			},
+		},
+	}
+	close(eventCh)
+	promptDone := make(chan error)
+
+	writer, err := NewEventWriter("")
+	if err != nil {
+		t.Fatalf("new event writer: %v", err)
+	}
+	defer writer.Close()
+
+	provider := &cliFakeProvider{}
+	result := waitForSessionForTest(context.Background(), provider, writer, fh, nil, eventCh, promptDone, nil, "ses_closed", "run_closed", "", false, DefaultPermissionClaimTimeout, nil, io.Discard)
+
+	if result.ExitCode != 1 {
+		t.Fatalf("WaitForSession() = %d, want 1", result.ExitCode)
+	}
+	if provider.answerRequestID != "req_closed" {
+		t.Fatalf("AnswerPermission request = %q, want req_closed", provider.answerRequestID)
 	}
 }
 

@@ -2,6 +2,7 @@ package codexappserver
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,7 +36,7 @@ func TestCapabilities(t *testing.T) {
 }
 
 func TestResumeNoop(t *testing.T) {
-	p := NewWithOptions(runtime.StartOptions{})
+	p := NewWithOptions(runtime.StartOptions{Dir: "/work"})
 	p.threads["th_existing"] = "th_existing"
 
 	sess, err := p.Resume(context.Background(), "th_existing")
@@ -47,6 +48,9 @@ func TestResumeNoop(t *testing.T) {
 	}
 	if sess.Backend != "codex-app-server" {
 		t.Errorf("Backend = %q", sess.Backend)
+	}
+	if sess.Dir != "/work" {
+		t.Errorf("Dir = %q, want /work", sess.Dir)
 	}
 }
 
@@ -68,10 +72,15 @@ func TestAnswerPermissionNotStarted(t *testing.T) {
 
 func TestAnswerPermissionEmptyRequestID(t *testing.T) {
 	p := NewWithOptions(runtime.StartOptions{})
-	p.client = nil // not started
+	c, _, _ := fakeClient()
+	defer c.Close()
+	p.client = c
 	err := p.AnswerPermission(context.Background(), "ses", "", runtime.PermissionResponse{Allow: true})
 	if err == nil {
 		t.Fatal("expected error for empty request id")
+	}
+	if !strings.Contains(err.Error(), "permission request id is required") {
+		t.Fatalf("error = %v, want permission request id validation", err)
 	}
 }
 
@@ -102,6 +111,7 @@ func TestCloseNotStarted(t *testing.T) {
 // This exercises: request routing, response routing, turn waiter notification.
 func TestProviderPipeRoundtrip(t *testing.T) {
 	c, wOut, rIn := fakeClient()
+	defer c.Close()
 	p := NewWithOptions(runtime.StartOptions{})
 	p.client = c
 	p.threads["th_pipe"] = "th_pipe"
