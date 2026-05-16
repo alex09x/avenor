@@ -132,6 +132,41 @@ func (f *cliFakeProvider) Capabilities(ctx context.Context) (runtime.Capabilitie
 	return runtime.Capabilities{}, nil
 }
 
+func waitForSessionForTest(
+	ctx context.Context,
+	provider runtime.Provider,
+	writer EventSink,
+	fileHandler *permission.FileHandler,
+	controlServer *control.ControlServer,
+	eventCh <-chan events.Event,
+	promptDone <-chan error,
+	interruptCh <-chan struct{},
+	sessionID string,
+	runID string,
+	runLabel string,
+	autoApprove bool,
+	permClaimTimeout time.Duration,
+	timeout <-chan time.Time,
+	stderr io.Writer,
+) sessionResult {
+	return WaitForSession(ctx, provider, SessionWaitConfig{
+		EventCh:                eventCh,
+		PromptDone:             promptDone,
+		InterruptCh:            interruptCh,
+		SessionID:              sessionID,
+		RunID:                  runID,
+		RunLabel:               runLabel,
+		AutoApprove:            autoApprove,
+		PermissionClaimTimeout: permClaimTimeout,
+		Timeout:                timeout,
+	}, SessionWaitDeps{
+		Writer:        writer,
+		FileHandler:   fileHandler,
+		ControlServer: controlServer,
+		Stderr:        stderr,
+	})
+}
+
 func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
@@ -164,12 +199,12 @@ func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) 
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	result := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "review", true, DefaultPermissionClaimTimeout, nil, &stderr)
+	result := waitForSessionForTest(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "review", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
 	}
 	if result.ExitCode != 0 {
-		t.Fatalf("WaitForSession() = %d, want 0; stderr=%s", result.ExitCode, stderr.String())
+		t.Fatalf("waitForSessionForTest() = %d, want 0; stderr=%s", result.ExitCode, stderr.String())
 	}
 	if provider.answerSessionID != "ses_1" || provider.answerRequestID != "req_1" {
 		t.Fatalf("answered session=%q request=%q", provider.answerSessionID, provider.answerRequestID)
@@ -245,18 +280,8 @@ func TestRunCleansSentinelFilesBetweenRetries(t *testing.T) {
 	attempts := 0
 	runAttempt = func(
 		ctx context.Context,
-		startOptions runtime.StartOptions,
-		resumeID string,
-		writer EventSink,
-		fileHandler *permission.FileHandler,
-		controlServer *control.ControlServer,
-		prompt string,
-		runID string,
-		runLabel string,
-		autoApprove bool,
-		permClaimTimeout time.Duration,
-		timer <-chan time.Time,
-		stderr io.Writer,
+		cfg attemptConfig,
+		deps attemptDeps,
 	) attemptResult {
 		attempts++
 		switch attempts {
@@ -530,7 +555,7 @@ func TestAutoAnswerGoroutineDoesNotBlockEventLoop(t *testing.T) {
 	var result sessionResult
 	go func() {
 		defer wg.Done()
-		result = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
+		result = waitForSessionForTest(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
 	}()
 
 	// Wait until AnswerPermission has been called (goroutine is now blocked inside it).
@@ -620,12 +645,12 @@ func TestAutoAnswerMissingRequestIDEmitsErrorNotWorking(t *testing.T) {
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	result := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, &stderr)
+	result := waitForSessionForTest(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
 	if result.ExitCode != 0 {
-		t.Fatalf("WaitForSession() = %d, want 0", result.ExitCode)
+		t.Fatalf("waitForSessionForTest() = %d, want 0", result.ExitCode)
 	}
 	// AnswerPermission must NOT have been called.
 	if provider.answerRequestID != "" {
@@ -687,12 +712,12 @@ func TestAutoAnswerEmitsPermissionResponse(t *testing.T) {
 
 	provider := &cliFakeProvider{}
 	var stderr strings.Builder
-	result := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "mylabel", true, DefaultPermissionClaimTimeout, nil, &stderr)
+	result := waitForSessionForTest(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "mylabel", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
 	if result.ExitCode != 0 {
-		t.Fatalf("WaitForSession() = %d, want 0; stderr=%s", result.ExitCode, stderr.String())
+		t.Fatalf("waitForSessionForTest() = %d, want 0; stderr=%s", result.ExitCode, stderr.String())
 	}
 
 	got := readEventLogForTest(t, eventsPath)
@@ -766,12 +791,12 @@ func TestAutoAnswerAnswerPermissionErrorEmitsError(t *testing.T) {
 
 	provider := &errorFakeProvider{answerErr: fmt.Errorf("backend unavailable")}
 	var stderr strings.Builder
-	result := WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, &stderr)
+	result := waitForSessionForTest(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, &stderr)
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
 	}
 	if result.ExitCode != 1 {
-		t.Fatalf("WaitForSession() = %d, want 1 (error exit)", result.ExitCode)
+		t.Fatalf("waitForSessionForTest() = %d, want 1 (error exit)", result.ExitCode)
 	}
 
 	got := readEventLogForTest(t, eventsPath)
@@ -821,7 +846,7 @@ func TestAutoAnswerWorkingStatusEmittedOnPermissionResume(t *testing.T) {
 	var result sessionResult
 	go func() {
 		defer wg.Done()
-		result = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
+		result = waitForSessionForTest(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
 	}()
 
 	// Wait until AnswerPermission is called, then unblock it so the
@@ -954,7 +979,7 @@ func TestControlPermissionResolution(t *testing.T) {
 	var result sessionResult
 	go func() {
 		defer wg.Done()
-		result = WaitForSession(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_ctrl", "run_1", "mylabel", false, 5*time.Second, nil, io.Discard)
+		result = waitForSessionForTest(context.Background(), provider, writer, nil, cs, eventCh, promptDone, nil, "ses_ctrl", "run_1", "mylabel", false, 5*time.Second, nil, io.Discard)
 	}()
 
 	// Wait for the permission.request to be processed by the event loop
@@ -1028,7 +1053,7 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 	var result sessionResult
 	go func() {
 		defer wg.Done()
-		result = WaitForSession(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
+		result = waitForSessionForTest(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
 	}()
 
 	// Wait until the first AnswerPermission call is in-flight (blocking).
@@ -1363,5 +1388,158 @@ func TestControlPermissionClaimContextCancelReleasesClaim(t *testing.T) {
 	// AnswerPermission must NOT have been called (ctx was cancelled before any answer).
 	if provider.answerRequestID != "" {
 		t.Fatalf("provider.AnswerPermission called with requestID=%q, want no call", provider.answerRequestID)
+	}
+}
+
+func TestRunBackendOpenCodeACP(t *testing.T) {
+	oldRunAttempt := runAttempt
+	oldRetryAfter := retryAfter
+	t.Cleanup(func() {
+		runAttempt = oldRunAttempt
+		retryAfter = oldRetryAfter
+	})
+
+	var gotBackend string
+	runAttempt = func(
+		ctx context.Context,
+		cfg attemptConfig,
+		deps attemptDeps,
+	) attemptResult {
+		gotBackend = cfg.backend
+		return attemptResult{exitCode: 0}
+	}
+	retryAfter = func(time.Duration) <-chan time.Time { return make(chan time.Time) }
+
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+
+	var stderr strings.Builder
+	code := run([]string{
+		"--prompt-file", promptPath,
+		"--backend", "opencode-acp",
+	}, func(string) string { return "" }, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if gotBackend != "opencode-acp" {
+		t.Fatalf("runAttempt backend = %q, want %q", gotBackend, "opencode-acp")
+	}
+}
+
+func TestRunBackendOpenCodeHTTPWithServerURL(t *testing.T) {
+	oldRunAttempt := runAttempt
+	oldRetryAfter := retryAfter
+	t.Cleanup(func() {
+		runAttempt = oldRunAttempt
+		retryAfter = oldRetryAfter
+	})
+
+	var gotBackend string
+	var gotServerURL string
+	runAttempt = func(
+		ctx context.Context,
+		cfg attemptConfig,
+		deps attemptDeps,
+	) attemptResult {
+		gotBackend = cfg.backend
+		gotServerURL = cfg.startOptions.ServerURL
+		return attemptResult{exitCode: 0}
+	}
+	retryAfter = func(time.Duration) <-chan time.Time { return make(chan time.Time) }
+
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+
+	var stderr strings.Builder
+	code := run([]string{
+		"--prompt-file", promptPath,
+		"--backend", "opencode-http",
+		"--server-url", "http://localhost:8080",
+	}, func(string) string { return "" }, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if gotBackend != "opencode-http" {
+		t.Fatalf("runAttempt backend = %q, want %q", gotBackend, "opencode-http")
+	}
+	if gotServerURL != "http://localhost:8080" {
+		t.Fatalf("startOptions.ServerURL = %q, want flag URL", gotServerURL)
+	}
+}
+
+func TestRunBackendOpenCodeHTTPWithEnvServerURL(t *testing.T) {
+	oldRunAttempt := runAttempt
+	oldRetryAfter := retryAfter
+	t.Cleanup(func() {
+		runAttempt = oldRunAttempt
+		retryAfter = oldRetryAfter
+	})
+
+	var gotBackend string
+	var gotServerURL string
+	runAttempt = func(
+		ctx context.Context,
+		cfg attemptConfig,
+		deps attemptDeps,
+	) attemptResult {
+		gotBackend = cfg.backend
+		gotServerURL = cfg.startOptions.ServerURL
+		return attemptResult{exitCode: 0}
+	}
+	retryAfter = func(time.Duration) <-chan time.Time { return make(chan time.Time) }
+
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	if err := os.WriteFile(promptPath, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("write prompt: %v", err)
+	}
+
+	env := func(key string) string {
+		if key == "AVENOR_OPENCODE_URL" {
+			return "http://env.example"
+		}
+		return ""
+	}
+	var stderr strings.Builder
+	code := run([]string{
+		"--prompt-file", promptPath,
+		"--backend", "opencode-http",
+	}, env, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if gotBackend != "opencode-http" {
+		t.Fatalf("runAttempt backend = %q, want %q", gotBackend, "opencode-http")
+	}
+	if gotServerURL != "http://env.example" {
+		t.Fatalf("startOptions.ServerURL = %q, want env URL", gotServerURL)
+	}
+}
+
+func TestRunUnknownBackend(t *testing.T) {
+	var stderr strings.Builder
+	code := run([]string{"--backend", "bogus"}, nil, &stderr)
+	if code != 1 {
+		t.Fatalf("run() = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), `avenor: unknown backend "bogus"`) {
+		t.Fatalf("stderr = %q, want unknown backend message", stderr.String())
+	}
+}
+
+func TestRunOpenCodeHTTPWithoutServerURL(t *testing.T) {
+	var stderr strings.Builder
+	code := run([]string{"--backend", "opencode-http"}, nil, &stderr)
+	if code != 1 {
+		t.Fatalf("run() = %d, want 1", code)
+	}
+	if stderr.String() != "avenor: --server-url is required for backend opencode-http\n" {
+		t.Fatalf("stderr = %q, want exact --server-url message", stderr.String())
 	}
 }

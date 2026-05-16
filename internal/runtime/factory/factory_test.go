@@ -1,0 +1,40 @@
+package factory
+
+import (
+	"testing"
+
+	"github.com/sdougbrown/avenor/internal/runtime"
+)
+
+func TestNewProviderAcp(t *testing.T) {
+	p, err := NewProvider(runtime.StartOptions{}, "opencode-acp")
+	if err != nil {
+		t.Fatalf("NewProvider(acp) error = %v", err)
+	}
+	if p == nil {
+		t.Fatal("NewProvider(acp) provider is nil")
+	}
+}
+
+func TestNewProviderHTTP(t *testing.T) {
+	p, err := NewProvider(runtime.StartOptions{}, "opencode-http")
+	if err != nil {
+		t.Fatalf("NewProvider(http) error = %v", err)
+	}
+	if p == nil {
+		t.Fatal("NewProvider(http) provider is nil")
+	}
+}
+
+func TestNewProviderUnknown(t *testing.T) {
+	p, err := NewProvider(runtime.StartOptions{}, "unknown")
+	if p != nil {
+		t.Fatal("NewProvider(unknown) expected nil provider")
+	}
+	if err == nil {
+		t.Fatal("NewProvider(unknown) expected error")
+	}
+	if err.Error() != `unknown backend "unknown"` {
+		t.Fatalf("NewProvider(unknown) error = %q, want %q", err.Error(), `unknown backend "unknown"`)
+	}
+}

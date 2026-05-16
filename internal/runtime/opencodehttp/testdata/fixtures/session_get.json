@@ -1,0 +1,34 @@
+{
+    "id": "ses_1d654d50cffeamYko2idbFNtOj",
+    "slug": "stellar-wolf",
+    "projectID": "01c609a803a410ee7f7493ce535df0a839b03ca6",
+    "directory": "/Users/douglasbrown/Code/avenor",
+    "path": "",
+    "summary": {
+        "additions": 0,
+        "deletions": 0,
+        "files": 0
+    },
+    "cost": 0.02792352,
+    "tokens": {
+        "input": 16018,
+        "output": 2,
+        "reasoning": 13,
+        "cache": {
+            "read": 0,
+            "write": 0
+        }
+    },
+    "title": "Simple greeting",
+    "agent": "jockey",
+    "model": {
+        "id": "deepseek-v4-pro",
+        "providerID": "deepseek",
+        "variant": "default"
+    },
+    "version": "1.14.50",
+    "time": {
+        "created": 1778815544051,
+        "updated": 1778815607447
+    }
+}

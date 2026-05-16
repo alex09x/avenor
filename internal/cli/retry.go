@@ -10,7 +10,7 @@ import (
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/opencodeacp"
+	"github.com/sdougbrown/avenor/internal/runtime/factory"
 )
 
 // attemptResult holds the outcome of a single session attempt.
@@ -19,6 +19,25 @@ type attemptResult struct {
 	sessionID     string
 	loopDirective string
 	loopLabel     string
+}
+
+type attemptConfig struct {
+	startOptions           runtime.StartOptions
+	backend                string
+	resumeID               string
+	initialPrompt          string
+	runID                  string
+	runLabel               string
+	autoApprove            bool
+	permissionClaimTimeout time.Duration
+	timer                  <-chan time.Time
+}
+
+type attemptDeps struct {
+	writer        EventSink
+	fileHandler   *permission.FileHandler
+	controlServer *control.ControlServer
+	stderr        io.Writer
 }
 
 // resumeSession resumes an existing session after cancellation so a follow-up
@@ -37,40 +56,34 @@ func resumeSession(ctx context.Context, provider runtime.Provider, sessionID str
 // returning.
 func runSingleAttempt(
 	ctx context.Context,
-	startOptions runtime.StartOptions,
-	resumeID string,
-	writer EventSink,
-	fileHandler *permission.FileHandler,
-	controlServer *control.ControlServer,
-	initPrompt string,
-	runID string,
-	runLabel string,
-	autoApprove bool,
-	permClaimTimeout time.Duration,
-	timer <-chan time.Time,
-	stderr io.Writer,
+	cfg attemptConfig,
+	deps attemptDeps,
 ) attemptResult {
-	provider := opencodeacp.NewWithOptions(startOptions)
+	provider, err := factory.NewProvider(cfg.startOptions, cfg.backend)
+	if err != nil {
+		fmt.Fprintf(deps.stderr, "avenor: create provider: %v\n", err)
+		return attemptResult{exitCode: 1}
+	}
 	defer func() {
 		if closer, ok := provider.(interface{ Close() error }); ok {
 			_ = closer.Close()
 		}
 	}()
 
-	session, err := StartSession(ctx, provider, startOptions, resumeID)
+	session, err := StartSession(ctx, provider, cfg.startOptions, cfg.resumeID)
 	if err != nil {
-		fmt.Fprintf(stderr, "avenor: start session: %v\n", err)
+		fmt.Fprintf(deps.stderr, "avenor: start session: %v\n", err)
 		return attemptResult{exitCode: 1}
 	}
 
-	prompt := initPrompt
+	prompt := cfg.initialPrompt
 
 	// Check for interrupts that arrived between turns (during backoff).
-	if controlServer != nil {
-		if text := controlServer.ConsumeInterrupt(); text != "" {
+	if deps.controlServer != nil {
+		if text := deps.controlServer.ConsumeInterrupt(); text != "" {
 			prompt = text
 			if _, err := resumeSession(ctx, provider, session.SessionID); err != nil {
-				fmt.Fprintf(stderr, "avenor: resume for interrupt: %v\n", err)
+				fmt.Fprintf(deps.stderr, "avenor: resume for interrupt: %v\n", err)
 				return attemptResult{exitCode: 1, sessionID: session.SessionID}
 			}
 		}
@@ -86,14 +99,14 @@ func runSingleAttempt(
 		eventCh, err := provider.Events(eventCtx, session.SessionID)
 		if err != nil {
 			cancelEvents()
-			fmt.Fprintf(stderr, "avenor: subscribe events: %v\n", err)
+			fmt.Fprintf(deps.stderr, "avenor: subscribe events: %v\n", err)
 			return attemptResult{exitCode: 1, sessionID: session.SessionID}
 		}
 
 		var interruptCh <-chan struct{}
-		if controlServer != nil {
-			controlServer.ResetInterrupt()
-			interruptCh = controlServer.InterruptChan()
+		if deps.controlServer != nil {
+			deps.controlServer.ResetInterrupt()
+			interruptCh = deps.controlServer.InterruptChan()
 		}
 
 		// Use a background context for Prompt so it survives process-cancellation
@@ -103,7 +116,22 @@ func runSingleAttempt(
 			promptDone <- provider.Prompt(context.Background(), session.SessionID, prompt)
 		}()
 
-		result := WaitForSession(ctx, provider, writer, fileHandler, controlServer, eventCh, promptDone, interruptCh, session.SessionID, runID, runLabel, autoApprove, permClaimTimeout, timer, stderr)
+		result := WaitForSession(ctx, provider, SessionWaitConfig{
+			EventCh:                eventCh,
+			PromptDone:             promptDone,
+			InterruptCh:            interruptCh,
+			SessionID:              session.SessionID,
+			RunID:                  cfg.runID,
+			RunLabel:               cfg.runLabel,
+			AutoApprove:            cfg.autoApprove,
+			PermissionClaimTimeout: cfg.permissionClaimTimeout,
+			Timeout:                cfg.timer,
+		}, SessionWaitDeps{
+			Writer:        deps.writer,
+			FileHandler:   deps.fileHandler,
+			ControlServer: deps.controlServer,
+			Stderr:        deps.stderr,
+		})
 		exitCode := result.ExitCode
 		cancelEvents()
 
@@ -112,21 +140,21 @@ func runSingleAttempt(
 			accLabel = result.LoopLabel
 		}
 
-		if controlServer != nil {
+		if deps.controlServer != nil {
 			// Check interrupt first (priority over queued prompts) to avoid
 			// losing the interrupt when exitCode==0 overlaps with a queued prompt.
-			if interruptText := controlServer.ConsumeInterrupt(); interruptText != "" {
+			if interruptText := deps.controlServer.ConsumeInterrupt(); interruptText != "" {
 				if _, err := resumeSession(ctx, provider, session.SessionID); err != nil {
-					fmt.Fprintf(stderr, "avenor: resume after cancel: %v\n", err)
+					fmt.Fprintf(deps.stderr, "avenor: resume after cancel: %v\n", err)
 					return attemptResult{exitCode: 1, sessionID: session.SessionID, loopDirective: accDirective, loopLabel: accLabel}
 				}
 				prompt = interruptText
 				continue
 			}
 			if exitCode == 0 {
-				if nextPrompt := controlServer.DequeuePrompt(); nextPrompt != "" {
+				if nextPrompt := deps.controlServer.DequeuePrompt(); nextPrompt != "" {
 					if _, err := resumeSession(ctx, provider, session.SessionID); err != nil {
-						fmt.Fprintf(stderr, "avenor: resume after end_turn: %v\n", err)
+						fmt.Fprintf(deps.stderr, "avenor: resume after end_turn: %v\n", err)
 						return attemptResult{exitCode: 1, sessionID: session.SessionID, loopDirective: accDirective, loopLabel: accLabel}
 					}
 					prompt = nextPrompt

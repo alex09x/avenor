@@ -2,6 +2,7 @@ package stable
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -98,6 +99,21 @@ func TestSpawnParamsValidation(t *testing.T) {
 	_, err = sup.spawn(SpawnParams{Prompt: "hello"})
 	// Dir defaults to ".", so this shouldn't error on validation alone
 	// It might fail on starting the acp session though
+
+	// opencode-http without server_url — unset env to avoid accidental
+	// resolution via AVENOR_OPENCODE_URL.
+	t.Setenv("AVENOR_OPENCODE_URL", "")
+	_, err = sup.spawn(SpawnParams{
+		Prompt:  "hello",
+		Dir:     "/tmp",
+		Backend: "opencode-http",
+	})
+	if err == nil {
+		t.Fatal("spawn with backend opencode-http and no server_url should error")
+	}
+	if !strings.Contains(err.Error(), "server-url is required for backend opencode-http") {
+		t.Errorf("error = %q, want server-url required message", err.Error())
+	}
 }
 
 func TestSpawnLoopFileFailureCleansReservedRuntime(t *testing.T) {
@@ -264,7 +280,7 @@ func TestRunLoopChildCleansUpOnLooprunnerError(t *testing.T) {
 		MaxIterations: 1,
 		Pre:           []looprunner.Phase{{Name: "broken", Prompt: "{{"}},
 	}
-	sup.runLoopChild(context.Background(), child, cfg, 0, "", "", "")
+	sup.runLoopChild(context.Background(), child, cfg, 0, "", "", "", "")
 
 	select {
 	case <-child.done:
