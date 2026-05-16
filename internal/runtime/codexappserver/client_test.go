@@ -1,0 +1,381 @@
+package codexappserver
+
+import (
+	"bufio"
+	"encoding/json"
+	"io"
+	"os/exec"
+	"testing"
+	"time"
+
+	"github.com/sdougbrown/avenor/internal/events"
+)
+
+// fakeClient creates a client backed by in-memory pipes.
+// Returns the client, a writer to simulate server→client messages (stdout),
+// and a reader to inspect client→server writes (stdin).
+func fakeClient() (*client, *io.PipeWriter, *io.PipeReader) {
+	clientInR, clientInW := io.Pipe() // stdin: client writes, we read
+	clientOutR, clientOutW := io.Pipe() // stdout: we write, client reads
+	errR, errW := io.Pipe()             // stderr: subprocess writes, client drains
+	_ = errW.Close()                     // no real stderr; close writer so drain exits
+
+	c := newClient(nil, clientInW, clientOutR, errR)
+	return c, clientOutW, clientInR
+}
+
+func writeLine(w io.Writer, v any) {
+	b, _ := json.Marshal(v)
+	b = append(b, '\n')
+	_, _ = w.Write(b)
+}
+
+func readLine(r io.Reader) (rpcMessage, error) {
+	var msg rpcMessage
+	scanner := bufio.NewScanner(r)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return msg, err
+		}
+		return msg, io.EOF
+	}
+	if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+		return msg, err
+	}
+	return msg, nil
+}
+
+func TestClientRequestResponse(t *testing.T) {
+	c, wOut, rIn := fakeClient()
+	defer c.Close()
+
+	done := make(chan json.RawMessage, 1)
+	go func() {
+		msg, err := readLine(rIn)
+		if err != nil {
+			t.Logf("read request: %v", err)
+			return
+		}
+		// Respond with the same ID.
+		writeLine(wOut, map[string]any{
+			"id":     msg.ID,
+			"result": map[string]any{"thread": map[string]any{"id": "th_abc"}},
+		})
+		done <- msg.Result
+	}()
+
+	result, err := c.request("thread/start", threadStartParams{CWD: "/tmp"})
+	if err != nil {
+		t.Fatalf("request error: %v", err)
+	}
+	var parsed struct {
+		Thread struct {
+			ID string `json:"id"`
+		} `json:"thread"`
+	}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if parsed.Thread.ID != "th_abc" {
+		t.Errorf("thread ID = %q, want th_abc", parsed.Thread.ID)
+	}
+}
+
+func TestClientRequestError(t *testing.T) {
+	c, wOut, rIn := fakeClient()
+	defer c.Close()
+
+	go func() {
+		msg, err := readLine(rIn)
+		if err != nil {
+			t.Logf("read request: %v", err)
+			return
+		}
+		writeLine(wOut, map[string]any{
+			"id": msg.ID,
+			"error": map[string]any{
+				"code":    -32000,
+				"message": "something went wrong",
+			},
+		})
+	}()
+
+	result, err := c.request("thread/start", nil)
+	if err != nil {
+		t.Fatalf("request error: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if errMap, ok := parsed["error"].(map[string]any); !ok {
+		t.Fatal("expected error in result")
+	} else if msg, _ := errMap["message"].(string); msg != "something went wrong" {
+		t.Errorf("error message = %q", msg)
+	}
+}
+
+func TestClientNotificationRouting(t *testing.T) {
+	c, wOut, _ := fakeClient()
+	defer c.Close()
+
+	sub := make(chan events.Event, 4)
+	c.subscribe("th_x", sub)
+
+	go func() {
+		writeLine(wOut, map[string]any{
+			"method": "turn/completed",
+			"params": map[string]any{
+				"threadId": "th_x",
+				"turn": map[string]any{
+					"id":     "turn_1",
+					"status": "completed",
+				},
+			},
+		})
+	}()
+
+	select {
+	case ev := <-sub:
+		if ev.Event != "session.end" {
+			t.Errorf("event = %q, want session.end", ev.Event)
+		}
+		if sid, _ := ev.Fields["stop_reason"].(string); sid != "end_turn" {
+			t.Errorf("stop_reason = %q, want end_turn", sid)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for notification event")
+	}
+}
+
+func TestClientTurnWaiter(t *testing.T) {
+	c, wOut, _ := fakeClient()
+	defer c.Close()
+
+	turnCh := c.registerTurn("turn_w")
+
+	go func() {
+		writeLine(wOut, map[string]any{
+			"method": "turn/completed",
+			"params": map[string]any{
+				"threadId": "th_x",
+				"turn": map[string]any{
+					"id":     "turn_w",
+					"status": "completed",
+				},
+			},
+		})
+	}()
+
+	select {
+	case ev := <-turnCh:
+		if ev.Event != "session.end" {
+			t.Errorf("event = %q, want session.end", ev.Event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for turn completion")
+	}
+}
+
+func TestClientApprovalRouting(t *testing.T) {
+	c, wOut, _ := fakeClient()
+	defer c.Close()
+
+	sub := make(chan events.Event, 4)
+	c.subscribe("th_perm", sub)
+
+	go func() {
+		writeLine(wOut, map[string]any{
+			"id":     "42",
+			"method": "item/commandExecution/requestApproval",
+			"params": map[string]any{
+				"threadId": "th_perm",
+				"command":  "rm -rf /",
+				"summary":  "dangerous command",
+			},
+		})
+	}()
+
+	select {
+	case ev := <-c.eventsCh:
+		if ev.Event != "permission.request" {
+			t.Errorf("event = %q, want permission.request", ev.Event)
+		}
+		rid, _ := ev.Fields["request_id"].(string)
+		if rid != "42" {
+			t.Errorf("request_id = %q, want 42", rid)
+		}
+		kind, _ := ev.Fields["kind"].(string)
+		if kind != "command" {
+			t.Errorf("kind = %q, want command", kind)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for approval event")
+	}
+
+	select {
+	case ev := <-sub:
+		if ev.Event != "permission.request" {
+			t.Errorf("event = %q, want permission.request", ev.Event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for subscriber approval event")
+	}
+
+	c.mu.Lock()
+	_, ok := c.approvals["42"]
+	c.mu.Unlock()
+	if !ok {
+		t.Fatal("approval not stored")
+	}
+}
+
+func TestClientAnswerApproval(t *testing.T) {
+	c, _, rIn := fakeClient()
+	defer c.Close()
+
+	c.mu.Lock()
+	c.approvals["req_accept"] = pendingApproval{method: "item/commandExecution/requestApproval"}
+	c.mu.Unlock()
+
+	done := make(chan rpcMessage, 1)
+	go func() {
+		msg, err := readLine(rIn)
+		if err != nil {
+			t.Logf("read error: %v", err)
+			return
+		}
+		done <- msg
+	}()
+
+	if err := c.answerApproval("req_accept", true); err != nil {
+		t.Fatalf("answerApproval: %v", err)
+	}
+
+	select {
+	case msg := <-done:
+		var resp approvalDecision
+		if err := json.Unmarshal(msg.Result, &resp); err != nil {
+			t.Fatalf("unmarshal result: %v", err)
+		}
+		if resp.Decision != "accept" {
+			t.Errorf("decision = %q, want accept", resp.Decision)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for answer write")
+	}
+}
+
+func TestClientAnswerApprovalNotFound(t *testing.T) {
+	c, _, _ := fakeClient()
+	defer c.Close()
+
+	err := c.answerApproval("unknown", true)
+	if err == nil {
+		t.Fatal("expected error for unknown approval")
+	}
+}
+
+func TestClientMalformedJSON(t *testing.T) {
+	c, wOut, _ := fakeClient()
+	defer c.Close()
+
+	go func() {
+		_, _ = wOut.Write([]byte("not json\n"))
+		writeLine(wOut, map[string]any{
+			"method": "turn/started",
+			"params": map[string]any{"threadId": "th_ok", "turnId": "t_ok"},
+		})
+	}()
+
+	select {
+	case ev := <-c.eventsCh:
+		if ev.Event != "avenor.turn.start" {
+			t.Errorf("expected turn.start after malformed line, got %q", ev.Event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for event after malformed line")
+	}
+}
+
+func TestClientClose(t *testing.T) {
+	proc := exec.Command("cat")
+	stdin, _ := proc.StdinPipe()
+	stdout, _ := proc.StdoutPipe()
+	stderr, _ := proc.StderrPipe()
+	_ = proc.Start()
+
+	c := newClient(proc, stdin, stdout, stderr)
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if proc.ProcessState == nil {
+		t.Fatal("process should have exited")
+	}
+}
+
+func TestClientNotify(t *testing.T) {
+	c, _, rIn := fakeClient()
+	defer c.Close()
+
+	done := make(chan rpcMessage, 1)
+	go func() {
+		msg, err := readLine(rIn)
+		if err != nil {
+			t.Logf("read error: %v", err)
+			return
+		}
+		done <- msg
+	}()
+
+	if err := c.notify("initialized", nil); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+
+	select {
+	case msg := <-done:
+		if msg.Method != "initialized" {
+			t.Errorf("method = %q, want initialized", msg.Method)
+		}
+		if len(msg.ID) > 0 && string(msg.ID) != "null" && string(msg.ID) != `"null"` {
+			t.Error("notify should have no id")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for notify write")
+	}
+}
+
+func TestRollingBuffer(t *testing.T) {
+	b := newRollingBuffer(3)
+	b.Append("line 1")
+	b.Append("line 2")
+	b.Append("line 3")
+	b.Append("line 4")
+	b.Append("line 5")
+
+	out := b.String()
+	if out != "line 3\nline 4\nline 5\n" {
+		t.Errorf("rolling buffer = %q", out)
+	}
+}
+
+func TestClientSubscribeUnsubscribe(t *testing.T) {
+	c, _, _ := fakeClient()
+	defer c.Close()
+
+	ch := make(chan events.Event, 1)
+	c.subscribe("th_sub", ch)
+	c.mu.Lock()
+	if len(c.subs["th_sub"]) != 1 {
+		t.Fatal("sub not registered")
+	}
+	c.mu.Unlock()
+
+	c.unsubscribe("th_sub", ch)
+	c.mu.Lock()
+	if len(c.subs["th_sub"]) != 0 {
+		t.Fatal("sub not removed")
+	}
+	c.mu.Unlock()
+}
