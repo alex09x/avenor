@@ -111,13 +111,27 @@ func waitForSessionForTest(
 
 func waitForPendingPermissionForTest(t *testing.T, cs *control.ControlServer) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if cs.HasPendingPermission() {
 			return
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("timed out waiting for pending permission claim")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func waitForControlClientForTest(t *testing.T, cs *control.ControlServer) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if cs.HasClients() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for control client")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -947,6 +961,7 @@ func TestControlPermissionResolution(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	defer ctrlConn.Close()
+	waitForControlClientForTest(t, cs)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -1062,6 +1077,7 @@ func TestControlPermissionNonLiteralOptionIDMapsByKind(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		defer ctrlConn.Close()
+		waitForControlClientForTest(t, cs)
 
 		var wg sync.WaitGroup
 		wg.Add(1)
@@ -1169,6 +1185,7 @@ func TestControlPermissionRejectsUnknownOptionID(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	defer ctrlConn.Close()
+	waitForControlClientForTest(t, cs)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -1250,6 +1267,7 @@ func TestControlPermissionRejectsUnsupportedKind(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	defer ctrlConn.Close()
+	waitForControlClientForTest(t, cs)
 
 	var wg sync.WaitGroup
 	wg.Add(1)

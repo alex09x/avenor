@@ -6,7 +6,7 @@ Avenor allows for any given to top-level agent (the one you're chatting with) to
 
 The way I have this organized personally is to have a "jockey" agent that is write-restricted, forcing it to spawn "horse" or "mule" sub-agents to do write-oriented work for it. An amusing pattern, and keeps implementing agents from getting confused and doing the wrong thing. Each agent above keeps focusing the prompts so that the implementors don't get distracted and start doing things they aren't supposed to. 
 
-Initially this is configured to work with [OpenCode](opencode.ai) via ACP or HTTP. (No real difference, just wanted to experiment so both work.) Get your agent to check to the docs to ensure it uses the cli correctly. (Hilariously this CLI is intended for your agent to use, not you as a human.)
+Initially this is configured to work with [OpenCode](opencode.ai) via ACP or HTTP. (No real difference, just wanted to experiment so both work.) For MCP-compatible clients, `avenor mcp` is the canonical Go-native MCP server — no Node/Bun required. The Node.js packages (`@dougbots/avenor-mcp`, `@dougbots/avenor-opencode`) remain for OpenCode integration. See [docs/mcp.md](docs/mcp.md) for MCP setup and tool details. Get your agent to check the docs to ensure it uses the CLI correctly. (Hilariously this CLI is intended for your agent to use, not you as a human.)
 
 I'm working to provide a good skill/agent template to get folks started on using this pattern. Originally I intended for this to be "token sparing" but that hasn't really borne out. It does do a good job of preserving top-level context though for longer-lived build runs so I'm happy with it so far. 
 
@@ -21,6 +21,22 @@ chmod +x avenor
 ```
 
 If you want a deeper tour, the docs cover the permission handler, event flow, plan, loop, and backend support in more detail.
+
+## Development
+
+This repo is Go-first, with a small JS workspace for package integrations. `mise` is the convenience layer for common local tasks; it wraps the underlying `go` and `bun` CLI commands rather than replacing them.
+
+```bash
+mise run build      # Go binary + JS packages
+mise run test       # Go tests + JS package tests
+
+mise run go-build   # Go binary only
+mise run go-test    # Go tests only
+mise run js-build   # JS packages only
+mise run js-test    # JS tests only
+```
+
+The direct equivalents are still ordinary commands such as `go build -o avenor ./cmd/avenor`, `go test ./...`, `bun run build`, and `bun run test`.
 
 ## Permission handling
 

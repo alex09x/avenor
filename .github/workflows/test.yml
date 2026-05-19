@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  go:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -14,19 +14,34 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.25'
 
-      - name: Run Go tests
-        run: go test ./...
+      - name: Setup mise
+        uses: jdx/mise-action@v2
+
+      - name: Build Go binary
+        run: mise run go-build
+
+      - name: Test Go packages
+        run: mise run go-test
+
+  js:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
+      - name: Setup mise
+        uses: jdx/mise-action@v2
+
       - name: Install package dependencies
         run: bun install
 
-      - name: Run package builds
-        run: bun run build
+      - name: Build JS packages
+        run: mise run js-build
 
-      - name: Run package tests
-        run: bun run test
+      - name: Test JS packages
+        run: mise run js-test

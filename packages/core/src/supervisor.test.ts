@@ -4,6 +4,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {
   findAvenorBinary,
+  installerBinaryPath,
   Supervisor,
   type RunInfo,
 } from './supervisor.js'
@@ -108,6 +109,88 @@ describe('findAvenorBinary', () => {
         process.env.AVENOR_BIN = prev
       } else {
         delete process.env.AVENOR_BIN
+      }
+    }
+  })
+
+  it('falls back to installer-managed path when AVENOR_BIN unset and avenor not on PATH', () => {
+    const prevBin = process.env.AVENOR_BIN
+    const prevInstallDir = process.env.AVENOR_INSTALL_DIR
+    const prevPath = process.env.PATH
+    const tmpDir = path.join(os.tmpdir(), `avenor-test-install-${process.pid}`)
+    const binaryPath = path.join(tmpDir, 'avenor')
+
+    delete process.env.AVENOR_BIN
+
+    try {
+      const emptyPath = fs.mkdtempSync(path.join(os.tmpdir(), 'avenor-empty-path-'))
+      fs.writeFileSync(path.join(emptyPath, 'which'), '#!/bin/sh\nexit 1\n', { mode: 0o755 })
+      process.env.PATH = emptyPath
+      // Create a fake executable at the installer path
+      fs.mkdirSync(tmpDir, { recursive: true })
+      fs.writeFileSync(binaryPath, '#!/bin/sh\nexit 0')
+      fs.chmodSync(binaryPath, 0o755)
+      process.env.AVENOR_INSTALL_DIR = tmpDir
+
+      const result = findAvenorBinary()
+      expect(result).toBe(binaryPath)
+    } finally {
+      if (prevBin) {
+        process.env.AVENOR_BIN = prevBin
+      } else {
+        delete process.env.AVENOR_BIN
+      }
+      if (prevInstallDir) {
+        process.env.AVENOR_INSTALL_DIR = prevInstallDir
+      } else {
+        delete process.env.AVENOR_INSTALL_DIR
+      }
+      if (prevPath) {
+        process.env.PATH = prevPath
+      } else {
+        delete process.env.PATH
+      }
+      try {
+        fs.unlinkSync(binaryPath)
+        fs.rmdirSync(tmpDir)
+      } catch {
+        // ignore cleanup errors
+      }
+    }
+  })
+})
+
+describe('installerBinaryPath', () => {
+  it('returns AVENOR_INSTALL_DIR/avenor when AVENOR_INSTALL_DIR is set', () => {
+    const prev = process.env.AVENOR_INSTALL_DIR
+    try {
+      process.env.AVENOR_INSTALL_DIR = '/opt/avenor/bin'
+      expect(installerBinaryPath()).toBe(path.join('/opt/avenor/bin', 'avenor'))
+    } finally {
+      if (prev) {
+        process.env.AVENOR_INSTALL_DIR = prev
+      } else {
+        delete process.env.AVENOR_INSTALL_DIR
+      }
+    }
+  })
+
+  it('returns the versioned default cache binary when AVENOR_INSTALL_DIR is unset', () => {
+    const prev = process.env.AVENOR_INSTALL_DIR
+    const prevVersion = process.env.AVENOR_VERSION
+    try {
+      delete process.env.AVENOR_INSTALL_DIR
+      process.env.AVENOR_VERSION = '2.3.4'
+      const expected = path.join(os.homedir(), '.cache', 'avenor', 'bin', 'avenor', '2.3.4', 'avenor')
+      expect(installerBinaryPath()).toBe(expected)
+    } finally {
+      if (prev) {
+        process.env.AVENOR_INSTALL_DIR = prev
+      }
+      if (prevVersion) {
+        process.env.AVENOR_VERSION = prevVersion
+      } else {
+        delete process.env.AVENOR_VERSION
       }
     }
   })

@@ -5,6 +5,9 @@ import * as path from 'node:path'
 import * as crypto from 'node:crypto'
 import { dial, Client, type SpawnParams } from './client.js'
 import { ensureRunPaths, socketsRoot } from './paths.js'
+import { installerBinaryPath } from './install-path.js'
+
+export { installerBinaryPath } from './install-path.js'
 
 export interface RunInfo {
   label: string
@@ -31,13 +34,21 @@ export function findAvenorBinary(): string {
   }
 
   try {
-    const binPath = execSync('which avenor', { encoding: 'utf-8' }).trim()
+    const binPath = execSync('which avenor', { encoding: 'utf-8', env: process.env }).trim()
     if (binPath) {
       fs.accessSync(binPath, fs.constants.X_OK)
       return binPath
     }
   } catch {
     // which failed or returned empty
+  }
+
+  try {
+    const installPath = installerBinaryPath()
+    fs.accessSync(installPath, fs.constants.X_OK)
+    return installPath
+  } catch {
+    // installer-managed binary not found
   }
 
   const homeBin = path.join(os.homedir(), '.botfiles', 'bin', 'avenor')
