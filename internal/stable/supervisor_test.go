@@ -6,6 +6,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -86,11 +89,78 @@ func TestShutdownModeValidation(t *testing.T) {
 	}
 }
 
+func TestManagedHTTPServerStartupFailure(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-http-server-fail.sock",
+		MaxRuntimes:   2,
+	})
+
+	withFakeExec(t, func(name string, arg ...string) *exec.Cmd { return exec.Command("false") })
+
+	_, err := sup.getOrCreateHTTPServer("/tmp")
+	if err == nil {
+		t.Fatal("getOrCreateHTTPServer should fail when the subprocess command fails")
+	}
+	// The error should mention opencode serve (the wrapper) rather than
+	// "server-url is required".
+	if !strings.Contains(err.Error(), "opencode serve") {
+		t.Fatalf("error = %q, expected opencode serve startup error", err.Error())
+	}
+	if strings.Contains(err.Error(), "server-url is required") {
+		t.Fatalf("error = %q, expected opencode serve startup error", err.Error())
+	}
+}
+
+func TestManagedHTTPServerCleanupOnMap(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-http-server-cleanup.sock",
+		MaxRuntimes:   2,
+	})
+
+	withFakeExec(t, func(name string, arg ...string) *exec.Cmd { return exec.Command("true") })
+
+	// Insert a managed server with a real subprocess (sleep 30) so
+	// shutdownManagedHTTPServers can exercise SIGTERM + reap.
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep: %v", err)
+	}
+	pid := cmd.Process.Pid
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+
+	sup.httpServers["/tmp"] = &managedHTTPServer{
+		dir:     "/tmp",
+		url:     "http://127.0.0.1:12345",
+		cmd:     cmd,
+		exited:  exited,
+		healthy: true,
+	}
+
+	sup.shutdownManagedHTTPServers()
+
+	if len(sup.httpServers) != 0 {
+		t.Fatalf("httpServers = %d, want 0 after shutdown", len(sup.httpServers))
+	}
+
+	// shutdown() already consumed the exited channel, so cmd.Wait() has
+	// completed and the process is fully reaped. Verify it's gone.
+	if proc, err := os.FindProcess(pid); err == nil {
+		if err := proc.Signal(syscall.Signal(0)); err == nil {
+			t.Fatalf("process %d still running after shutdown", pid)
+		}
+	}
+}
+
 func TestSpawnParamsValidation(t *testing.T) {
 	sup := NewSupervisor(Config{
 		ControlSocket: "/tmp/test-spawn-validate.sock",
 		MaxRuntimes:   2,
 	})
+
+	// Replace the real exec command immediately to avoid starting real
+	// opencode serve processes when the default backend is opencode-http.
+	withFakeExec(t, func(name string, arg ...string) *exec.Cmd { return exec.Command("false") })
 
 	// Missing prompt and prompt_file
 	_, err := sup.spawn(SpawnParams{Dir: "/tmp"})
@@ -98,35 +168,30 @@ func TestSpawnParamsValidation(t *testing.T) {
 		t.Fatal("spawn with no prompt should error")
 	}
 
-	// Missing dir
-	_, err = sup.spawn(SpawnParams{Prompt: "hello"})
-	// Dir defaults to ".", so this shouldn't error on validation alone
-	// It might fail on starting the acp session though
-
-	// opencode-http without server_url — unset env to avoid accidental
-	// resolution via AVENOR_OPENCODE_URL.
+	// Missing dir — falls through to default backend which triggers
+	// auto-start via the fake exec that always fails.
 	t.Setenv("AVENOR_OPENCODE_URL", "")
+	_, err = sup.spawn(SpawnParams{Prompt: "hello"})
+	if err == nil {
+		t.Fatal("spawn with default backend and no server_url should error when subprocess fails")
+	}
+	if strings.Contains(err.Error(), "server-url is required for backend opencode-http") {
+		t.Errorf("error = %q, expected subprocess start error, not server-url required", err.Error())
+	}
+
+	// opencode-http without server_url now tries to auto-start a subprocess
+	// via the fake execCommand("false") which always fails — assert the error
+	// indicates subprocess startup failure rather than "server-url is required".
 	_, err = sup.spawn(SpawnParams{
 		Prompt:  "hello",
 		Dir:     "/tmp",
 		Backend: "opencode-http",
 	})
 	if err == nil {
-		t.Fatal("spawn with backend opencode-http and no server_url should error")
+		t.Fatal("spawn with backend opencode-http and no server_url should error when subprocess fails")
 	}
-	if !strings.Contains(err.Error(), "server-url is required for backend opencode-http") {
-		t.Errorf("error = %q, want server-url required message", err.Error())
-	}
-
-	_, err = sup.spawn(SpawnParams{
-		Prompt: "hello",
-		Dir:    "/tmp",
-	})
-	if err == nil {
-		t.Fatal("spawn with default backend and no server_url should error")
-	}
-	if !strings.Contains(err.Error(), "server-url is required for backend opencode-http") {
-		t.Errorf("error = %q, want server-url required message", err.Error())
+	if strings.Contains(err.Error(), "server-url is required for backend opencode-http") {
+		t.Errorf("error = %q, expected subprocess start error, not server-url required", err.Error())
 	}
 }
 
@@ -828,6 +893,75 @@ func testTombstoneOnSignalSubprocess(t *testing.T) {
 	}
 }
 
+func TestGetOrCreateHTTPServerConcurrentSameDir(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-http-server-concurrent.sock",
+		MaxRuntimes:   2,
+	})
+
+	// Write a tiny script that blocks for a while, proving the sentinel
+	// dedup works: only the first goroutine reaches the script while others
+	// wait on the condition variable.
+	scriptDir := t.TempDir()
+	scriptPath := filepath.Join(scriptDir, "block.sh")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nsleep 2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	const numGoroutines = 5
+
+	// maxInflight tracks the peak number of goroutines simultaneously in
+	// the exec call. If the sentinel dedup works correctly, this should be
+	// 1 even though numGoroutines goroutines call getOrCreateHTTPServer concurrently.
+	var maxInflight atomic.Int32
+	var curInflight int
+	var mu sync.Mutex
+	gate := make(chan struct{})
+	arrived := make(chan struct{}, numGoroutines) // buffered so goroutines don't block
+
+	fakeExec := func(name string, arg ...string) *exec.Cmd {
+		mu.Lock()
+		curInflight++
+		if curInflight > int(maxInflight.Load()) {
+			maxInflight.Store(int32(curInflight))
+		}
+		mu.Unlock()
+
+		// Block until the gate opens (signaled after all goroutines have
+		// arrived), then run the real script.
+		<-gate
+
+		mu.Lock()
+		curInflight--
+		mu.Unlock()
+		return exec.Command(scriptPath)
+	}
+	oldExecCommand := httpExecCommand
+	httpExecCommand = fakeExec
+	defer func() { httpExecCommand = oldExecCommand }()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			arrived <- struct{}{}
+			_, _ = sup.getOrCreateHTTPServer("/tmp/concurrent-test-dir")
+		}()
+	}
+
+	// Wait for all goroutines to arrive before opening the gate.
+	for i := 0; i < numGoroutines; i++ {
+		<-arrived
+	}
+	close(gate)
+	wg.Wait()
+
+	if got := maxInflight.Load(); got != 1 {
+		t.Fatalf("max concurrent exec calls = %d, want 1 (concurrent callers should be deduped by the sentinel)", got)
+	}
+}
+
 func newStableSocketPath(t *testing.T, name string) string {
 	t.Helper()
 	return filepath.Join(newStableSocketTestDir(t, name), name+".sock")
@@ -841,4 +975,13 @@ func newStableSocketTestDir(t *testing.T, name string) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return dir
+}
+
+// withFakeExec replaces httpExecCommand for the duration of the test,
+// restoring it on cleanup.
+func withFakeExec(t *testing.T, fake func(name string, arg ...string) *exec.Cmd) {
+	t.Helper()
+	old := httpExecCommand
+	httpExecCommand = fake
+	t.Cleanup(func() { httpExecCommand = old })
 }
