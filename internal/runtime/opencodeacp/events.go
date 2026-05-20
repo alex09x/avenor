@@ -97,6 +97,41 @@ func mapPromptResponse(sessionID string, result json.RawMessage) (events.Event, 
 	fields := map[string]any{}
 	for k, v := range payload {
 		if k != "stopReason" && k != "stop_reason" {
+			if k == "usage" {
+				if usageMap, ok := v.(map[string]any); ok {
+					u := map[string]any{}
+					inputTokens, _ := usageMap["inputTokens"]
+					if inputTokens == nil {
+						inputTokens, _ = usageMap["input_tokens"]
+					}
+					outputTokens, _ := usageMap["outputTokens"]
+					if outputTokens == nil {
+						outputTokens, _ = usageMap["output_tokens"]
+					}
+					totalTokens, _ := usageMap["totalTokens"]
+					if totalTokens == nil {
+						totalTokens, _ = usageMap["total_tokens"]
+					}
+					cachedReadTokens, _ := usageMap["cachedReadTokens"]
+					if cachedReadTokens == nil {
+						cachedReadTokens, _ = usageMap["cached_read_tokens"]
+					}
+					if inputTokens != nil {
+						u["input_tokens"] = inputTokens
+					}
+					if outputTokens != nil {
+						u["output_tokens"] = outputTokens
+					}
+					if totalTokens != nil {
+						u["total_tokens"] = totalTokens
+					}
+					if cachedReadTokens != nil {
+						u["cached_read_tokens"] = cachedReadTokens
+					}
+					fields["usage"] = u
+				}
+				continue // drop non-map usage rather than corrupt fields
+			}
 			fields[k] = v
 		}
 	}

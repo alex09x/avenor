@@ -31,6 +31,7 @@ type Session struct {
 	SessionID string
 	Backend   string
 	Dir       string
+	PID       int // Consumed by longe halt (SIGTERM); set by opencode-acp backend. 0 otherwise.
 }
 
 // PermissionResponse is the response to a permission request.
