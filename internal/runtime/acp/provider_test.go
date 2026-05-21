@@ -33,10 +33,34 @@ func TestSelectPermissionOption(t *testing.T) {
 			want:    "allow",
 		},
 		{
+			name:    "approve picks option with allow_once kind",
+			options: opts("reject", "reject_once", "once", "allow_once"),
+			approve: true,
+			want:    "once",
+		},
+		{
 			name:    "reject picks reject-kind",
 			options: opts("allow", "allow", "deny", "reject"),
 			approve: false,
 			want:    "deny",
+		},
+		{
+			name:    "reject picks deny_once kind",
+			options: opts("allow", "allow", "x", "deny_once"),
+			approve: false,
+			want:    "x",
+		},
+		{
+			name:    "reject picks deny_always kind",
+			options: opts("allow", "allow", "y", "deny_always"),
+			approve: false,
+			want:    "y",
+		},
+		{
+			name:    "reject picks reject-once kind",
+			options: opts("always", "allow_always", "reject", "reject_once"),
+			approve: false,
+			want:    "reject",
 		},
 		{
 			name:    "unknown kind returns error",
