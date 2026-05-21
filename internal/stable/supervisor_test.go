@@ -109,6 +109,41 @@ func TestManagedHTTPServerStartupFailure(t *testing.T) {
 	if strings.Contains(err.Error(), "server-url is required") {
 		t.Fatalf("error = %q, expected opencode serve startup error", err.Error())
 	}
+	if _, ok := sup.httpServers["/tmp"]; ok {
+		t.Fatal("server entry leaked into map after startup failure")
+	}
+}
+
+func TestStartHTTPServerSetsCmdDir(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-http-server-dir.sock",
+		MaxRuntimes:   2,
+	})
+
+	var capturedCmd *exec.Cmd
+	withFakeExec(t, func(name string, arg ...string) *exec.Cmd {
+		cmd := exec.Command("false")
+		capturedCmd = cmd
+		return cmd
+	})
+
+	dir := t.TempDir()
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatalf("filepath.Abs: %v", err)
+	}
+
+	_, startErr := sup.getOrCreateHTTPServer(dir)
+	if startErr == nil {
+		t.Fatal("expected startup error from fake exec, got nil")
+	}
+
+	if capturedCmd == nil {
+		t.Fatal("httpExecCommand was not called")
+	}
+	if capturedCmd.Dir != absDir {
+		t.Fatalf("cmd.Dir = %q, want %q", capturedCmd.Dir, absDir)
+	}
 }
 
 func TestManagedHTTPServerCleanupOnMap(t *testing.T) {
