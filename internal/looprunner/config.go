@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 type Phase struct {
 	Name               string `json:"name"`
 	Prompt             string `json:"prompt"`
+	PromptFile         string `json:"prompt_file,omitempty"`
 	ResumeFromPrevious bool   `json:"resume_from_previous,omitempty"`
 }
 
@@ -33,11 +35,42 @@ func LoadLoopConfig(path string) (*LoopConfig, error) {
 		cfg.MaxIterations = 10
 	}
 
+	configDir := filepath.Dir(path)
+	if err := resolvePromptFiles(cfg.Pre, configDir); err != nil {
+		return nil, err
+	}
+	if err := resolvePromptFiles(cfg.Loop, configDir); err != nil {
+		return nil, err
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
 	return &cfg, nil
+}
+
+func resolvePromptFiles(phases []Phase, configDir string) error {
+	for i := range phases {
+		p := &phases[i]
+		if p.PromptFile == "" {
+			continue
+		}
+		if p.Prompt != "" {
+			return fmt.Errorf("loop config: phase[name %s]: prompt and prompt_file are mutually exclusive", p.Name)
+		}
+		absPath := p.PromptFile
+		if !filepath.IsAbs(absPath) {
+			absPath = filepath.Join(configDir, absPath)
+		}
+		contents, err := os.ReadFile(absPath)
+		if err != nil {
+			return fmt.Errorf("loop config: phase[name %s]: reading prompt_file %q: %w", p.Name, p.PromptFile, err)
+		}
+		p.Prompt = string(contents)
+		p.PromptFile = ""
+	}
+	return nil
 }
 
 func (c *LoopConfig) Validate() error {
@@ -53,8 +86,8 @@ func (c *LoopConfig) Validate() error {
 		if c.Pre[i].Name == "" {
 			return fmt.Errorf("loop config: phase[index %d]: name must not be empty", i)
 		}
-		if c.Pre[i].Prompt == "" {
-			return fmt.Errorf("loop config: phase[name %s]: prompt must not be empty", c.Pre[i].Name)
+		if c.Pre[i].Prompt == "" && c.Pre[i].PromptFile == "" {
+			return fmt.Errorf("loop config: phase[name %s]: prompt must not be empty (set prompt or prompt_file)", c.Pre[i].Name)
 		}
 	}
 
@@ -62,8 +95,8 @@ func (c *LoopConfig) Validate() error {
 		if c.Loop[i].Name == "" {
 			return fmt.Errorf("loop config: phase[index %d]: name must not be empty", i)
 		}
-		if c.Loop[i].Prompt == "" {
-			return fmt.Errorf("loop config: phase[name %s]: prompt must not be empty", c.Loop[i].Name)
+		if c.Loop[i].Prompt == "" && c.Loop[i].PromptFile == "" {
+			return fmt.Errorf("loop config: phase[name %s]: prompt must not be empty (set prompt or prompt_file)", c.Loop[i].Name)
 		}
 	}
 
