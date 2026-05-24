@@ -83,7 +83,7 @@ func TestLoadLoopConfig(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
-		if err.Error() != "loop config: phase[name foo]: prompt must not be empty" {
+		if err.Error() != "loop config: phase[name foo]: prompt must not be empty (set prompt or prompt_file)" {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if cfg != nil {
@@ -190,7 +190,7 @@ func TestLoadLoopConfig(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
-		if err.Error() != "loop config: phase[name test]: prompt must not be empty" {
+		if err.Error() != "loop config: phase[name test]: prompt must not be empty (set prompt or prompt_file)" {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if cfg != nil {
@@ -226,7 +226,7 @@ func TestValidatePhaseMissingPromptLoop(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if err.Error() != "loop config: phase[name test]: prompt must not be empty" {
+	if err.Error() != "loop config: phase[name test]: prompt must not be empty (set prompt or prompt_file)" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
