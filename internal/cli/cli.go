@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +23,7 @@ import (
 )
 
 const (
-	DefaultBackend        = "opencode-http"
+	DefaultBackend        = "opencode-acp"
 	backendOpenCodeACP    = "opencode-acp"
 	backendOpenCodeHTTP   = "opencode-http"
 	backendCodexAppServer = "codex-app-server"
@@ -223,6 +224,16 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		if err != nil {
 			fmt.Fprintf(stderr, "avenor: %v\n", err)
 			return exitWithSentinel(1)
+		}
+	}
+
+	if *agent != "" && *model == "" {
+		resolved, err := resolveAgentModel(*agent)
+		if err != nil {
+			fmt.Fprintf(stderr, "avenor: %v\n", err)
+		}
+		if resolved != "" {
+			*model = resolved
 		}
 	}
 
@@ -908,4 +919,57 @@ func ParsePermissionHandler(value string) (*permission.FileHandler, error) {
 		return nil, fmt.Errorf("--permission-handler file path is required")
 	}
 	return permission.NewFileHandler(path), nil
+}
+
+// resolveAgentModel reads opencode's config and returns the configured model
+// for the given agent name. Returns ("", nil) if not found. Returns a non-nil
+// error only when a config file exists but cannot be parsed (malformed JSON).
+func resolveAgentModel(agentName string) (string, error) {
+	dir := opencodeConfigDir()
+	if dir == "" {
+		return "", nil
+	}
+	for _, name := range []string{"opencode.json", "opencode.jsonc"} {
+		model, err := readAgentModel(filepath.Join(dir, name), agentName)
+		if err != nil {
+			return "", err
+		}
+		if model != "" {
+			return model, nil
+		}
+	}
+	return "", nil
+}
+
+func opencodeConfigDir() string {
+	if dir := os.Getenv("OPENCODE_CONFIG_DIR"); dir != "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "opencode")
+}
+
+func readAgentModel(path, agentName string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil // file doesn't exist — not an error
+		}
+		return "", fmt.Errorf("read opencode config %s: %w", path, err)
+	}
+	var config struct {
+		Agent map[string]struct {
+			Model string `json:"model"`
+		} `json:"agent"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return "", fmt.Errorf("parse opencode config %s: %w", path, err)
+	}
+	if agent, ok := config.Agent[agentName]; ok && agent.Model != "" {
+		return agent.Model, nil
+	}
+	return "", nil
 }
