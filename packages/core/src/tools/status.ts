@@ -1,12 +1,12 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import { Supervisor, type RunInfo } from '../supervisor.js'
-import { dial, type Client } from '../client.js'
+import { type Client } from '../client.js'
 import { runsRoot } from '../paths.js'
 import {
   validateRunId,
-  validateSupervisorSocketPath,
 } from './validate.js'
+import { getSupervisorClient } from './get-supervisor-client.js'
 
 function findRunByLabel(sup: Supervisor, runId: string): RunInfo | undefined {
   const runs = (sup as any).runs as Map<string, RunInfo>
@@ -158,7 +158,7 @@ export async function statusTool(
   },
 ): Promise<StatusResult | StatusResult[]> {
   if (args.supervisorId) {
-    const client = await dial(validateSupervisorSocketPath(args.supervisorId))
+    const { client, isSingleton } = await getSupervisorClient(args.supervisorId)
     try {
       if (args.runId) {
         validateRunId(args.runId)
@@ -219,7 +219,9 @@ export async function statusTool(
         session_id: entry.session_id as string | undefined,
       }))
     } finally {
-      client.close()
+      if (!isSingleton) {
+        client.close()
+      }
     }
   }
 

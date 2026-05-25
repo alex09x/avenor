@@ -1,6 +1,6 @@
 import { Supervisor } from '../supervisor.js'
-import { dial } from '../client.js'
-import { validateSupervisorSocketPath } from './validate.js'
+import { getSupervisorClient } from './get-supervisor-client.js'
+import { validateRunId } from './validate.js'
 
 function findRunByLabel(sup: Supervisor, runId: string): { label: string; runtimeId?: string } | undefined {
   const runs = (sup as any).runs as Map<string, { label: string; runtimeId?: string }>
@@ -21,15 +21,18 @@ export async function answerPermissionTool(args: {
   let client
   let sup: Supervisor | null = null
   let requestId = args.requestId
+  let supervisorId: string | undefined
+  let isSingleton = false
 
   if (args.supervisorId) {
-    client = await dial(validateSupervisorSocketPath(args.supervisorId))
+    ({ client, isSingleton, sup, supervisorId } = await getSupervisorClient(args.supervisorId))
   } else {
     sup = await Supervisor.get()
     client = sup.getClient()
   }
 
   try {
+    validateRunId(args.runId)
     const runInfo = sup ? findRunByLabel(sup, args.runId) : undefined
     const runtimeId = runInfo?.runtimeId ?? args.runId
     if (!requestId) {
@@ -47,7 +50,7 @@ export async function answerPermissionTool(args: {
 
     return { ok: true }
   } finally {
-    if (args.supervisorId) {
+    if (supervisorId && !isSingleton) {
       client.close()
     }
   }

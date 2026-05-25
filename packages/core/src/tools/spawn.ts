@@ -1,8 +1,8 @@
 import * as crypto from 'node:crypto'
 import { Supervisor } from '../supervisor.js'
-import { dial } from '../client.js'
 import { ensureRunPaths } from '../paths.js'
-import { validateSupervisorSocketPath, validateTimeout } from './validate.js'
+import { validateTimeout } from './validate.js'
+import { getSupervisorClient } from './get-supervisor-client.js'
 
 export async function spawnTool(args: {
   agent: string
@@ -21,7 +21,7 @@ export async function spawnTool(args: {
   const label = args.label ?? runId
 
   if (args.supervisorId) {
-    const client = await dial(validateSupervisorSocketPath(args.supervisorId))
+    const { client, isSingleton, supervisorId } = await getSupervisorClient(args.supervisorId)
     const { sentinelPath, eventLogPath } = ensureRunPaths(runId)
 
     try {
@@ -44,10 +44,12 @@ export async function spawnTool(args: {
       return {
         run_id: (result.runtime_id as string | undefined) ?? runId,
         label,
-        supervisor_id: args.supervisorId,
+        supervisor_id: supervisorId,
       }
     } finally {
-      client.close()
+      if (!isSingleton) {
+        client.close()
+      }
     }
   }
 
