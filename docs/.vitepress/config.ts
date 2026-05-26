@@ -1,12 +1,15 @@
 import { defineConfig } from 'vitepress'
 
 export default defineConfig({
-  title: 'Avenor',
+  title: '🏇 Avenor',
   description: 'Agent orchestration harness — dispatch across runtimes, monitor events, handle permissions.',
-  // For a GitHub Pages project site: base: '/avenor/'
-  // For a custom domain at the root: base: '/'
-  base: '/avenor/',
+  base: '/',
+  head: [
+    ['link', { rel: 'icon', href: '/favicon.svg', type: 'image/svg+xml' }],
+    ['link', { rel: 'apple-touch-icon', href: '/apple-touch-icon.png' }],
+  ],
   themeConfig: {
+    appearance: 'dark',
     nav: [
       { text: 'CLI Reference', link: '/cli' },
       { text: 'GitHub', link: 'https://github.com/sdougbrown/avenor' },
