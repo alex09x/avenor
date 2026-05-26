@@ -173,7 +173,7 @@ Cancel a running runtime. If no runtime-id given, cancels the only child or erro
 avenor control --socket /tmp/avenor.sock cancel rt-12345
 ```
 
-#### prompt <text> [runtime-id]
+#### prompt `<text>` [runtime-id]
 
 Queue a follow-up prompt for the runtime. If no runtime-id given, targets the only child.
 
@@ -181,7 +181,7 @@ Queue a follow-up prompt for the runtime. If no runtime-id given, targets the on
 avenor control --socket /tmp/avenor.sock prompt "continue with part 2" rt-12345
 ```
 
-#### interrupt-and-prompt <text> [runtime-id]
+#### interrupt-and-prompt `<text>` [runtime-id]
 
 Interrupt the current message generation and queue a new prompt.
 
@@ -189,7 +189,7 @@ Interrupt the current message generation and queue a new prompt.
 avenor control --socket /tmp/avenor.sock interrupt-and-prompt "stop and refocus" rt-12345
 ```
 
-#### answer-permission <request-id> <option-id> [runtime-id]
+#### answer-permission `<request-id>` `<option-id>` [runtime-id]
 
 Answer a pending permission request by request-id and option-id. If no runtime-id given, targets the only child.
 
