@@ -143,6 +143,7 @@ Phase prompts support Go `text/template` syntax. Variables reflect the current s
 
 ### Available variables
 
+::: v-pre
 | Variable | Value |
 |---|---|
 | `{{.RunID}}` | The run's correlation ID |
@@ -150,36 +151,43 @@ Phase prompts support Go `text/template` syntax. Variables reflect the current s
 | `{{.Iteration}}` | Current loop iteration (1-indexed; `0` for pre-phases) |
 | `{{.MaxIterations}}` | Value of `max_iterations` |
 | `{{.WorkDir}}` | Working directory |
+:::
 
 Example:
 
+::: v-pre
 ```json
 {
   "name": "status",
   "prompt": "Report progress. (Phase {{.Phase}}, iteration {{.Iteration}} of {{.MaxIterations}})"
 }
 ```
+:::
 
 ### Git delta variables
 
 Populated only when running inside a git repository and only after a previous phase has completed:
 
+::: v-pre
 | Variable | Value |
 |---|---|
 | `{{.PrevPhaseCommit}}` | Git commit SHA at the end of the previous phase |
 | `{{.DiffStat}}` | Output of `git diff --stat <prev-commit>..HEAD` |
 | `{{.ChangedFiles}}` | Newline-separated list of files changed since previous phase |
+:::
 
 Avenor snapshots `git rev-parse HEAD` after each phase and uses that as the reference point for the next phase. The reference moves forward — it reflects what the immediately preceding phase left behind, not the start of the loop.
 
 Delta variables are informational. Avenor does not enforce scoping; that belongs in your prompt:
 
+::: v-pre
 ```json
 {
   "name": "review",
   "prompt": "Review the branch for issues.\n\n{{if .ChangedFiles}}Since the last iteration the following files changed:\n{{.ChangedFiles}}\nReview these changes carefully, and also check whether they introduce knock-on effects elsewhere.{{else}}This is the first review pass. Cover the entire branch.{{end}}"
 }
 ```
+:::
 
 ## resume_from_previous
 
