@@ -63,7 +63,10 @@ func (t *GlobTool) Execute(ctx context.Context, workingDir string, args json.Raw
 	// Validate pattern resolves within working directory
 	patternRel, err := filepath.Rel(wdAbs, pattern)
 	if err != nil || strings.HasPrefix(patternRel, "..") {
-		return "", fmt.Errorf("glob: pattern %q is outside the working directory", input.Pattern)
+		// Check against additional allowed dirs
+		if rel := IsPathInAllowedDirs(pattern, AllowedReadDirsFromContext(ctx)); rel == "" {
+			return "", fmt.Errorf("glob: pattern %q is outside the working directory", input.Pattern)
+		}
 	}
 
 	matches, err := filepath.Glob(pattern)
@@ -77,9 +80,19 @@ func (t *GlobTool) Execute(ctx context.Context, workingDir string, args json.Raw
 
 	var relPaths []string
 	for _, m := range matches {
-		relPath, err := filepath.Rel(wdAbs, m)
+		// Resolve symlinks so the containment check uses the physical path.
+		resolved, err := filepath.EvalSymlinks(m)
 		if err != nil {
 			continue
+		}
+		relPath, err := filepath.Rel(wdAbs, resolved)
+		if err != nil || strings.HasPrefix(relPath, "..") {
+			// Check against additional allowed dirs
+			if rel := IsPathInAllowedDirs(resolved, AllowedReadDirsFromContext(ctx)); rel != "" {
+				relPath = rel
+			} else {
+				continue
+			}
 		}
 		relPaths = append(relPaths, relPath)
 	}

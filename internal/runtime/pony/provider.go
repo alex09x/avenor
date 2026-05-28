@@ -28,6 +28,10 @@ type Config struct {
 	OrchTools      bool
 	WorkingDir     string // for AGENTS.md discovery
 	InjectAgentsMD bool
+	AllowedReadDirs  []string         // additional directories read tools may access (e.g. skills)
+	AllowedWriteDirs []string         // additional directories write tools may access
+	ToolApproval     map[string]bool  // tool name → requires approval
+	ShellConfig      *ShellConfig     // overrides for shell tool
 	// Registry is internal; built from tool config.
 	toolRegistry *tools.Registry
 
@@ -50,6 +54,7 @@ type Provider struct {
 	mu             sync.Mutex
 	sessions       map[string]*sessionState
 	sessionCounter atomic.Int64
+	permCounter    atomic.Int64
 }
 
 var _ runtime.Provider = (*Provider)(nil)
@@ -66,13 +71,21 @@ func New(cfg Config) *Provider {
 			tools.NewGlobTool(),
 			tools.NewGrepTool(),
 			tools.NewListDirTool(),
-			tools.NewShellTool(),
+			tools.NewShellToolWithConfig(cfg.ShellConfig),
 		)
 	}
+	// report_finding is always available — it emits structured events
+	toolList = append(toolList, tools.NewReportFindingTool())
 	if cfg.OrchTools && cfg.Executor != nil {
 		toolList = append(toolList, newOrchestrationTools(cfg.Executor)...)
 	}
 	cfg.toolRegistry = tools.NewRegistry(toolList)
+	if len(cfg.AllowedReadDirs) > 0 {
+		cfg.toolRegistry.SetAllowedReadDirs(cfg.AllowedReadDirs)
+	}
+	if len(cfg.AllowedWriteDirs) > 0 {
+		cfg.toolRegistry.SetAllowedWriteDirs(cfg.AllowedWriteDirs)
+	}
 
 	return &Provider{
 		cfg:      cfg,
@@ -209,6 +222,10 @@ func (p *Provider) Prompt(ctx context.Context, sessionID string, prompt string) 
 	}()
 
 	// Run the loop
+	var approval ApprovalChecker
+	if len(p.cfg.ToolApproval) > 0 {
+		approval = p.makeApprovalChecker(ss)
+	}
 	finalHistory, stopReason, err := LoopWithRetry(
 		promptCtx,
 		p.cfg.Adapter,
@@ -219,6 +236,7 @@ func (p *Provider) Prompt(ctx context.Context, sessionID string, prompt string) 
 		p.cfg.WorkingDir,
 		eventCh,
 		p.cfg.StopConditions,
+		approval,
 	)
 
 	close(eventCh)
@@ -279,14 +297,85 @@ func (p *Provider) Events(ctx context.Context, sessionID string) (<-chan events.
 	return out, nil
 }
 
+// makeApprovalChecker returns an ApprovalChecker that blocks until the
+// permission request is answered via AnswerPermission.
+func (p *Provider) makeApprovalChecker(ss *sessionState) ApprovalChecker {
+	return func(ctx context.Context, toolName string, eventCh chan<- events.Event) (bool, error) {
+		requires, ok := p.cfg.ToolApproval[toolName]
+		if !ok || !requires {
+			return true, nil
+		}
+
+		respond := make(chan runtime.PermissionResponse, 1)
+		permID := p.permCounter.Add(1)
+		requestID := fmt.Sprintf("perm_%s_%d", toolName, permID)
+
+		ss.mu.Lock()
+		ss.pendingPerm.requestID = requestID
+		ss.pendingPerm.respond = respond
+		ss.mu.Unlock()
+
+		defer func() {
+			ss.mu.Lock()
+			ss.pendingPerm.respond = nil
+			ss.mu.Unlock()
+		}()
+
+		emit(eventCh, "permission.request", map[string]any{
+			"request_id": requestID,
+			"tool":       toolName,
+			"question":   fmt.Sprintf("Allow %s to execute?", toolName),
+			"options": []map[string]any{
+				{"optionId": "allow", "kind": "allow"},
+				{"optionId": "deny", "kind": "deny"},
+			},
+		})
+
+		select {
+		case resp := <-respond:
+			return resp.Allow, nil
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+}
+
 func (p *Provider) AnswerPermission(ctx context.Context, sessionID string, requestID string, response runtime.PermissionResponse) error {
-	return errors.New("permissions not supported by pony backend")
+	p.mu.Lock()
+	ss, ok := p.sessions[sessionID]
+	p.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("unknown session: %s", sessionID)
+	}
+
+	ss.mu.Lock()
+	respond := ss.pendingPerm.respond
+	pendingID := ss.pendingPerm.requestID
+	ss.mu.Unlock()
+
+	if respond == nil {
+		return fmt.Errorf("no pending permission request for session %s", sessionID)
+	}
+	if requestID != pendingID {
+		return fmt.Errorf("requestID mismatch: got %q, pending %q", requestID, pendingID)
+	}
+
+	// Non-blocking send: if the approval checker has already consumed the
+	// response (or its context was cancelled and it stopped listening), the
+	// send fails without blocking. This prevents goroutine leaks from
+	// duplicate or stale AnswerPermission calls.
+	select {
+	case respond <- response:
+		return nil
+	default:
+		return fmt.Errorf("permission request %q is no longer pending", requestID)
+	}
 }
 
 func (p *Provider) Capabilities(ctx context.Context) (runtime.Capabilities, error) {
 	return runtime.Capabilities{
 		Backend:             backendID,
-		Permissions:         false,
+		Permissions:         len(p.cfg.ToolApproval) > 0,
 		Resume:              false,
 		ExternalServerURL:   true,
 		SubprocessDiscovery: false,
