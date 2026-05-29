@@ -2,12 +2,15 @@ package client
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"sync"
 	"time"
 )
+
+const maxSendToParentMessageBytes = 64 * 1024
 
 type Request struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -71,6 +74,9 @@ type Client struct {
 	eventCh   chan Event
 	eventOnce sync.Once
 	dropped   int // events discarded due to full eventCh; surfaced as client.lagged
+
+	subsMu      sync.Mutex
+	runtimeSubs map[string]map[chan Event]struct{}
 }
 
 func Dial(socketPath string) (*Client, error) {
@@ -83,6 +89,7 @@ func Dial(socketPath string) (*Client, error) {
 		scan:    bufio.NewScanner(conn),
 		pending: map[int]chan Response{},
 		eventCh: make(chan Event, 256),
+		runtimeSubs: map[string]map[chan Event]struct{}{},
 	}, nil
 }
 
@@ -237,6 +244,7 @@ func (c *Client) readLoop() {
 		default:
 			c.dropped++
 		}
+		c.publishRuntimeEvent(ev)
 	}
 }
 
@@ -273,9 +281,17 @@ func (c *Client) Cancel(runtimeID string) error {
 
 // Prompt sends a follow-up prompt to the one-shot session or a runtime.
 func (c *Client) Prompt(runtimeID, text string) error {
+	return c.PromptWithRequestID(runtimeID, text, "")
+}
+
+// PromptWithRequestID sends a follow-up prompt with an optional child-question request ID.
+func (c *Client) PromptWithRequestID(runtimeID, text, requestID string) error {
 	params := map[string]string{"text": text}
 	if runtimeID != "" {
 		params["runtime_id"] = runtimeID
+	}
+	if requestID != "" {
+		params["request_id"] = requestID
 	}
 	return c.Call("prompt", params, nil)
 }
@@ -290,6 +306,57 @@ func (c *Client) AnswerPermission(runtimeID, requestID, optionID string) error {
 		params["runtime_id"] = runtimeID
 	}
 	return c.Call("answer_permission", params, nil)
+}
+
+// SubscribeRuntime returns a channel of events filtered to a specific runtime.
+// The caller must drain the channel. The channel closes when ctx is done or
+// the underlying event channel is closed. Calling SubscribeRuntime ensures the
+// readLoop is started.
+func (c *Client) SubscribeRuntime(ctx context.Context, runtimeID string) <-chan Event {
+	_ = c.Events() // ensure readLoop is running
+	out := make(chan Event, 256)
+	c.subsMu.Lock()
+	if c.runtimeSubs[runtimeID] == nil {
+		c.runtimeSubs[runtimeID] = map[chan Event]struct{}{}
+	}
+	c.runtimeSubs[runtimeID][out] = struct{}{}
+	c.subsMu.Unlock()
+	go func() {
+		<-ctx.Done()
+		c.subsMu.Lock()
+		if subs := c.runtimeSubs[runtimeID]; subs != nil {
+			delete(subs, out)
+			if len(subs) == 0 {
+				delete(c.runtimeSubs, runtimeID)
+			}
+		}
+		c.subsMu.Unlock()
+		close(out)
+	}()
+	return out
+}
+
+func (c *Client) publishRuntimeEvent(ev Event) {
+	keys := []string{ev.RuntimeID}
+	if ev.SessionID != "" && ev.SessionID != ev.RuntimeID {
+		keys = append(keys, ev.SessionID)
+	}
+
+	c.subsMu.Lock()
+	targets := make([]chan Event, 0)
+	for _, key := range keys {
+		for ch := range c.runtimeSubs[key] {
+			targets = append(targets, ch)
+		}
+	}
+	c.subsMu.Unlock()
+
+	for _, ch := range targets {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
 }
 
 // List returns all active runtimes from the stable supervisor.
@@ -321,4 +388,22 @@ func (c *Client) InterruptAndPrompt(runtimeID, text string, keepQueue bool) erro
 		params["runtime_id"] = runtimeID
 	}
 	return c.Call("interrupt_and_prompt", params, nil)
+}
+
+// SendToParent sends a message from a child runtime to its parent.
+func (c *Client) SendToParent(runtimeID, message string) error {
+	if runtimeID == "" {
+		return fmt.Errorf("runtime_id is required")
+	}
+	if message == "" {
+		return fmt.Errorf("message is required")
+	}
+	if len(message) > maxSendToParentMessageBytes {
+		return fmt.Errorf("message exceeds %d bytes", maxSendToParentMessageBytes)
+	}
+	params := map[string]any{
+		"runtime_id": runtimeID,
+		"message":    message,
+	}
+	return c.Call("send_to_parent", params, nil)
 }

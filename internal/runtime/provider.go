@@ -24,6 +24,7 @@ type StartOptions struct {
 	Dir       string
 	ServerURL string
 	Model     string
+	RuntimeID string // supervisor-assigned runtime ID (rt_N), for parent-child routing
 }
 
 // Session represents an active ACP session.
@@ -39,6 +40,14 @@ type PermissionResponse struct {
 	Allow    bool
 	OptionID string
 	Message  string
+}
+
+// AgentResult holds the result of a completed agent session.
+type AgentResult struct {
+	SessionID   string   `json:"session_id"`
+	StopReason  string   `json:"stop_reason"`
+	ExitCode    int      `json:"exit_code"`
+	OutputFiles []string `json:"output_files,omitempty"`
 }
 
 // Capabilities describes what a runtime backend supports.

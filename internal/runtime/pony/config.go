@@ -8,6 +8,7 @@ import (
 	"sort"
 
 	"github.com/sdougbrown/avenor/client"
+	"github.com/sdougbrown/avenor/internal/runtime"
 	"github.com/sdougbrown/avenor/internal/runtime/pony/tools"
 )
 
@@ -118,36 +119,53 @@ func (e *controlSocketExecutor) SpawnAgent(ctx context.Context, params map[strin
 	if err != nil {
 		return "", err
 	}
-	if sid, ok := result["session_id"].(string); ok && sid != "" {
-		return sid, nil
-	}
 	if rid, ok := result["runtime_id"].(string); ok && rid != "" {
 		return rid, nil
+	}
+	if sid, ok := result["session_id"].(string); ok && sid != "" {
+		return sid, nil
 	}
 	return "", fmt.Errorf("no session_id or runtime_id in spawn result")
 }
 
-func (e *controlSocketExecutor) SendPrompt(ctx context.Context, sessionID, prompt string) error {
-	return e.client.Prompt(sessionID, prompt)
+func (e *controlSocketExecutor) SendPrompt(ctx context.Context, sessionID, prompt, requestID string) error {
+	return e.client.PromptWithRequestID(sessionID, prompt, requestID)
 }
 
 func (e *controlSocketExecutor) GetStatus(ctx context.Context, sessionID string) (map[string]any, error) {
 	return e.client.Status(sessionID)
 }
 
-func (e *controlSocketExecutor) WaitForDone(ctx context.Context, sessionID string) error {
-	eventsCh := e.client.Events()
-	for {
-		select {
-		case evt, ok := <-eventsCh:
-			if !ok {
-				return fmt.Errorf("event channel closed while waiting for session %s", sessionID)
+func (e *controlSocketExecutor) WaitForDone(ctx context.Context, sessionID string) (*runtime.AgentResult, error) {
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sub := e.client.SubscribeRuntime(subCtx, sessionID)
+	for evt := range sub {
+		if evt.Event == "session.end" {
+			stopReason, _ := evt.Raw["stop_reason"].(string)
+			exitCode := 0
+			if ec, ok := evt.Raw["exit_code"].(float64); ok {
+				exitCode = int(ec)
 			}
-			if evt.Event == "session.end" && (evt.RuntimeID == sessionID || evt.SessionID == sessionID) {
-				return nil
+			var outputFiles []string
+			if of, ok := evt.Raw["output_files"].([]any); ok {
+				for _, f := range of {
+					if s, ok := f.(string); ok {
+						outputFiles = append(outputFiles, s)
+					}
+				}
 			}
-		case <-ctx.Done():
-			return ctx.Err()
+			return &runtime.AgentResult{
+				SessionID:   sessionID,
+				StopReason:  stopReason,
+				ExitCode:    exitCode,
+				OutputFiles: outputFiles,
+			}, nil
 		}
 	}
+	return nil, ctx.Err()
+}
+
+func (e *controlSocketExecutor) SendToParent(ctx context.Context, runtimeID, message string) error {
+	return e.client.SendToParent(runtimeID, message)
 }

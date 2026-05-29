@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -27,6 +28,7 @@ type Config struct {
 	IdleTimeout            time.Duration
 	ShutdownTimeout        time.Duration
 	PermissionClaimTimeout time.Duration
+	ChildQuestionTimeout   time.Duration
 }
 
 type SpawnParams struct {
@@ -46,6 +48,7 @@ type SpawnParams struct {
 	MaxRetries        int    `json:"max_retries,omitempty"`
 	LoopFile          string `json:"loop_file,omitempty"`
 	SessionID         string `json:"session_id,omitempty"`
+	ParentID          string `json:"parent_id,omitempty"` // runtime ID of the parent agent
 }
 
 type SpawnResult struct {
@@ -58,6 +61,8 @@ type SpawnResult struct {
 type childRuntime struct {
 	id               string
 	label            string
+	parentID         string               // runtime ID of the parent agent, empty for top-level
+	children         []string             // runtime IDs spawned by this runtime
 	provider         runtime.Provider
 	session          runtime.Session
 	eventWriter      cli.EventSink
@@ -79,6 +84,16 @@ type childRuntime struct {
 	mu               sync.Mutex
 }
 
+type pendingChildQuestion struct {
+	requestID string
+	timer     *time.Timer
+}
+
+type handledChildQuestion struct {
+	requestID string
+	at        time.Time
+}
+
 type Supervisor struct {
 	config          Config
 	runID           string
@@ -89,11 +104,17 @@ type Supervisor struct {
 	nextID          int
 	shutdownCh      chan struct{}
 	runtimeActivity chan struct{}
+	childQuestionSeq int
+	pendingQuestions map[string]pendingChildQuestion // child runtime ID -> pending question
+	handledQuestions map[string]handledChildQuestion // child runtime ID -> latest handled request
+	childQuestionTimeout time.Duration
 	httpServer      *control.HTTPDebugServer
 	permOptions     map[string][]any // keyed by "runtimeID:requestID"
 	httpServers     map[string]any   // dir → *managedHTTPServer or errHTTPServerStarting sentinel
 	httpServerMu    sync.Mutex
 	httpServerCond  *sync.Cond
+	fileSnapshots   map[string][]string // runtimeID → pre-run file list for output detection
+	fileSnapMu      sync.Mutex
 }
 
 func NewSupervisor(cfg Config) *Supervisor {
@@ -107,10 +128,17 @@ func NewSupervisor(cfg Config) *Supervisor {
 		runtimes:        map[string]*childRuntime{},
 		shutdownCh:      make(chan struct{}),
 		runtimeActivity: make(chan struct{}),
+		pendingQuestions: map[string]pendingChildQuestion{},
+		handledQuestions: map[string]handledChildQuestion{},
+		childQuestionTimeout: cfg.ChildQuestionTimeout,
 		permOptions:     map[string][]any{},
 		httpServers:     map[string]any{},
+		fileSnapshots:   map[string][]string{},
 	}
 	sup.httpServerCond = sync.NewCond(&sup.httpServerMu)
+	if sup.childQuestionTimeout <= 0 {
+		sup.childQuestionTimeout = 120 * time.Second
+	}
 	sup.control.SetStableHandler(sup)
 	return sup
 }
@@ -232,6 +260,20 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 	s.runtimes[rtID] = child
 	s.controlMu.Unlock()
 
+	// Track parent-child relationship.
+	if params.ParentID != "" {
+		child.mu.Lock()
+		child.parentID = params.ParentID
+		child.mu.Unlock()
+		s.controlMu.Lock()
+		if parent, ok := s.runtimes[params.ParentID]; ok {
+			parent.mu.Lock()
+			parent.children = append(parent.children, rtID)
+			parent.mu.Unlock()
+		}
+		s.controlMu.Unlock()
+	}
+
 	releaseReservation := func() {
 		s.controlMu.Lock()
 		delete(s.runtimes, rtID)
@@ -343,10 +385,11 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 
 	// Start provider and session.
 	startOpts := runtime.StartOptions{
-		Agent: params.Agent,
-		Label: params.Label,
-		Dir:   params.Dir,
-		Model: params.Model,
+		Agent:     params.Agent,
+		Label:     params.Label,
+		Dir:       params.Dir,
+		Model:     params.Model,
+		RuntimeID: rtID,
 	}
 	discovery := cli.DiscoverServer(params.ServerURL, os.Getenv)
 	startOpts.ServerURL = discovery.URL
@@ -404,6 +447,11 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 	// Initialise cancelFn in spawn so it's never nil when cancelRuntime reads it.
 	childCtx, childCancel := context.WithCancel(context.Background())
 	child.cancelFn = childCancel
+
+	// Take a file snapshot for output file detection.
+	s.fileSnapMu.Lock()
+	s.fileSnapshots[rtID] = s.takeFileSnapshot(params.Dir)
+	s.fileSnapMu.Unlock()
 
 	// Start the child event loop in a goroutine.
 	releaseReservation = nil
@@ -789,16 +837,86 @@ func (s *Supervisor) attemptSession(ctx context.Context, child *childRuntime, re
 	}, resumeID)
 }
 
+// takeFileSnapshot records the set of files (relative paths) in dir for
+// later output-file diffing. Returns the snapshot as a sorted string slice.
+func (s *Supervisor) takeFileSnapshot(dir string) []string {
+	if dir == "" {
+		return nil
+	}
+	var files []string
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // skip unreadable entries
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return nil
+		}
+		files = append(files, rel)
+		return nil
+	})
+	sort.Strings(files)
+	return files
+}
+
+// computeOutputFiles computes the diff between the pre-run snapshot and the
+// current file state in the runtime's working directory. Clears the snapshot
+// after computing so results are returned only once.
+func (s *Supervisor) computeOutputFiles(runtimeID string) []string {
+	s.fileSnapMu.Lock()
+	snapshot, ok := s.fileSnapshots[runtimeID]
+	delete(s.fileSnapshots, runtimeID)
+	s.fileSnapMu.Unlock()
+	if !ok {
+		return nil
+	}
+
+	// Find the runtime's working directory.
+	s.controlMu.Lock()
+	rt := s.runtimes[runtimeID]
+	s.controlMu.Unlock()
+	if rt == nil || rt.dir == "" {
+		return nil
+	}
+
+	current := s.takeFileSnapshot(rt.dir)
+	if len(current) == 0 {
+		return nil
+	}
+
+	// Return anything in current that wasn't in the pre-snapshot.
+	snapSet := make(map[string]struct{}, len(snapshot))
+	for _, f := range snapshot {
+		snapSet[f] = struct{}{}
+	}
+	var output []string
+	for _, f := range current {
+		if _, seen := snapSet[f]; !seen {
+			output = append(output, f)
+		}
+	}
+	return output
+}
+
 func (s *Supervisor) emitSessionEnd(child *childRuntime, exitCode int, stopReason string) {
+	fields := map[string]any{
+		"stop_reason": stopReason,
+		"runtime_id":  child.id,
+		"exit_code":   exitCode,
+		"ts":          time.Now().UnixMilli(),
+	}
+	// Compute output file diff if pre-snapshot exists.
+	outputFiles := s.computeOutputFiles(child.id)
+	if len(outputFiles) > 0 {
+		fields["output_files"] = outputFiles
+	}
 	s.control.PublishEvent(events.Event{
 		Event:     "session.end",
 		SessionID: child.sessionID(),
-		Fields: map[string]any{
-			"stop_reason": stopReason,
-			"runtime_id":  child.id,
-			"exit_code":   exitCode,
-			"ts":          time.Now().UnixMilli(),
-		},
+		Fields:    fields,
 	})
 }
 
@@ -912,6 +1030,8 @@ func (s *Supervisor) listRuntimes() []map[string]any {
 			"exit_code":     rt.exitCode,
 			"on_event":      rt.onEvent,
 			"sentinel_file": rt.sentinelFile,
+			"parent_id":     rt.parentID,
+			"children":      rt.children,
 		}
 		rt.mu.Unlock()
 		out = append(out, entry)
@@ -1042,6 +1162,21 @@ func (s *Supervisor) Spawn(raw json.RawMessage) (any, error) {
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return nil, fmt.Errorf("invalid spawn params: %w", err)
 	}
+	// Auto-populate ParentID when the spawn is called by a known runtime.
+	// The caller embeds its own runtime_id in the spawn params; if it maps to
+	// a registered runtime, treat it as the parent.
+	if p.ParentID == "" {
+		var caller struct {
+			RuntimeID string `json:"runtime_id"`
+		}
+		if err := json.Unmarshal(raw, &caller); err == nil && caller.RuntimeID != "" {
+			s.controlMu.Lock()
+			if _, ok := s.runtimes[caller.RuntimeID]; ok {
+				p.ParentID = caller.RuntimeID
+			}
+			s.controlMu.Unlock()
+		}
+	}
 	return s.spawn(p)
 }
 
@@ -1086,6 +1221,8 @@ func (s *Supervisor) RuntimeStatus(rtID string) (any, error) {
 		"exit_code":     rt.exitCode,
 		"on_event":      rt.onEvent,
 		"sentinel_file": rt.sentinelFile,
+		"parent_id":     rt.parentID,
+		"children":      rt.children,
 	}
 	rt.mu.Unlock()
 	return entry, nil
@@ -1095,7 +1232,19 @@ func (s *Supervisor) RuntimeCancel(rtID string) error {
 	return s.cancelRuntime(rtID)
 }
 
-func (s *Supervisor) RuntimePrompt(rtID, text string) error {
+func (s *Supervisor) RuntimePrompt(rtID, text, requestID string) error {
+	if requestID != "" {
+		s.controlMu.Lock()
+		if handled, ok := s.handledQuestions[rtID]; ok && handled.requestID == requestID {
+			s.controlMu.Unlock()
+			return nil
+		}
+		s.handledQuestions[rtID] = handledChildQuestion{requestID: requestID, at: time.Now()}
+		s.controlMu.Unlock()
+	}
+
+	s.clearPendingChildQuestion(rtID, requestID)
+
 	s.controlMu.Lock()
 	rt := s.runtimes[rtID]
 	s.controlMu.Unlock()
@@ -1111,6 +1260,22 @@ func (s *Supervisor) RuntimePrompt(rtID, text string) error {
 	rt.mu.Unlock()
 	rt.signalPrompt()
 	return nil
+}
+
+func (s *Supervisor) clearPendingChildQuestion(childID, requestID string) {
+	s.controlMu.Lock()
+	pq, ok := s.pendingQuestions[childID]
+	if ok && requestID != "" && pq.requestID != requestID {
+		s.controlMu.Unlock()
+		return
+	}
+	if ok {
+		delete(s.pendingQuestions, childID)
+	}
+	s.controlMu.Unlock()
+	if ok && pq.timer != nil {
+		pq.timer.Stop()
+	}
 }
 
 func (s *Supervisor) RuntimeAnswerPermission(rtID, requestID, optionID string) error {
@@ -1140,6 +1305,70 @@ func (s *Supervisor) RuntimeInterruptAndPrompt(rtID, text string, keepQueue bool
 	if interruptFn != nil {
 		interruptFn()
 	}
+	return nil
+}
+
+func (s *Supervisor) RuntimeSendToParent(rtID, message string) error {
+	s.controlMu.Lock()
+	child := s.runtimes[rtID]
+	s.controlMu.Unlock()
+	if child == nil {
+		return fmt.Errorf("runtime %q not found", rtID)
+	}
+	child.mu.Lock()
+	parentID := child.parentID
+	childSessionID := child.session.SessionID
+	child.mu.Unlock()
+	if parentID == "" {
+		return fmt.Errorf("runtime %q has no parent", rtID)
+	}
+	s.controlMu.Lock()
+	parent := s.runtimes[parentID]
+	s.controlMu.Unlock()
+	if parent == nil {
+		return fmt.Errorf("parent runtime %q not found", parentID)
+	}
+	parent.mu.Lock()
+	parentSessionID := parent.session.SessionID
+	parent.mu.Unlock()
+	s.controlMu.Lock()
+	s.childQuestionSeq++
+	requestID := fmt.Sprintf("cq_%d", s.childQuestionSeq)
+	if existing, ok := s.pendingQuestions[rtID]; ok {
+		if existing.timer != nil {
+			existing.timer.Stop()
+		}
+		delete(s.pendingQuestions, rtID)
+	}
+	timer := time.AfterFunc(s.childQuestionTimeout, func() {
+		s.controlMu.Lock()
+		pq, ok := s.pendingQuestions[rtID]
+		if !ok || pq.requestID != requestID {
+			s.controlMu.Unlock()
+			return
+		}
+		delete(s.pendingQuestions, rtID)
+		s.controlMu.Unlock()
+		_ = s.RuntimePrompt(rtID, fmt.Sprintf("No parent response received within %s. Continue with your best judgment and state assumptions.", s.childQuestionTimeout), requestID)
+	})
+	s.pendingQuestions[rtID] = pendingChildQuestion{requestID: requestID, timer: timer}
+	s.controlMu.Unlock()
+	s.control.PublishEvent(events.Event{
+		Event:     runtime.EventChildQuestion,
+		SessionID: parentSessionID,
+		Fields: func() map[string]any {
+			fields := runtime.ChildQuestionPayload{
+				RuntimeID: parentID,
+				SessionID: childSessionID,
+				ChildID:   rtID,
+				Message:   message,
+				RequestID: requestID,
+			}.Fields()
+			fields["parent_id"] = parentID
+			fields["ts"] = time.Now().UnixMilli()
+			return fields
+		}(),
+	})
 	return nil
 }
 

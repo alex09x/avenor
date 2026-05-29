@@ -16,6 +16,13 @@ import (
 // backendID is the backend identifier.
 const backendID = "pony"
 
+// RuntimeIDKey is the context key for the current session's runtime ID.
+// The pony provider injects this during Prompt; tools read it for
+// parent-child routing (e.g., send_to_parent).
+type runtimeIDKey struct{}
+
+var RuntimeIDKey = &runtimeIDKey{}
+
 // Config configures the pony provider.
 type Config struct {
 	Adapter        model.Adapter
@@ -42,9 +49,10 @@ type Config struct {
 // OrchestratorExecutor wraps the control-socket client for orchestration tools.
 type OrchestratorExecutor interface {
 	SpawnAgent(ctx context.Context, params map[string]any) (sessionID string, err error)
-	SendPrompt(ctx context.Context, sessionID, prompt string) error
+	SendPrompt(ctx context.Context, sessionID, prompt, requestID string) error
 	GetStatus(ctx context.Context, sessionID string) (map[string]any, error)
-	WaitForDone(ctx context.Context, sessionID string) error
+	WaitForDone(ctx context.Context, sessionID string) (*runtime.AgentResult, error)
+	SendToParent(ctx context.Context, runtimeID, message string) error
 }
 
 // Provider implements runtime.Provider for the pony backend.
@@ -142,6 +150,8 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
+	ss.runtimeID = opts.RuntimeID
+
 	// 1. System prompt
 	if p.cfg.SystemPrompt != "" {
 		ss.history = append(ss.history, model.Message{
@@ -212,6 +222,9 @@ func (p *Provider) Prompt(ctx context.Context, sessionID string, prompt string) 
 
 	// Ensure cancel is cleaned up when Prompt returns
 	defer cancel()
+
+	// Inject runtime ID into context for tool access (e.g., send_to_parent).
+	promptCtx = context.WithValue(promptCtx, RuntimeIDKey, ss.runtimeID)
 
 	// Build event channel — emit through session state
 	eventCh := make(chan events.Event, 256)

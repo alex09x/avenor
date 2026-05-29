@@ -91,15 +91,17 @@ func (f *fakeAdapter) Stream(ctx context.Context, req model.Request) (<-chan mod
 
 // fakeExecutor implements OrchestratorExecutor for orchestration tool tests.
 type fakeExecutor struct {
-	spawnCalled   int
-	sendCalled    int
-	statusCalled  int
-	waitCalled    int
-	spawnDelay    time.Duration
-	waitDone      bool
-	waitErr       error
-	spawnID       string
-	getStatusResp map[string]any
+	spawnCalled    int
+	sendCalled     int
+	lastRequestID  string
+	statusCalled   int
+	waitCalled     int
+	sendToParentCalled int
+	spawnDelay     time.Duration
+	waitDone       bool
+	waitErr        error
+	spawnID        string
+	getStatusResp  map[string]any
 }
 
 func (f *fakeExecutor) SpawnAgent(ctx context.Context, params map[string]any) (string, error) {
@@ -118,8 +120,9 @@ func (f *fakeExecutor) SpawnAgent(ctx context.Context, params map[string]any) (s
 	return id, nil
 }
 
-func (f *fakeExecutor) SendPrompt(ctx context.Context, sessionID, prompt string) error {
+func (f *fakeExecutor) SendPrompt(ctx context.Context, sessionID, prompt, requestID string) error {
 	f.sendCalled++
+	f.lastRequestID = requestID
 	return nil
 }
 
@@ -131,15 +134,24 @@ func (f *fakeExecutor) GetStatus(ctx context.Context, sessionID string) (map[str
 	return map[string]any{"phase": "running", "state": "active"}, nil
 }
 
-func (f *fakeExecutor) WaitForDone(ctx context.Context, sessionID string) error {
+func (f *fakeExecutor) WaitForDone(ctx context.Context, sessionID string) (*runtime.AgentResult, error) {
 	f.waitCalled++
 	if f.waitErr != nil {
-		return f.waitErr
+		return nil, f.waitErr
 	}
 	if !f.waitDone {
 		<-ctx.Done()
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
+	return &runtime.AgentResult{
+		SessionID:  sessionID,
+		StopReason: "stop",
+		ExitCode:   0,
+	}, nil
+}
+
+func (f *fakeExecutor) SendToParent(ctx context.Context, runtimeID, message string) error {
+	f.sendToParentCalled++
 	return nil
 }
 
@@ -1010,7 +1022,8 @@ func TestOrchestrationTools_spawn(t *testing.T) {
 
 func TestOrchestrationTools_sendPrompt(t *testing.T) {
 	ctx := context.Background()
-	reg := tools.NewRegistry(newOrchestrationTools(&fakeExecutor{}))
+	fake := &fakeExecutor{}
+	reg := tools.NewRegistry(newOrchestrationTools(fake))
 
 	result, err := reg.Dispatch(ctx, ".", "send_prompt", json.RawMessage(`{"session_id":"child_1","prompt":"more"}`))
 	if err != nil {
@@ -1018,6 +1031,14 @@ func TestOrchestrationTools_sendPrompt(t *testing.T) {
 	}
 	if result != "Prompt sent." {
 		t.Errorf("result = %q, want %q", result, "Prompt sent.")
+	}
+
+	_, err = reg.Dispatch(ctx, ".", "send_prompt", json.RawMessage(`{"session_id":"child_1","prompt":"more","request_id":"cq_9"}`))
+	if err != nil {
+		t.Fatalf("unexpected error for request_id: %v", err)
+	}
+	if fake.lastRequestID != "cq_9" {
+		t.Fatalf("lastRequestID = %q, want cq_9", fake.lastRequestID)
 	}
 }
 
@@ -1042,8 +1063,9 @@ func TestOrchestrationTools_waitForDone_immediate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result != "Child agent completed." {
-		t.Errorf("result = %q, want %q", result, "Child agent completed.")
+	expected := "Agent child_1 completed (exit 0, stop). Output files: []"
+	if result != expected {
+		t.Errorf("result = %q, want %q", result, expected)
 	}
 }
 
@@ -1077,6 +1099,91 @@ func TestOrchestrationTools_spawnMissingPrompt(t *testing.T) {
 	_, err := reg.Dispatch(ctx, ".", "spawn_agent", json.RawMessage(`{}`))
 	if err == nil {
 		t.Fatal("expected error for missing prompt, got nil")
+	}
+}
+
+func TestOrchestrationTools_spawnAgents(t *testing.T) {
+	ctx := context.Background()
+	fe := &fakeExecutor{}
+	reg := tools.NewRegistry(newOrchestrationTools(fe))
+
+	result, err := reg.Dispatch(ctx, ".", "spawn_agents", json.RawMessage(`{"agents":[{"prompt":"task one"},{"prompt":"task two"}]}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fe.spawnCalled != 2 {
+		t.Errorf("spawnCalled = %d, want 2", fe.spawnCalled)
+	}
+	expected := "Spawned agents: [spawned_1, spawned_2]"
+	if result != expected {
+		t.Errorf("result = %q, want %q", result, expected)
+	}
+}
+
+func TestOrchestrationTools_spawnAgreesEmpty(t *testing.T) {
+	ctx := context.Background()
+	reg := tools.NewRegistry(newOrchestrationTools(&fakeExecutor{}))
+
+	_, err := reg.Dispatch(ctx, ".", "spawn_agents", json.RawMessage(`{"agents":[]}`))
+	if err == nil {
+		t.Fatal("expected error for empty agents, got nil")
+	}
+}
+
+func TestOrchestrationTools_spawnAgentsMissingPrompt(t *testing.T) {
+	ctx := context.Background()
+	reg := tools.NewRegistry(newOrchestrationTools(&fakeExecutor{}))
+
+	_, err := reg.Dispatch(ctx, ".", "spawn_agents", json.RawMessage(`{"agents":[{"prompt":"ok"},{}]}`))
+	if err == nil {
+		t.Fatal("expected error for missing prompt, got nil")
+	}
+}
+
+func TestOrchestrationTools_spawnAgentsDirsOutsideWorkDir(t *testing.T) {
+	ctx := context.Background()
+	reg := tools.NewRegistry(newOrchestrationTools(&fakeExecutor{}))
+
+	_, err := reg.Dispatch(ctx, ".", "spawn_agents", json.RawMessage(`{"agents":[{"prompt":"hi","dir":"/etc"}]}`))
+	if err == nil {
+		t.Fatal("expected error for dir outside workdir, got nil")
+	}
+}
+
+func TestOrchestrationTools_sendToParent(t *testing.T) {
+	ctx := context.WithValue(context.Background(), RuntimeIDKey, "rt_child")
+	fe := &fakeExecutor{}
+	reg := tools.NewRegistry(newOrchestrationTools(fe))
+
+	result, err := reg.Dispatch(ctx, ".", "send_to_parent", json.RawMessage(`{"message":"need help"}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fe.sendToParentCalled != 1 {
+		t.Errorf("sendToParentCalled = %d, want 1", fe.sendToParentCalled)
+	}
+	if result != "Message sent to parent agent." {
+		t.Errorf("result = %q, want %q", result, "Message sent to parent agent.")
+	}
+}
+
+func TestOrchestrationTools_sendToParentMissingRuntimeContext(t *testing.T) {
+	ctx := context.Background()
+	reg := tools.NewRegistry(newOrchestrationTools(&fakeExecutor{}))
+
+	_, err := reg.Dispatch(ctx, ".", "send_to_parent", json.RawMessage(`{"message":"need help"}`))
+	if err == nil {
+		t.Fatal("expected error for missing runtime context, got nil")
+	}
+}
+
+func TestOrchestrationTools_sendToParentMissingMessage(t *testing.T) {
+	ctx := context.Background()
+	reg := tools.NewRegistry(newOrchestrationTools(&fakeExecutor{}))
+
+	_, err := reg.Dispatch(ctx, ".", "send_to_parent", json.RawMessage(`{}`))
+	if err == nil {
+		t.Fatal("expected error for missing message, got nil")
 	}
 }
 
@@ -1193,4 +1300,3 @@ func TestSessionState_removeSubscriber_nonExistent(t *testing.T) {
 		t.Error("ch1 should still be open and receive the event")
 	}
 }
-
