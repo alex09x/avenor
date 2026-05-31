@@ -9,9 +9,12 @@ import (
 	"github.com/sdougbrown/avenor/internal/control"
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/permission"
+	"github.com/sdougbrown/avenor/internal/phaseconfig"
 	"github.com/sdougbrown/avenor/internal/runtime"
 	"github.com/sdougbrown/avenor/internal/runtime/factory"
 )
+
+var newProvider = factory.NewProvider
 
 // attemptResult holds the outcome of a single session attempt.
 type attemptResult struct {
@@ -20,6 +23,7 @@ type attemptResult struct {
 	stopReason    string
 	loopDirective string
 	loopLabel     string
+	output        string
 	usage         map[string]any
 }
 
@@ -62,7 +66,7 @@ func runSingleAttempt(
 	cfg attemptConfig,
 	deps attemptDeps,
 ) attemptResult {
-	provider, err := factory.NewProvider(cfg.startOptions, cfg.backend)
+	provider, err := newProvider(cfg.startOptions, cfg.backend)
 	if err != nil {
 		fmt.Fprintf(deps.stderr, "avenor: create provider: %v\n", err)
 		return attemptResult{exitCode: 1}
@@ -140,7 +144,7 @@ func runSingleAttempt(
 		stopReason := result.StopReason
 		cancelEvents()
 
-		if loopDirectiveSeverity(result.LoopDirective) > loopDirectiveSeverity(accDirective) {
+		if phaseconfig.LoopDirectiveSeverity(result.LoopDirective) > phaseconfig.LoopDirectiveSeverity(accDirective) {
 			accDirective = result.LoopDirective
 			accLabel = result.LoopLabel
 		}
@@ -151,7 +155,7 @@ func runSingleAttempt(
 			if interruptText := deps.controlServer.ConsumeInterrupt(); interruptText != "" {
 				if _, err := resumeSession(ctx, provider, session.SessionID); err != nil {
 					fmt.Fprintf(deps.stderr, "avenor: resume after cancel: %v\n", err)
-					return attemptResult{exitCode: 1, sessionID: session.SessionID, stopReason: stopReason, loopDirective: accDirective, loopLabel: accLabel, usage: result.Usage}
+					return attemptResult{exitCode: 1, sessionID: session.SessionID, stopReason: stopReason, loopDirective: accDirective, loopLabel: accLabel, output: result.Output, usage: result.Usage}
 				}
 				prompt = interruptText
 				continue
@@ -160,7 +164,7 @@ func runSingleAttempt(
 				if nextPrompt := deps.controlServer.DequeuePrompt(); nextPrompt != "" {
 					if _, err := resumeSession(ctx, provider, session.SessionID); err != nil {
 						fmt.Fprintf(deps.stderr, "avenor: resume after end_turn: %v\n", err)
-						return attemptResult{exitCode: 1, sessionID: session.SessionID, stopReason: stopReason, loopDirective: accDirective, loopLabel: accLabel, usage: result.Usage}
+						return attemptResult{exitCode: 1, sessionID: session.SessionID, stopReason: stopReason, loopDirective: accDirective, loopLabel: accLabel, output: result.Output, usage: result.Usage}
 					}
 					prompt = nextPrompt
 					continue
@@ -168,7 +172,7 @@ func runSingleAttempt(
 			}
 		}
 
-		return attemptResult{exitCode: exitCode, sessionID: session.SessionID, stopReason: stopReason, loopDirective: accDirective, loopLabel: accLabel, usage: result.Usage}
+		return attemptResult{exitCode: exitCode, sessionID: session.SessionID, stopReason: stopReason, loopDirective: accDirective, loopLabel: accLabel, output: result.Output, usage: result.Usage}
 	}
 }
 

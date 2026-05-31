@@ -5,20 +5,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/sdougbrown/avenor/internal/phaseconfig"
 )
 
-type Phase struct {
-	Name               string `json:"name"`
-	Prompt             string `json:"prompt"`
-	PromptFile         string `json:"prompt_file,omitempty"`
-	ResumeFromPrevious bool   `json:"resume_from_previous,omitempty"`
-}
-
 type LoopConfig struct {
-	MaxIterations int     `json:"max_iterations"`
-	Pre           []Phase `json:"pre"`
-	Loop          []Phase `json:"loop"`
-	Post          []Phase `json:"post"`
+	MaxIterations int                 `json:"max_iterations"`
+	Pre           []phaseconfig.Phase `json:"pre"`
+	Loop          []phaseconfig.Phase `json:"loop"`
+	Post          []phaseconfig.Phase `json:"post"`
 }
 
 func LoadLoopConfig(path string) (*LoopConfig, error) {
@@ -37,13 +32,16 @@ func LoadLoopConfig(path string) (*LoopConfig, error) {
 	}
 
 	configDir := filepath.Dir(path)
-	if err := resolvePromptFiles(cfg.Pre, configDir); err != nil {
+	if err := cfg.preValidate(); err != nil {
 		return nil, err
 	}
-	if err := resolvePromptFiles(cfg.Loop, configDir); err != nil {
+	if err := phaseconfig.ResolvePhaseFiles(cfg.Pre, configDir); err != nil {
 		return nil, err
 	}
-	if err := resolvePromptFiles(cfg.Post, configDir); err != nil {
+	if err := phaseconfig.ResolvePhaseFiles(cfg.Loop, configDir); err != nil {
+		return nil, err
+	}
+	if err := phaseconfig.ResolvePhaseFiles(cfg.Post, configDir); err != nil {
 		return nil, err
 	}
 
@@ -54,25 +52,21 @@ func LoadLoopConfig(path string) (*LoopConfig, error) {
 	return &cfg, nil
 }
 
-func resolvePromptFiles(phases []Phase, configDir string) error {
-	for i := range phases {
-		p := &phases[i]
-		if p.PromptFile == "" {
-			continue
+func (c *LoopConfig) preValidate() error {
+	for i := range c.Pre {
+		if err := phaseconfig.ValidatePhaseMutualExclusions(c.Pre[i]); err != nil {
+			return fmt.Errorf("loop config: %w", err)
 		}
-		if p.Prompt != "" {
-			return fmt.Errorf("loop config: phase[name %s]: prompt and prompt_file are mutually exclusive", p.Name)
+	}
+	for i := range c.Loop {
+		if err := phaseconfig.ValidatePhaseMutualExclusions(c.Loop[i]); err != nil {
+			return fmt.Errorf("loop config: %w", err)
 		}
-		absPath := p.PromptFile
-		if !filepath.IsAbs(absPath) {
-			absPath = filepath.Join(configDir, absPath)
+	}
+	for i := range c.Post {
+		if err := phaseconfig.ValidatePhaseMutualExclusions(c.Post[i]); err != nil {
+			return fmt.Errorf("loop config: %w", err)
 		}
-		contents, err := os.ReadFile(absPath)
-		if err != nil {
-			return fmt.Errorf("loop config: phase[name %s]: reading prompt_file %q: %w", p.Name, p.PromptFile, err)
-		}
-		p.Prompt = string(contents)
-		p.PromptFile = ""
 	}
 	return nil
 }
@@ -90,8 +84,11 @@ func (c *LoopConfig) Validate() error {
 		if c.Pre[i].Name == "" {
 			return fmt.Errorf("loop config: phase[index %d]: name must not be empty", i)
 		}
-		if c.Pre[i].Prompt == "" && c.Pre[i].PromptFile == "" {
-			return fmt.Errorf("loop config: phase[name %s]: prompt must not be empty (set prompt or prompt_file)", c.Pre[i].Name)
+		if c.Pre[i].Conditional || c.Pre[i].Agent != "" || c.Pre[i].Model != "" {
+			return fmt.Errorf("loop config: phase[name %s]: conditional, agent, and model are only supported on team members", c.Pre[i].Name)
+		}
+		if err := phaseconfig.ValidatePhaseHasPrompt(c.Pre[i]); err != nil {
+			return fmt.Errorf("loop config: phase[name %s]: %w", c.Pre[i].Name, err)
 		}
 	}
 
@@ -99,8 +96,11 @@ func (c *LoopConfig) Validate() error {
 		if c.Loop[i].Name == "" {
 			return fmt.Errorf("loop config: phase[index %d]: name must not be empty", i)
 		}
-		if c.Loop[i].Prompt == "" && c.Loop[i].PromptFile == "" {
-			return fmt.Errorf("loop config: phase[name %s]: prompt must not be empty (set prompt or prompt_file)", c.Loop[i].Name)
+		if c.Loop[i].Conditional || c.Loop[i].Agent != "" || c.Loop[i].Model != "" {
+			return fmt.Errorf("loop config: phase[name %s]: conditional, agent, and model are only supported on team members", c.Loop[i].Name)
+		}
+		if err := phaseconfig.ValidatePhaseHasPrompt(c.Loop[i]); err != nil {
+			return fmt.Errorf("loop config: phase[name %s]: %w", c.Loop[i].Name, err)
 		}
 	}
 
@@ -108,48 +108,21 @@ func (c *LoopConfig) Validate() error {
 		if c.Post[i].Name == "" {
 			return fmt.Errorf("loop config: phase[index %d]: name must not be empty", i)
 		}
-		if c.Post[i].Prompt == "" && c.Post[i].PromptFile == "" {
-			return fmt.Errorf("loop config: phase[name %s]: prompt must not be empty (set prompt or prompt_file)", c.Post[i].Name)
+		if c.Post[i].Conditional || c.Post[i].Agent != "" || c.Post[i].Model != "" {
+			return fmt.Errorf("loop config: phase[name %s]: conditional, agent, and model are only supported on team members", c.Post[i].Name)
+		}
+		if err := phaseconfig.ValidatePhaseHasPrompt(c.Post[i]); err != nil {
+			return fmt.Errorf("loop config: phase[name %s]: %w", c.Post[i].Name, err)
 		}
 	}
 
-	names := make(map[string]struct{})
-	for i := range c.Pre {
-		n := c.Pre[i].Name
-		if n == "(initial)" {
-			return fmt.Errorf("loop config: duplicate phase name: \"(initial)\"")
-		}
-		if _, ok := names[n]; ok {
-			return fmt.Errorf("loop config: duplicate phase name: \"%s\"", n)
-		}
-		names[n] = struct{}{}
-	}
-
-	for i := range c.Loop {
-		n := c.Loop[i].Name
-		if n == "(initial)" {
-			return fmt.Errorf("loop config: duplicate phase name: \"(initial)\"")
-		}
-		if _, ok := names[n]; ok {
-			return fmt.Errorf("loop config: duplicate phase name: \"%s\"", n)
-		}
-		names[n] = struct{}{}
-	}
-
-	for i := range c.Post {
-		n := c.Post[i].Name
-		if n == "(initial)" {
-			return fmt.Errorf("loop config: duplicate phase name: \"(initial)\"")
-		}
-		if _, ok := names[n]; ok {
-			return fmt.Errorf("loop config: duplicate phase name: \"%s\"", n)
-		}
-		names[n] = struct{}{}
+	if err := phaseconfig.ValidatePhaseNames(c.Pre, c.Loop, c.Post); err != nil {
+		return fmt.Errorf("loop config: %w", err)
 	}
 
 	return nil
 }
 
 func (c *LoopConfig) InsertInitialPrompt(prompt string) {
-	c.Pre = append([]Phase{{Name: "(initial)", Prompt: prompt}}, c.Pre...)
+	phaseconfig.InsertInitialPrompt(&c.Pre, prompt)
 }

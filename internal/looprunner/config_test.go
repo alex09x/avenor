@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/sdougbrown/avenor/internal/phaseconfig"
 )
 
 func TestLoadLoopConfig(t *testing.T) {
@@ -83,7 +85,7 @@ func TestLoadLoopConfig(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
-		if err.Error() != "loop config: phase[name foo]: prompt must not be empty (set prompt or prompt_file)" {
+		if err.Error() != "loop config: phase[name foo]: prompt must not be empty (set prompt, prompt_file, loop_file, or team_file)" {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if cfg != nil {
@@ -119,7 +121,7 @@ func TestLoadLoopConfig(t *testing.T) {
 
 	t.Run("InsertInitialPrompt adds phase at index 0 of Pre", func(t *testing.T) {
 		cfg := &LoopConfig{
-			Pre: []Phase{{Name: "build", Prompt: "build it"}},
+			Pre: []phaseconfig.Phase{{Name: "build", Prompt: "build it"}},
 		}
 		cfg.InsertInitialPrompt("my initial prompt")
 		if len(cfg.Pre) != 2 {
@@ -138,7 +140,7 @@ func TestLoadLoopConfig(t *testing.T) {
 
 	t.Run("InsertInitialPrompt does not trigger duplicate error", func(t *testing.T) {
 		cfg := &LoopConfig{
-			Pre: []Phase{{Name: "foo", Prompt: "do foo"}},
+			Pre: []phaseconfig.Phase{{Name: "foo", Prompt: "do foo"}},
 		}
 		cfg.InsertInitialPrompt("start here")
 		if len(cfg.Pre) != 2 {
@@ -190,7 +192,7 @@ func TestLoadLoopConfig(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
-		if err.Error() != "loop config: phase[name test]: prompt must not be empty (set prompt or prompt_file)" {
+		if err.Error() != "loop config: phase[name test]: prompt must not be empty (set prompt, prompt_file, loop_file, or team_file)" {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if cfg != nil {
@@ -210,7 +212,7 @@ func TestLoadLoopConfig(t *testing.T) {
 }
 
 func TestValidatePhaseMissingNamePre(t *testing.T) {
-	cfg := &LoopConfig{Pre: []Phase{{Prompt: "hello"}}}
+	cfg := &LoopConfig{Pre: []phaseconfig.Phase{{Prompt: "hello"}}}
 	err := cfg.Validate()
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -221,18 +223,18 @@ func TestValidatePhaseMissingNamePre(t *testing.T) {
 }
 
 func TestValidatePhaseMissingPromptLoop(t *testing.T) {
-	cfg := &LoopConfig{Loop: []Phase{{Name: "test"}}, MaxIterations: 5}
+	cfg := &LoopConfig{Loop: []phaseconfig.Phase{{Name: "test"}}, MaxIterations: 5}
 	err := cfg.Validate()
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if err.Error() != "loop config: phase[name test]: prompt must not be empty (set prompt or prompt_file)" {
+	if err.Error() != "loop config: phase[name test]: prompt must not be empty (set prompt, prompt_file, loop_file, or team_file)" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
 func TestValidateDuplicateNameInPre(t *testing.T) {
-	cfg := &LoopConfig{Pre: []Phase{
+	cfg := &LoopConfig{Pre: []phaseconfig.Phase{
 		{Name: "foo", Prompt: "first"},
 		{Name: "foo", Prompt: "second"},
 	}}
@@ -247,8 +249,8 @@ func TestValidateDuplicateNameInPre(t *testing.T) {
 
 func TestValidateDuplicateNameInLoop(t *testing.T) {
 	cfg := &LoopConfig{
-		Pre:           []Phase{{Name: "foo", Prompt: "first"}},
-		Loop:          []Phase{{Name: "foo", Prompt: "second"}},
+		Pre:           []phaseconfig.Phase{{Name: "foo", Prompt: "first"}},
+		Loop:          []phaseconfig.Phase{{Name: "foo", Prompt: "second"}},
 		MaxIterations: 5,
 	}
 	err := cfg.Validate()
@@ -262,7 +264,7 @@ func TestValidateDuplicateNameInLoop(t *testing.T) {
 
 func TestValidateDuplicateAcrossMultipleLoop(t *testing.T) {
 	cfg := &LoopConfig{
-		Loop: []Phase{
+		Loop: []phaseconfig.Phase{
 			{Name: "a", Prompt: "a"},
 			{Name: "b", Prompt: "b"},
 			{Name: "a", Prompt: "a again"},
@@ -281,8 +283,8 @@ func TestValidateDuplicateAcrossMultipleLoop(t *testing.T) {
 func TestValidateOK(t *testing.T) {
 	cfg := &LoopConfig{
 		MaxIterations: 10,
-		Pre:           []Phase{{Name: "setup", Prompt: "setup env"}},
-		Loop:          []Phase{{Name: "test", Prompt: "run tests"}},
+		Pre:           []phaseconfig.Phase{{Name: "setup", Prompt: "setup env"}},
+		Loop:          []phaseconfig.Phase{{Name: "test", Prompt: "run tests"}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -301,7 +303,7 @@ func TestInsertInitialPromptOnEmptyPre(t *testing.T) {
 }
 
 func TestInsertInitialPromptResumeFromPrevious(t *testing.T) {
-	cfg := &LoopConfig{Pre: []Phase{{Name: "build", Prompt: "build it", ResumeFromPrevious: true}}}
+	cfg := &LoopConfig{Pre: []phaseconfig.Phase{{Name: "build", Prompt: "build it", ResumeFromPrevious: true}}}
 	cfg.InsertInitialPrompt("go")
 	if len(cfg.Pre) != 2 {
 		t.Fatalf("expected 2 pre phases, got %d", len(cfg.Pre))
@@ -314,9 +316,22 @@ func TestInsertInitialPromptResumeFromPrevious(t *testing.T) {
 	}
 }
 
+func TestLoopConfigRejectsTeamOnlyFields(t *testing.T) {
+	cfg, err := loadFromJSON(t, `{"loop":[{"name":"work","prompt":"do work","agent":"special"}]}`)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if err.Error() != "loop config: phase[name work]: conditional, agent, and model are only supported on team members" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg != nil {
+		t.Fatal("expected nil config on error")
+	}
+}
+
 func TestValidateNamesCaseSensitiveDistinct(t *testing.T) {
 	cfg := &LoopConfig{
-		Pre: []Phase{
+		Pre: []phaseconfig.Phase{
 			{Name: "Foo", Prompt: "first"},
 			{Name: "foo", Prompt: "second"},
 		},
@@ -329,7 +344,7 @@ func TestValidateNamesCaseSensitiveDistinct(t *testing.T) {
 
 func TestValidateNamesCaseSensitiveDuplicate(t *testing.T) {
 	cfg := &LoopConfig{
-		Pre: []Phase{
+		Pre: []phaseconfig.Phase{
 			{Name: "Foo", Prompt: "first"},
 			{Name: "Foo", Prompt: "second"},
 		},
@@ -372,8 +387,8 @@ func TestLoadLoopConfigWithPost(t *testing.T) {
 
 func TestValidateDuplicateNameAcrossPost(t *testing.T) {
 	cfg := &LoopConfig{
-		Loop:          []Phase{{Name: "work", Prompt: "work"}},
-		Post:          []Phase{{Name: "work", Prompt: "also work"}},
+		Loop:          []phaseconfig.Phase{{Name: "work", Prompt: "work"}},
+		Post:          []phaseconfig.Phase{{Name: "work", Prompt: "also work"}},
 		MaxIterations: 1,
 	}
 	err := cfg.Validate()
@@ -490,6 +505,86 @@ func TestPromptFile(t *testing.T) {
 		}
 		if cfg.Pre[0].Prompt != content {
 			t.Fatalf("unexpected prompt: %q", cfg.Pre[0].Prompt)
+		}
+	})
+}
+
+func TestLoopFileAndTeamFileMutualExclusion(t *testing.T) {
+	t.Parallel()
+
+	t.Run("prompt and loop_file both set returns error", func(t *testing.T) {
+		cfg, err := loadFromJSON(t, `{"pre":[{"name":"build","prompt":"build it","loop_file":"sub.json"}]}`)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if err.Error() != `loop config: phase[name build]: prompt is mutually exclusive with loop_file and team_file` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg != nil {
+			t.Fatal("expected nil config on error")
+		}
+	})
+
+	t.Run("prompt and team_file both set returns error", func(t *testing.T) {
+		cfg, err := loadFromJSON(t, `{"pre":[{"name":"build","prompt":"build it","team_file":"team.json"}]}`)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if err.Error() != `loop config: phase[name build]: prompt is mutually exclusive with loop_file and team_file` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg != nil {
+			t.Fatal("expected nil config on error")
+		}
+	})
+
+	t.Run("loop_file and team_file both set returns error", func(t *testing.T) {
+		cfg, err := loadFromJSON(t, `{"pre":[{"name":"build","loop_file":"loop.json","team_file":"team.json"}]}`)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if err.Error() != `loop config: phase[name build]: loop_file and team_file are mutually exclusive` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg != nil {
+			t.Fatal("expected nil config on error")
+		}
+	})
+
+	t.Run("only loop_file set is valid", func(t *testing.T) {
+		cfg, err := loadFromJSON(t, `{"pre":[{"name":"build","loop_file":"sub.json"}]}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Pre[0].LoopFile != "sub.json" {
+			t.Fatalf("expected LoopFile to be sub.json, got %q", cfg.Pre[0].LoopFile)
+		}
+	})
+
+	t.Run("only team_file set is valid", func(t *testing.T) {
+		cfg, err := loadFromJSON(t, `{"pre":[{"name":"build","team_file":"team.json"}]}`)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Pre[0].TeamFile != "team.json" {
+			t.Fatalf("expected TeamFile to be team.json, got %q", cfg.Pre[0].TeamFile)
+		}
+	})
+
+	t.Run("prompt_file and loop_file both set returns error", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "p.txt"), []byte("content"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := loadFromDir(t, dir, `{"pre":[{"name":"build","prompt_file":"p.txt","loop_file":"sub.json"}]}`)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if err.Error() != `loop config: phase[name build]: prompt_file is mutually exclusive with loop_file and team_file` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg != nil {
+			t.Fatal("expected nil config on error")
 		}
 	})
 }

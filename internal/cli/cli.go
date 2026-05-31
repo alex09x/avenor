@@ -19,9 +19,11 @@ import (
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/looprunner"
 	"github.com/sdougbrown/avenor/internal/permission"
+	"github.com/sdougbrown/avenor/internal/phaseconfig"
 	"github.com/sdougbrown/avenor/internal/runtime"
 	"github.com/sdougbrown/avenor/internal/runtime/pony"
 	"github.com/sdougbrown/avenor/internal/runtime/pony/model/openai"
+	"github.com/sdougbrown/avenor/internal/teamrunner"
 )
 
 const (
@@ -99,6 +101,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	httpDebug := fs.String("http-debug", "", "http debug adapter bind address")
 	permClaimTimeout := fs.Duration("permission-claim-timeout", 0, fmt.Sprintf("how long to wait for a connected socket client to answer a permission request before falling through to the file handler or 'none' resolver (0 uses the default: %v)", DefaultPermissionClaimTimeout))
 	loopFile := fs.String("loop-file", "", "path to loop config JSON (optional; enables multi-phase mode)")
+	teamFile := fs.String("team-file", "", "path to team config JSON (optional; enables parallel-team mode)")
 	ponyConfig := fs.String("pony-config", "", "path to pony backend JSON config (required for --backend pony)")
 
 	if err := fs.Parse(args); err != nil {
@@ -216,18 +219,18 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		}
 
 		pCfg := pony.Config{
-			Adapter:        adapter,
-			Model:          profile.Model,
-			MaxTokens:      profile.MaxTokens,
-			SystemPrompt:   systemPrompt,
-			InitialPrompt:  initialPrompt,
-			Executor:       executor,
-			LocalTools:     profile.Tools.Local,
-			OrchTools:      profile.Tools.Orchestration,
-			WorkingDir:     *dir,
-			InjectAgentsMD: profile.InjectAgentsMD,
-			ToolApproval:   profile.ToolApproval,
-			ShellConfig:    profile.ShellConfig,
+			Adapter:         adapter,
+			Model:           profile.Model,
+			MaxTokens:       profile.MaxTokens,
+			SystemPrompt:    systemPrompt,
+			InitialPrompt:   initialPrompt,
+			Executor:        executor,
+			LocalTools:      profile.Tools.Local,
+			OrchTools:       profile.Tools.Orchestration,
+			WorkingDir:      *dir,
+			InjectAgentsMD:  profile.InjectAgentsMD,
+			ToolApproval:    profile.ToolApproval,
+			ShellConfig:     profile.ShellConfig,
 			AllowedReadDirs: allowedDirs,
 		}
 		pony.SetGlobalConfig(&pCfg)
@@ -237,12 +240,20 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "avenor: --prompt and --prompt-file are mutually exclusive")
 		return exitWithSentinel(1)
 	}
-	if *prompt == "" && *promptFile == "" && *loopFile == "" {
-		fmt.Fprintln(stderr, "avenor: --prompt, --prompt-file, or --loop-file is required")
+	if *loopFile != "" && *teamFile != "" {
+		fmt.Fprintln(stderr, "avenor: --loop-file and --team-file are mutually exclusive")
 		return exitWithSentinel(1)
 	}
 	if *loopFile != "" && *resume != "" {
 		fmt.Fprintln(stderr, "avenor: --loop-file and --resume are mutually exclusive")
+		return exitWithSentinel(1)
+	}
+	if *teamFile != "" && *resume != "" {
+		fmt.Fprintln(stderr, "avenor: --team-file and --resume are mutually exclusive")
+		return exitWithSentinel(1)
+	}
+	if *prompt == "" && *promptFile == "" && *loopFile == "" && *teamFile == "" {
+		fmt.Fprintln(stderr, "avenor: --prompt, --prompt-file, --loop-file, or --team-file is required")
 		return exitWithSentinel(1)
 	}
 
@@ -350,6 +361,59 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		timer = t.C
 	}
 
+	agentOverride := *agent
+	modelOverride := *model
+
+	execAttempt := func(ctx context.Context, agent, model, resumeID, prompt string) attemptResult {
+		return runSingleAttempt(ctx, attemptConfig{
+			startOptions:           runtime.StartOptions{Agent: agent, Model: model, Dir: *dir, ServerURL: discovery.URL},
+			backend:                *backend,
+			resumeID:               resumeID,
+			initialPrompt:          prompt,
+			runID:                  runID,
+			runLabel:               *label,
+			autoApprove:            *autoApprove,
+			permissionClaimTimeout: *permClaimTimeout,
+			progressTimeout:        *progressTimeout,
+			timer:                  timer,
+		}, attemptDeps{
+			writer:        writer,
+			fileHandler:   fileHandler,
+			controlServer: controlServer,
+			stderr:        os.Stderr,
+		})
+	}
+
+	phaseAttemptForLoop := func(ctx context.Context, phase phaseconfig.Phase, _ int, _ int, prevSessionID string) (looprunner.PhaseAttemptResult, error) {
+		r := execAttempt(ctx, agentOverride, modelOverride, prevSessionID, phase.Prompt)
+		return looprunner.PhaseAttemptResult{
+			ExitCode:      r.exitCode,
+			SessionID:     r.sessionID,
+			StopReason:    r.stopReason,
+			LoopDirective: r.loopDirective,
+			LoopLabel:     r.loopLabel,
+		}, nil
+	}
+
+	phaseAttemptForTeam := func(ctx context.Context, phase phaseconfig.Phase, _ int, prevSessionID string) (teamrunner.PhaseAttemptResult, error) {
+		a, m := agentOverride, modelOverride
+		if phase.Agent != "" {
+			a = phase.Agent
+		}
+		if phase.Model != "" {
+			m = phase.Model
+		}
+		r := execAttempt(ctx, a, m, prevSessionID, phase.Prompt)
+		return teamrunner.PhaseAttemptResult{
+			ExitCode:      r.exitCode,
+			SessionID:     r.sessionID,
+			StopReason:    r.stopReason,
+			LoopDirective: r.loopDirective,
+			LoopLabel:     r.loopLabel,
+			Output:        r.output,
+		}, nil
+	}
+
 	if *loopFile != "" {
 		cfg, err := looprunner.LoadLoopConfig(*loopFile)
 		if err != nil {
@@ -364,51 +428,81 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			cfg.InsertInitialPrompt(string(promptText))
 		}
 
-		opts := looprunner.RunOptions{
-			WorkDir:    *dir,
-			RunID:      runID,
-			EventSink:  writer,
-			Config:     cfg,
-			MaxRetries: *maxRetries,
-			PhaseAttempt: func(ctx context.Context, phase looprunner.Phase, attemptNum int, iteration int, prevSessionID string) (looprunner.PhaseAttemptResult, error) {
-				startOpts := runtime.StartOptions{
-					Agent:     *agent,
-					Model:     *model,
-					Dir:       *dir,
-					ServerURL: discovery.URL,
+		var nestedRun func(ctx context.Context, configPath string, runType string) (looprunner.NestedResult, error)
+		nestedRun = func(ctx context.Context, configPath string, runType string) (looprunner.NestedResult, error) {
+			if runType == "loop" {
+				subCfg, err := looprunner.LoadLoopConfig(configPath)
+				if err != nil {
+					return looprunner.NestedResult{}, fmt.Errorf("load nested loop config: %w", err)
 				}
-
-				var resumeID string
-				if prevSessionID != "" {
-					resumeID = prevSessionID
+				subOpts := looprunner.RunOptions{
+					WorkDir:      *dir,
+					RunID:        runID,
+					EventSink:    writer,
+					Config:       subCfg,
+					MaxRetries:   *maxRetries,
+					ConfigDir:    filepath.Dir(configPath),
+					PhaseAttempt: phaseAttemptForLoop,
+					NestedRun:    nestedRun,
 				}
-
-				result := runSingleAttempt(ctx, attemptConfig{
-					startOptions:           startOpts,
-					backend:                *backend,
-					resumeID:               resumeID,
-					initialPrompt:          phase.Prompt,
-					runID:                  runID,
-					runLabel:               *label,
-					autoApprove:            *autoApprove,
-					permissionClaimTimeout: *permClaimTimeout,
-					progressTimeout:        *progressTimeout,
-					timer:                  timer,
-				}, attemptDeps{
-					writer:        writer,
-					fileHandler:   fileHandler,
-					controlServer: controlServer,
-					stderr:        os.Stderr,
-				})
-
-				return looprunner.PhaseAttemptResult{
-					ExitCode:      result.exitCode,
-					SessionID:     result.sessionID,
-					StopReason:    result.stopReason,
-					LoopDirective: result.loopDirective,
-					LoopLabel:     result.loopLabel,
+				subResult, err := looprunner.Run(ctx, subOpts)
+				if err != nil {
+					return looprunner.NestedResult{}, err
+				}
+				return looprunner.NestedResult{
+					ExitCode:   subResult.ExitCode,
+					StopReason: subResult.StopReason,
+					SessionID:  subResult.SessionID,
+					Reason:     subResult.Reason,
 				}, nil
-			},
+			}
+			if runType == "team" {
+				subCfg, err := teamrunner.LoadTeamConfig(configPath)
+				if err != nil {
+					return looprunner.NestedResult{}, fmt.Errorf("load nested team config: %w", err)
+				}
+				teamNestedRun := func(ctx context.Context, configPath string, runType string) (teamrunner.NestedResult, error) {
+					nr, err := nestedRun(ctx, configPath, runType)
+					return teamrunner.NestedResult{
+						ExitCode:   nr.ExitCode,
+						StopReason: nr.StopReason,
+						SessionID:  nr.SessionID,
+						Reason:     nr.Reason,
+					}, err
+				}
+				subOpts := teamrunner.RunOptions{
+					WorkDir:      *dir,
+					RunID:        runID,
+					EventSink:    writer,
+					Config:       subCfg,
+					MaxRetries:   *maxRetries,
+					ConfigDir:    filepath.Dir(configPath),
+					PhaseAttempt: phaseAttemptForTeam,
+					NestedRun:    teamNestedRun,
+				}
+				subResult, err := teamrunner.Run(ctx, subOpts)
+				if err != nil {
+					return looprunner.NestedResult{}, err
+				}
+				return looprunner.NestedResult{
+					ExitCode:   subResult.ExitCode,
+					StopReason: subResult.StopReason,
+					SessionID:  subResult.SessionID,
+					Reason:     subResult.Reason,
+				}, nil
+			}
+			return looprunner.NestedResult{}, fmt.Errorf("unknown run type %q", runType)
+		}
+
+		opts := looprunner.RunOptions{
+			WorkDir:      *dir,
+			RunID:        runID,
+			EventSink:    writer,
+			Config:       cfg,
+			MaxRetries:   *maxRetries,
+			ConfigDir:    filepath.Dir(*loopFile),
+			PhaseAttempt: phaseAttemptForLoop,
+			NestedRun:    nestedRun,
 		}
 
 		lrCtx, lrCancel := context.WithCancel(ctx)
@@ -424,6 +518,120 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		}
 
 		writeSentinelForResult(result, *sentinelFile, runID, stderr)
+
+		return result.ExitCode
+	}
+
+	if *teamFile != "" {
+		cfg, err := teamrunner.LoadTeamConfig(*teamFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "avenor: load team config: %v\n", err)
+			if *sentinelFile != "" {
+				WriteSentinel(*sentinelFile, 1, finalSessionID, "error", runID, stderr)
+			}
+			return 1
+		}
+
+		if len(promptText) > 0 {
+			cfg.InsertInitialPrompt(string(promptText))
+		}
+
+		var nestedRun func(ctx context.Context, configPath string, runType string) (teamrunner.NestedResult, error)
+		nestedRun = func(ctx context.Context, configPath string, runType string) (teamrunner.NestedResult, error) {
+			if runType == "loop" {
+				subCfg, err := looprunner.LoadLoopConfig(configPath)
+				if err != nil {
+					return teamrunner.NestedResult{}, fmt.Errorf("load nested loop config: %w", err)
+				}
+				loopNestedRun := func(ctx context.Context, configPath string, runType string) (looprunner.NestedResult, error) {
+					nr, err := nestedRun(ctx, configPath, runType)
+					return looprunner.NestedResult{
+						ExitCode:   nr.ExitCode,
+						StopReason: nr.StopReason,
+						SessionID:  nr.SessionID,
+						Reason:     nr.Reason,
+					}, err
+				}
+				subOpts := looprunner.RunOptions{
+					WorkDir:      *dir,
+					RunID:        runID,
+					EventSink:    writer,
+					Config:       subCfg,
+					MaxRetries:   *maxRetries,
+					ConfigDir:    filepath.Dir(configPath),
+					PhaseAttempt: phaseAttemptForLoop,
+					NestedRun:    loopNestedRun,
+				}
+				subResult, err := looprunner.Run(ctx, subOpts)
+				if err != nil {
+					return teamrunner.NestedResult{}, err
+				}
+				return teamrunner.NestedResult{
+					ExitCode:   subResult.ExitCode,
+					StopReason: subResult.StopReason,
+					SessionID:  subResult.SessionID,
+					Reason:     subResult.Reason,
+				}, nil
+			}
+			if runType == "team" {
+				subCfg, err := teamrunner.LoadTeamConfig(configPath)
+				if err != nil {
+					return teamrunner.NestedResult{}, fmt.Errorf("load nested team config: %w", err)
+				}
+				subOpts := teamrunner.RunOptions{
+					WorkDir:      *dir,
+					RunID:        runID,
+					EventSink:    writer,
+					Config:       subCfg,
+					MaxRetries:   *maxRetries,
+					ConfigDir:    filepath.Dir(configPath),
+					PhaseAttempt: phaseAttemptForTeam,
+					NestedRun:    nestedRun,
+				}
+				subResult, err := teamrunner.Run(ctx, subOpts)
+				if err != nil {
+					return teamrunner.NestedResult{}, err
+				}
+				return teamrunner.NestedResult{
+					ExitCode:   subResult.ExitCode,
+					StopReason: subResult.StopReason,
+					SessionID:  subResult.SessionID,
+					Reason:     subResult.Reason,
+				}, nil
+			}
+			return teamrunner.NestedResult{}, fmt.Errorf("unknown run type %q", runType)
+		}
+
+		opts := teamrunner.RunOptions{
+			WorkDir:      *dir,
+			RunID:        runID,
+			EventSink:    writer,
+			Config:       cfg,
+			MaxRetries:   *maxRetries,
+			ConfigDir:    filepath.Dir(*teamFile),
+			PhaseAttempt: phaseAttemptForTeam,
+			NestedRun:    nestedRun,
+		}
+
+		trCtx, trCancel := context.WithCancel(ctx)
+		defer trCancel()
+
+		result, err := teamrunner.Run(trCtx, opts)
+		if err != nil {
+			fmt.Fprintf(stderr, "avenor: team run: %v\n", err)
+			if *sentinelFile != "" {
+				WriteSentinel(*sentinelFile, 1, result.SessionID, "error", runID, stderr)
+			}
+			return 1
+		}
+
+		if *sentinelFile != "" {
+			if result.Reason != "" {
+				WriteSentinelWithReason(*sentinelFile, result.ExitCode, result.SessionID, result.StopReason, runID, result.Reason, stderr)
+			} else {
+				WriteSentinel(*sentinelFile, result.ExitCode, result.SessionID, result.StopReason, runID, stderr)
+			}
+		}
 
 		return result.ExitCode
 	}
@@ -543,20 +751,8 @@ type sessionResult struct {
 	StopReason    string
 	LoopDirective string
 	LoopLabel     string
+	Output        string
 	Usage         map[string]any
-}
-
-func loopDirectiveSeverity(d string) int {
-	switch d {
-	case "abort":
-		return 3
-	case "exit":
-		return 2
-	case "continue":
-		return 1
-	default:
-		return 0
-	}
 }
 
 type SessionWaitConfig struct {
@@ -586,6 +782,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 	var permissionDone <-chan permissionResult
 	var loopDirective string
 	var loopLabel string
+	var output strings.Builder
 	eventChClosed := false
 	tracker := newStatusTracker(cfg.SessionID, cfg.RunID, cfg.RunLabel)
 
@@ -647,7 +844,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 				if finalStopReason == "" {
 					return sessionResult{ExitCode: 1}
 				}
-				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Usage: bufferedUsage}
+				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Output: output.String(), Usage: bufferedUsage}
 			} else if progressTimer != nil {
 				if !progressTimer.Stop() {
 					select {
@@ -666,6 +863,9 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 			if event.Event == "agent.message_chunk" || event.Event == "agent.thought_chunk" {
 				if text := chunkText(event); text != "" {
 					chunkBuf.Append(text)
+					if event.Event == "agent.message_chunk" {
+						output.WriteString(text)
+					}
 					if phase, label, ok := chunkBuf.ScanStatusMarker(); ok {
 						if !writeStatus(tracker.ObserveMarker(phase, label)) {
 							return sessionResult{ExitCode: 1}
@@ -676,7 +876,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 					// The raw event still reaches tracker.Observe so the caller
 					// sees the full message text including the marker.
 					if dir, lbl, ok := chunkBuf.ScanLoopMarker(); ok {
-						if loopDirectiveSeverity(dir) > loopDirectiveSeverity(loopDirective) {
+						if phaseconfig.LoopDirectiveSeverity(dir) > phaseconfig.LoopDirectiveSeverity(loopDirective) {
 							loopDirective = dir
 							loopLabel = lbl
 						}
@@ -721,7 +921,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 				return sessionResult{ExitCode: 1}
 			}
 			if event.Event == "session.end" && promptReturned && permissionDone == nil {
-				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Usage: bufferedUsage}
+				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Output: output.String(), Usage: bufferedUsage}
 			}
 		case err := <-cfg.PromptDone:
 			promptReturned = true
@@ -733,7 +933,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 				return sessionResult{ExitCode: 1}
 			}
 			if finalStopReason != "" && permissionDone == nil {
-				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Usage: bufferedUsage}
+				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Output: output.String(), Usage: bufferedUsage}
 			}
 		case res := <-permissionDone:
 			permissionDone = nil
@@ -753,7 +953,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 			// If session.end + promptDone already arrived while we were waiting for
 			// AnswerPermission, exit now that the permission goroutine has resolved.
 			if finalStopReason != "" && promptReturned {
-				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Usage: bufferedUsage}
+				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Output: output.String(), Usage: bufferedUsage}
 			}
 			if eventChClosed && finalStopReason == "" {
 				return sessionResult{ExitCode: 1}
