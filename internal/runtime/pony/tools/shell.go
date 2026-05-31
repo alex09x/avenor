@@ -49,7 +49,7 @@ func DefaultShellConfig() ShellConfig {
 
 var allowedShellCommands = []string{
 	"go", "git", "make", "mise", "npm", "bun", "node",
-	"ls", "cat", "echo", "grep", "find", "head", "tail", "wc",
+	"ls", "cat", "echo", "grep", "rg", "find", "head", "tail", "wc",
 	"sort", "uniq", "diff", "mkdir", "rmdir", "cp", "mv", "rm",
 	"chmod", "date", "pwd", "which", "test", "python", "python3",
 }
