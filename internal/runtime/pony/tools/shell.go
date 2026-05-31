@@ -50,8 +50,10 @@ func DefaultShellConfig() ShellConfig {
 var allowedShellCommands = []string{
 	"go", "git", "make", "mise", "npm", "bun", "node",
 	"ls", "cat", "echo", "grep", "rg", "find", "head", "tail", "wc",
-	"sort", "uniq", "diff", "mkdir", "rmdir", "cp", "mv", "rm",
+	"sort", "uniq", "diff", "mkdir", "rmdir", "cp", "mv", "rm", "printf",
 	"chmod", "date", "pwd", "which", "test", "python", "python3",
+	"sed", "awk", "jq", "tr", "cut", "xargs",
+	"touch", "stat", "tee", "timeout", "bc", "expr", "tar", "zip", "unzip",
 }
 
 func NewShellTool() Tool {
