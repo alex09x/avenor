@@ -557,12 +557,29 @@ func TestRunTeamFileConfigErrorWritesErrorSentinel(t *testing.T) {
 func TestRunTeamFileFakeE2E(t *testing.T) {
 	oldNewProvider := newProvider
 	provider := newScriptedProvider()
+	var backendsMu sync.Mutex
+	var backends []string
 	newProvider = func(startOpts runtime.StartOptions, backend string) (runtime.Provider, error) {
+		backendsMu.Lock()
+		backends = append(backends, backend)
+		backendsMu.Unlock()
 		return provider, nil
 	}
 	t.Cleanup(func() { newProvider = oldNewProvider })
 
 	dir := t.TempDir()
+	xdgDir := filepath.Join(dir, "xdg")
+	opencodeDir := filepath.Join(xdgDir, "opencode")
+	if err := os.MkdirAll(opencodeDir, 0o700); err != nil {
+		t.Fatalf("mkdir opencode config dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(opencodeDir, "opencode.json"), []byte(`{
+		"agent": {
+			"style-agent": {"model": "style-model"}
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("write opencode config: %v", err)
+	}
 	teamPath := filepath.Join(dir, "team.json")
 	eventsPath := filepath.Join(dir, "events.ndjson")
 	sentinelPath := filepath.Join(dir, "run.done")
@@ -570,7 +587,7 @@ func TestRunTeamFileFakeE2E(t *testing.T) {
 		"pre":[{"name":"decide","prompt":"decide reviewers"}],
 		"team":[
 			{"name":"security","prompt":"review security","conditional":true,"agent":"security-agent","model":"security-model"},
-			{"name":"style","prompt":"review style","agent":"style-agent","model":"style-model"}
+			{"name":"style","prompt":"review style","agent":"style-agent"}
 		],
 		"post":[{"name":"report","prompt":"summarize findings"}]
 	}`
@@ -580,13 +597,19 @@ func TestRunTeamFileFakeE2E(t *testing.T) {
 
 	var stderr strings.Builder
 	exitCode := run([]string{
+		"--backend", "gemini-acp",
 		"--team-file", teamPath,
 		"--on-event", eventsPath,
 		"--sentinel-file", sentinelPath,
 		"--run-id", "run_team_e2e",
 		"--agent", "default-agent",
 		"--model", "default-model",
-	}, func(string) string { return "" }, &stderr)
+	}, func(key string) string {
+		if key == "XDG_CONFIG_HOME" {
+			return xdgDir
+		}
+		return ""
+	}, &stderr)
 	if exitCode != 0 {
 		t.Fatalf("run() = %d, want 0; stderr=%s", exitCode, stderr.String())
 	}
@@ -661,6 +684,17 @@ func TestRunTeamFileFakeE2E(t *testing.T) {
 	}
 	if !sawPre || !sawStyle || !sawPost {
 		t.Fatalf("did not observe all expected phases in provider snapshot: %+v", sessions)
+	}
+
+	backendsMu.Lock()
+	defer backendsMu.Unlock()
+	if len(backends) != 3 {
+		t.Fatalf("provider backends = %v, want 3 gemini-acp entries", backends)
+	}
+	for _, backend := range backends {
+		if backend != "gemini-acp" {
+			t.Fatalf("provider backends = %v, want only gemini-acp", backends)
+		}
 	}
 }
 
@@ -2799,4 +2833,112 @@ func TestWaitForSessionAccumulatesAgentMessageOutput(t *testing.T) {
 	if result.Output != "[team: skip | security]" {
 		t.Fatalf("Output = %q, want assistant output only", result.Output)
 	}
+}
+
+func TestWaitForSessionAccumulatesDeltaAgentMessageOutput(t *testing.T) {
+	eventCh := make(chan events.Event, 3)
+	eventCh <- events.Event{
+		Event:     "agent.message_chunk",
+		SessionID: "ses_output",
+		Fields: map[string]any{
+			"delta": "[team: skip | security-reviewer]",
+		},
+	}
+	eventCh <- events.Event{
+		Event:     "agent.thought_chunk",
+		SessionID: "ses_output",
+		Fields: map[string]any{
+			"delta": "internal reasoning",
+		},
+	}
+	eventCh <- events.Event{
+		Event:     "session.end",
+		SessionID: "ses_output",
+		Fields:    map[string]any{"stop_reason": "end_turn"},
+	}
+	close(eventCh)
+
+	promptDone := make(chan error, 1)
+	promptDone <- nil
+
+	writer, err := NewEventWriter("")
+	if err != nil {
+		t.Fatalf("NewEventWriter(\"\") error = %v", err)
+	}
+	defer writer.Close()
+
+	result := waitForSessionForTest(context.Background(), &cliFakeProvider{}, writer, nil, nil, eventCh, promptDone, nil, "ses_output", "run_output", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
+	if result.Output != "[team: skip | security-reviewer]" {
+		t.Fatalf("Output = %q, want delta assistant output only", result.Output)
+	}
+}
+
+func TestWaitForSessionFinalReply(t *testing.T) {
+	runFinalReplyTest := func(t *testing.T, evts []events.Event, wantOutput, wantFinalReply string) {
+		t.Helper()
+		eventCh := make(chan events.Event, len(evts)+1)
+		for _, ev := range evts {
+			eventCh <- ev
+		}
+		eventCh <- events.Event{
+			Event:     "session.end",
+			SessionID: "ses_output",
+			Fields:    map[string]any{"stop_reason": "end_turn"},
+		}
+		close(eventCh)
+
+		promptDone := make(chan error, 1)
+		promptDone <- nil
+
+		writer, err := NewEventWriter("")
+		if err != nil {
+			t.Fatalf("NewEventWriter(\"\") error = %v", err)
+		}
+		defer writer.Close()
+
+		result := waitForSessionForTest(context.Background(), &cliFakeProvider{}, writer, nil, nil, eventCh, promptDone, nil, "ses_output", "run_output", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
+		if result.Output != wantOutput {
+			t.Fatalf("Output = %q, want %q", result.Output, wantOutput)
+		}
+		if result.FinalReply != wantFinalReply {
+			t.Fatalf("FinalReply = %q, want %q", result.FinalReply, wantFinalReply)
+		}
+	}
+
+	msg := func(delta string) events.Event {
+		return events.Event{Event: "agent.message_chunk", SessionID: "ses_output", Fields: map[string]any{"delta": delta}}
+	}
+	toolCall := events.Event{Event: "tool.call", SessionID: "ses_output", Fields: map[string]any{"kind": "shell", "title": "shell"}}
+
+	t.Run("single turn with tool call then final text", func(t *testing.T) {
+		runFinalReplyTest(t, []events.Event{
+			msg("Let me check."),
+			toolCall,
+			msg("Here are findings:"),
+			msg(" No issues."),
+		}, "Let me check.Here are findings: No issues.", "Here are findings: No issues.")
+	})
+
+	t.Run("zero tool calls — FinalReply equals full Output", func(t *testing.T) {
+		runFinalReplyTest(t, []events.Event{
+			msg("Summary only."),
+		}, "Summary only.", "Summary only.")
+	})
+
+	t.Run("multiple tool calls — only last block captured", func(t *testing.T) {
+		runFinalReplyTest(t, []events.Event{
+			msg("Checking files."),
+			toolCall,
+			msg("Checking tests."),
+			toolCall,
+			msg("Final answer."),
+		}, "Checking files.Checking tests.Final answer.", "Final answer.")
+	})
+
+	t.Run("tool call at end with no subsequent text — FinalReply empty", func(t *testing.T) {
+		runFinalReplyTest(t, []events.Event{
+			msg("Initial thought."),
+			toolCall,
+		}, "Initial thought.", "")
+	})
 }

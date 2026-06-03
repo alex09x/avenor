@@ -161,79 +161,82 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "avenor: %v\n", err)
 			return exitWithSentinel(1)
 		}
-		profile, err := ponyCfg.ResolveProfile(*agent)
-		if err != nil {
-			fmt.Fprintf(stderr, "avenor: %v\n", err)
-			return exitWithSentinel(1)
-		}
+		profileConfigs := make(map[string]pony.Config, len(ponyCfg.Profiles))
+		configDir := filepath.Dir(*ponyConfig)
+		for name, profile := range ponyCfg.Profiles {
+			resolvedBaseURL := ponyCfg.BaseURL
+			resolvedAPIKeyEnv := ponyCfg.APIKeyEnv
+			if profile.BaseURL != "" {
+				resolvedBaseURL = profile.BaseURL
+			}
+			if profile.APIKeyEnv != "" {
+				resolvedAPIKeyEnv = profile.APIKeyEnv
+			}
 
-		// Resolve base_url and api_key_env — profile overrides top-level
-		resolvedBaseURL := ponyCfg.BaseURL
-		resolvedAPIKeyEnv := ponyCfg.APIKeyEnv
-		if profile.BaseURL != "" {
-			resolvedBaseURL = profile.BaseURL
-		}
-		if profile.APIKeyEnv != "" {
-			resolvedAPIKeyEnv = profile.APIKeyEnv
-		}
-
-		adapter, err := openai.New(openai.Config{
-			BaseURL: resolvedBaseURL,
-			APIKey:  os.Getenv(resolvedAPIKeyEnv),
-		})
-		if err != nil {
-			fmt.Fprintf(stderr, "avenor: %v\n", err)
-			return exitWithSentinel(1)
-		}
-
-		var executor pony.OrchestratorExecutor
-		if profile.Tools.Orchestration && *controlSocket != "" {
-			var err error
-			executor, err = pony.NewControlSocketExecutor(*controlSocket)
+			adapter, err := openai.New(openai.Config{
+				BaseURL: resolvedBaseURL,
+				APIKey:  getenv(resolvedAPIKeyEnv),
+			})
 			if err != nil {
 				fmt.Fprintf(stderr, "avenor: %v\n", err)
 				return exitWithSentinel(1)
 			}
+
+			var executor pony.OrchestratorExecutor
+			if profile.Tools.Orchestration && *controlSocket != "" {
+				executor, err = pony.NewControlSocketExecutor(*controlSocket)
+				if err != nil {
+					fmt.Fprintf(stderr, "avenor: %v\n", err)
+					return exitWithSentinel(1)
+				}
+			}
+
+			systemPrompt := profile.SystemPrompt
+			initialPrompt := profile.InitialPrompt
+			var allowedDirs []string
+			if len(profile.Skills) > 0 {
+				skills, err := pony.LoadSkills(configDir, profile.Skills)
+				if err != nil {
+					fmt.Fprintf(stderr, "avenor: %v\n", err)
+					return exitWithSentinel(1)
+				}
+				systemPrompt, initialPrompt = pony.MergeSkills(systemPrompt, initialPrompt, skills)
+
+				if skillsDir := os.Getenv("PONY_SKILLS_DIR"); skillsDir != "" {
+					allowedDirs = append(allowedDirs, skillsDir)
+				}
+				if configDir != "" {
+					allowedDirs = append(allowedDirs, filepath.Join(configDir, ".pony"))
+				}
+			}
+
+			profileConfigs[name] = pony.Config{
+				Adapter:          adapter,
+				Model:            profile.Model,
+				MaxTokens:        profile.MaxTokens,
+				SystemPrompt:     systemPrompt,
+				InitialPrompt:    initialPrompt,
+				Executor:         executor,
+				LocalTools:       profile.Tools.Local,
+				OrchTools:        profile.Tools.Orchestration,
+				WorkingDir:       *dir,
+				InjectAgentsMD:   profile.InjectAgentsMD,
+				ToolApproval:     profile.ToolApproval,
+				ShellConfig:      profile.ShellConfig,
+				FileReadConfig:   profile.FileReadConfig,
+				AllowedReadDirs:  allowedDirs,
+				Context:          profile.Context,
+				CompactionPrompt: profile.CompactionPrompt,
+			}
 		}
 
-		// Load skills and merge prompts
-		systemPrompt := profile.SystemPrompt
-		initialPrompt := profile.InitialPrompt
-		var allowedDirs []string
-		if len(profile.Skills) > 0 {
-			configDir := filepath.Dir(*ponyConfig)
-			skills, err := pony.LoadSkills(configDir, profile.Skills)
-			if err != nil {
-				fmt.Fprintf(stderr, "avenor: %v\n", err)
+		pony.SetGlobalProfiles(ponyCfg.DefaultAgent, profileConfigs)
+		if *agent != "" {
+			if _, ok := profileConfigs[*agent]; !ok {
+				fmt.Fprintf(stderr, "avenor: pony config: unknown profile %q\n", *agent)
 				return exitWithSentinel(1)
 			}
-			systemPrompt, initialPrompt = pony.MergeSkills(systemPrompt, initialPrompt, skills)
-
-			// Add skill discovery dirs to allowed dirs for file_read/shell access
-			if skillsDir := os.Getenv("PONY_SKILLS_DIR"); skillsDir != "" {
-				allowedDirs = append(allowedDirs, skillsDir)
-			}
-			if configDir != "" {
-				allowedDirs = append(allowedDirs, filepath.Join(configDir, ".pony"))
-			}
 		}
-
-		pCfg := pony.Config{
-			Adapter:         adapter,
-			Model:           profile.Model,
-			MaxTokens:       profile.MaxTokens,
-			SystemPrompt:    systemPrompt,
-			InitialPrompt:   initialPrompt,
-			Executor:        executor,
-			LocalTools:      profile.Tools.Local,
-			OrchTools:       profile.Tools.Orchestration,
-			WorkingDir:      *dir,
-			InjectAgentsMD:  profile.InjectAgentsMD,
-			ToolApproval:    profile.ToolApproval,
-			ShellConfig:     profile.ShellConfig,
-			AllowedReadDirs: allowedDirs,
-		}
-		pony.SetGlobalConfig(&pCfg)
 	}
 
 	if *prompt != "" && *promptFile != "" {
@@ -331,7 +334,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	}
 
 	if *agent != "" && *model == "" {
-		resolved, err := resolveAgentModel(*agent)
+		resolved, err := resolveAgentModel(*agent, getenv)
 		if err != nil {
 			fmt.Fprintf(stderr, "avenor: %v\n", err)
 		}
@@ -402,6 +405,14 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		}
 		if phase.Model != "" {
 			m = phase.Model
+		} else if phase.Agent != "" {
+			resolved, err := resolveAgentModel(phase.Agent, getenv)
+			if err != nil {
+				return teamrunner.PhaseAttemptResult{ExitCode: 1}, err
+			}
+			if resolved != "" {
+				m = resolved
+			}
 		}
 		r := execAttempt(ctx, a, m, prevSessionID, phase.Prompt)
 		return teamrunner.PhaseAttemptResult{
@@ -411,6 +422,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			LoopDirective: r.loopDirective,
 			LoopLabel:     r.loopLabel,
 			Output:        r.output,
+			FinalReply:    r.finalReply,
 		}, nil
 	}
 
@@ -752,6 +764,7 @@ type sessionResult struct {
 	LoopDirective string
 	LoopLabel     string
 	Output        string
+	FinalReply    string
 	Usage         map[string]any
 }
 
@@ -783,6 +796,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 	var loopDirective string
 	var loopLabel string
 	var output strings.Builder
+	var finalReply strings.Builder
 	eventChClosed := false
 	tracker := newStatusTracker(cfg.SessionID, cfg.RunID, cfg.RunLabel)
 
@@ -844,7 +858,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 				if finalStopReason == "" {
 					return sessionResult{ExitCode: 1}
 				}
-				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Output: output.String(), Usage: bufferedUsage}
+				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Output: output.String(), FinalReply: finalReply.String(), Usage: bufferedUsage}
 			} else if progressTimer != nil {
 				if !progressTimer.Stop() {
 					select {
@@ -860,11 +874,15 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 				}
 			}
 			markerHandled := false
+			if event.Event == "tool.call" {
+				finalReply.Reset()
+			}
 			if event.Event == "agent.message_chunk" || event.Event == "agent.thought_chunk" {
 				if text := chunkText(event); text != "" {
 					chunkBuf.Append(text)
 					if event.Event == "agent.message_chunk" {
 						output.WriteString(text)
+						finalReply.WriteString(text)
 					}
 					if phase, label, ok := chunkBuf.ScanStatusMarker(); ok {
 						if !writeStatus(tracker.ObserveMarker(phase, label)) {
@@ -921,7 +939,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 				return sessionResult{ExitCode: 1}
 			}
 			if event.Event == "session.end" && promptReturned && permissionDone == nil {
-				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Output: output.String(), Usage: bufferedUsage}
+				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Output: output.String(), FinalReply: finalReply.String(), Usage: bufferedUsage}
 			}
 		case err := <-cfg.PromptDone:
 			promptReturned = true
@@ -933,7 +951,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 				return sessionResult{ExitCode: 1}
 			}
 			if finalStopReason != "" && permissionDone == nil {
-				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Output: output.String(), Usage: bufferedUsage}
+				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Output: output.String(), FinalReply: finalReply.String(), Usage: bufferedUsage}
 			}
 		case res := <-permissionDone:
 			permissionDone = nil
@@ -953,7 +971,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 			// If session.end + promptDone already arrived while we were waiting for
 			// AnswerPermission, exit now that the permission goroutine has resolved.
 			if finalStopReason != "" && promptReturned {
-				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Output: output.String(), Usage: bufferedUsage}
+				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Output: output.String(), FinalReply: finalReply.String(), Usage: bufferedUsage}
 			}
 			if eventChClosed && finalStopReason == "" {
 				return sessionResult{ExitCode: 1}
@@ -1216,13 +1234,9 @@ func ParsePermissionHandler(value string) (*permission.FileHandler, error) {
 // resolveAgentModel reads opencode's config and returns the configured model
 // for the given agent name. Returns ("", nil) if not found. Returns a non-nil
 // error only when a config file exists but cannot be parsed (malformed JSON).
-func resolveAgentModel(agentName string) (string, error) {
-	dir := opencodeConfigDir()
-	if dir == "" {
-		return "", nil
-	}
-	for _, name := range []string{"opencode.json", "opencode.jsonc"} {
-		model, err := readAgentModel(filepath.Join(dir, name), agentName)
+func resolveAgentModel(agentName string, getenv func(string) string) (string, error) {
+	for _, path := range opencodeConfigPaths(getenv) {
+		model, err := readAgentModel(path, agentName)
 		if err != nil {
 			return "", err
 		}
@@ -1233,15 +1247,26 @@ func resolveAgentModel(agentName string) (string, error) {
 	return "", nil
 }
 
-func opencodeConfigDir() string {
-	if dir := os.Getenv("OPENCODE_CONFIG_DIR"); dir != "" {
-		return dir
+func opencodeConfigPaths(getenv func(string) string) []string {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	if path := getenv("OPENCODE_CONFIG"); path != "" {
+		return []string{path}
+	}
+	if dir := getenv("OPENCODE_CONFIG_DIR"); dir != "" {
+		return []string{filepath.Join(dir, "opencode.json"), filepath.Join(dir, "opencode.jsonc")}
+	}
+	if xdg := getenv("XDG_CONFIG_HOME"); xdg != "" {
+		dir := filepath.Join(xdg, "opencode")
+		return []string{filepath.Join(dir, "opencode.json"), filepath.Join(dir, "opencode.jsonc")}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ""
+		return nil
 	}
-	return filepath.Join(home, ".config", "opencode")
+	dir := filepath.Join(home, ".config", "opencode")
+	return []string{filepath.Join(dir, "opencode.json"), filepath.Join(dir, "opencode.jsonc")}
 }
 
 func readAgentModel(path, agentName string) (string, error) {

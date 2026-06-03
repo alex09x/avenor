@@ -49,12 +49,11 @@ type fakeAdapter struct {
 	chunks          []model.Chunk
 	chunkDelay      time.Duration
 	callCount       int
+	streamCount     atomic.Int64
 	mutualExclusion bool // when true, use atomic counter for thread-safe call counting
 	streamFunc      func(ctx context.Context, req model.Request) (<-chan model.Chunk, error)
 	onStream        func() // called when Stream is invoked (for synchronization)
 }
-
-var adapterCallCount int64
 
 func (f *fakeAdapter) Name() string { return "fake" }
 
@@ -63,7 +62,7 @@ func (f *fakeAdapter) Stream(ctx context.Context, req model.Request) (<-chan mod
 		return f.streamFunc(ctx, req)
 	}
 	if f.mutualExclusion {
-		atomic.AddInt64(&adapterCallCount, 1)
+		f.streamCount.Add(1)
 	} else {
 		f.callCount++
 	}
@@ -87,21 +86,19 @@ func (f *fakeAdapter) Stream(ctx context.Context, req model.Request) (<-chan mod
 	return ch, nil
 }
 
-
-
 // fakeExecutor implements OrchestratorExecutor for orchestration tool tests.
 type fakeExecutor struct {
-	spawnCalled    int
-	sendCalled     int
-	lastRequestID  string
-	statusCalled   int
-	waitCalled     int
+	spawnCalled        int
+	sendCalled         int
+	lastRequestID      string
+	statusCalled       int
+	waitCalled         int
 	sendToParentCalled int
-	spawnDelay     time.Duration
-	waitDone       bool
-	waitErr        error
-	spawnID        string
-	getStatusResp  map[string]any
+	spawnDelay         time.Duration
+	waitDone           bool
+	waitErr            error
+	spawnID            string
+	getStatusResp      map[string]any
 }
 
 func (f *fakeExecutor) SpawnAgent(ctx context.Context, params map[string]any) (string, error) {
@@ -154,7 +151,6 @@ func (f *fakeExecutor) SendToParent(ctx context.Context, runtimeID, message stri
 	f.sendToParentCalled++
 	return nil
 }
-
 
 // ── RunLoop tests ────────────────────────────────────────────────────────────
 
@@ -277,7 +273,6 @@ func TestRunLoop_textToolCalls_stop(t *testing.T) {
 		t.Errorf("tool_call_id = %q, want %q", toolMsg.ToolCallID, "tc1")
 	}
 }
-
 
 func TestRunLoop_toolExecuteError(t *testing.T) {
 	ctx := context.Background()
@@ -616,7 +611,6 @@ func TestRunLoop_stopConditionOnToolCalls(t *testing.T) {
 	}
 }
 
-
 // ── LoopWithRetry tests ──────────────────────────────────────────────────────
 
 func TestLoopWithRetry_succeedsFirstAttempt(t *testing.T) {
@@ -644,8 +638,8 @@ func TestLoopWithRetry_succeedsFirstAttempt(t *testing.T) {
 	if len(history) != 2 {
 		t.Errorf("history length = %d, want 2", len(history))
 	}
-	if atomic.LoadInt64(&adapterCallCount) != 1 {
-		t.Errorf("call count = %d, want 1", atomic.LoadInt64(&adapterCallCount))
+	if adapter.streamCount.Load() != 1 {
+		t.Errorf("call count = %d, want 1", adapter.streamCount.Load())
 	}
 }
 
@@ -747,7 +741,6 @@ func TestLoopWithRetry_contextCancelledDuringBackoff(t *testing.T) {
 	}
 }
 
-
 // ── Provider tests ───────────────────────────────────────────────────────────
 
 func TestProvider_Capabilities(t *testing.T) {
@@ -770,13 +763,57 @@ func TestProvider_Capabilities(t *testing.T) {
 	}
 }
 
+func TestSystemPromptWithToolInstructions(t *testing.T) {
+	t.Run("no tools keeps base prompt unchanged", func(t *testing.T) {
+		got := systemPromptWithToolInstructions("You are helpful.", false, false)
+		if got != "You are helpful." {
+			t.Fatalf("prompt = %q", got)
+		}
+	})
+
+		t.Run("local tools prefer structured tools and strict shell argv", func(t *testing.T) {
+			got := systemPromptWithToolInstructions("You are helpful.", true, false)
+			if !strings.Contains(got, "You are helpful.") {
+				t.Fatalf("prompt missing base: %q", got)
+			}
+		if !strings.Contains(got, "Prefer structured tools") {
+			t.Fatalf("prompt missing structured-tool guidance: %q", got)
+		}
+		if !strings.Contains(got, "For shell, prefer cmd plus args") {
+			t.Fatalf("prompt missing shell argv guidance: %q", got)
+		}
+			if !strings.Contains(got, `Use shell only when no structured tool fits`) {
+				t.Fatalf("prompt missing shell fallback guidance: %q", got)
+			}
+			if !strings.Contains(got, `{"cmd":"git","args":["diff","--stat","base...head"]}`) {
+				t.Fatalf("prompt missing git example: %q", got)
+			}
+			if !strings.Contains(got, `{"cmd":"ls","args":["packages"]}`) {
+				t.Fatalf("prompt missing ls example: %q", got)
+			}
+			if strings.Contains(got, "spawn_agents") {
+				t.Fatalf("prompt unexpectedly included orchestration guidance: %q", got)
+			}
+		})
+
+	t.Run("orchestration tools add orchestration guidance", func(t *testing.T) {
+		got := systemPromptWithToolInstructions("", false, true)
+		if !strings.Contains(got, "spawn_agents") || !strings.Contains(got, "wait_for_done") {
+			t.Fatalf("prompt missing orchestration guidance: %q", got)
+		}
+		if strings.Contains(got, "For shell") {
+			t.Fatalf("prompt unexpectedly included local tool guidance: %q", got)
+		}
+	})
+}
+
 func TestProvider_Start(t *testing.T) {
 	ctx := context.Background()
 	p := New(Config{
-		Model:           "test-model",
-		SystemPrompt:    "You are helpful.",
-		InitialPrompt:   "Hello!",
-		WorkingDir:      "/tmp",
+		Model:         "test-model",
+		SystemPrompt:  "You are helpful.",
+		InitialPrompt: "Hello!",
+		WorkingDir:    "/tmp",
 	})
 
 	session, err := p.Start(ctx, runtime.StartOptions{Dir: "/test"})
@@ -813,13 +850,146 @@ func TestProvider_Start_multipleSessions(t *testing.T) {
 }
 
 func TestProvider_Resume(t *testing.T) {
+	cleanGlobalSessions(t)
 	ctx := context.Background()
-	p := New(Config{Model: "test-model"})
+	p := New(Config{Model: "test-model", WorkingDir: t.TempDir()})
 
-	_, err := p.Resume(ctx, "pony_1")
-	if err == nil {
-		t.Fatal("expected error from Resume, got nil")
+	s1, err := p.Start(ctx, runtime.StartOptions{})
+	if err != nil {
+		t.Fatalf("Start error: %v", err)
 	}
+
+	s2, err := p.Resume(ctx, s1.SessionID)
+	if err != nil {
+		t.Fatalf("Resume error: %v", err)
+	}
+	if s2.SessionID != s1.SessionID {
+		t.Errorf("resumed SessionID = %q, want %q", s2.SessionID, s1.SessionID)
+	}
+	if s2.Backend != backendID {
+		t.Errorf("resumed Backend = %q, want %q", s2.Backend, backendID)
+	}
+
+	// Resuming an unknown session should still error
+	_, err = p.Resume(ctx, "nonexistent")
+	if err == nil {
+		t.Fatal("expected error for unknown session, got nil")
+	}
+}
+
+func TestProvider_Resume_thenPromptExtendsHistory(t *testing.T) {
+	cleanGlobalSessions(t)
+	ctx := context.Background()
+	p := New(Config{
+		Model:    "test-model",
+		Adapter:  &fakeAdapter{chunks: []model.Chunk{textChunk("ack"), finishChunk("stop")}},
+		MaxTokens: 100,
+	})
+
+	s1, err := p.Start(ctx, runtime.StartOptions{})
+	if err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+
+	// First prompt — adds to history
+	if err := p.Prompt(ctx, s1.SessionID, "first question"); err != nil {
+		t.Fatalf("first Prompt error: %v", err)
+	}
+
+	// Resume the session
+	s2, err := p.Resume(ctx, s1.SessionID)
+	if err != nil {
+		t.Fatalf("Resume error: %v", err)
+	}
+
+	// Second prompt — should extend existing history with 4+ messages
+	// (system + user("first question") + assistant + user("second question"))
+	if err := p.Prompt(ctx, s2.SessionID, "second question"); err != nil {
+		t.Fatalf("second Prompt error: %v", err)
+	}
+
+	// Verify the session has extended history
+	p.mu.Lock()
+	ss, ok := p.sessions[s1.SessionID]
+	p.mu.Unlock()
+	if !ok {
+		t.Fatal("session not found after resume + prompt")
+	}
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+
+	// History should have at least 4 messages:
+	// user("first") + assistant + user("second") + assistant
+	if len(ss.history) < 4 {
+		t.Fatalf("history length = %d, want >= 4 (2 user + 2 assistant rounds)", len(ss.history))
+	}
+	lastUser := ss.history[len(ss.history)-2]
+	if lastUser.Role != model.RoleUser || lastUser.Content != "second question" {
+		t.Errorf("last user message = %+v, want user: second question", lastUser)
+	}
+}
+
+func TestProvider_Resume_crossProvider(t *testing.T) {
+	cleanGlobalSessions(t)
+	ctx := context.Background()
+	adapter := &fakeAdapter{chunks: []model.Chunk{textChunk("ack"), finishChunk("stop")}}
+
+	// Provider A: Start and Prompt
+	pA := New(Config{Model: "test-model", Adapter: adapter, MaxTokens: 100})
+	s1, err := pA.Start(ctx, runtime.StartOptions{})
+	if err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	if err := pA.Prompt(ctx, s1.SessionID, "first question"); err != nil {
+		t.Fatalf("first Prompt error: %v", err)
+	}
+
+	// Provider B: Resume the session and Prompt again
+	pB := New(Config{Model: "test-model", Adapter: adapter, MaxTokens: 100})
+	s2, err := pB.Resume(ctx, s1.SessionID)
+	if err != nil {
+		t.Fatalf("Resume on provider B error: %v", err)
+	}
+	if s2.SessionID != s1.SessionID {
+		t.Errorf("resumed SessionID = %q, want %q", s2.SessionID, s1.SessionID)
+	}
+	if err := pB.Prompt(ctx, s2.SessionID, "second question"); err != nil {
+		t.Fatalf("second Prompt error: %v", err)
+	}
+
+	// Verify history was preserved across providers
+	globalSessionsMu.Lock()
+	ss, ok := globalSessions[s1.SessionID]
+	globalSessionsMu.Unlock()
+	if !ok {
+		t.Fatal("session not found in global store")
+	}
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if len(ss.history) < 4 {
+		t.Fatalf("history length = %d, want >= 4 (2 user + 2 assistant rounds)", len(ss.history))
+	}
+	// Verify the conversation context carried over
+	foundFirst := false
+	foundSecond := false
+	for _, msg := range ss.history {
+		if msg.Role == model.RoleUser && msg.Content == "first question" {
+			foundFirst = true
+		}
+		if msg.Role == model.RoleUser && msg.Content == "second question" {
+			foundSecond = true
+		}
+	}
+	if !foundFirst || !foundSecond {
+		t.Errorf("history missing expected user messages (found first=%v, second=%v)", foundFirst, foundSecond)
+	}
+}
+
+func cleanGlobalSessions(t *testing.T) {
+	t.Helper()
+	globalSessionsMu.Lock()
+	globalSessions = make(map[string]*sessionState)
+	globalSessionsMu.Unlock()
 }
 
 func TestProvider_Prompt_unknownSession(t *testing.T) {
@@ -895,7 +1065,6 @@ func TestProvider_Events_unknownSession(t *testing.T) {
 		t.Fatal("expected error for unknown session, got nil")
 	}
 }
-
 
 func TestProvider_Start_withAgentsMD(t *testing.T) {
 	ctx := context.Background()
@@ -1003,6 +1172,78 @@ func TestProvider_NewWithOptions_noGlobalConfig(t *testing.T) {
 	}
 }
 
+func TestProvider_NewWithOptions_profileByAgent(t *testing.T) {
+	SetGlobalProfiles("primary", map[string]Config{
+		"primary": {Model: "primary-model", WorkingDir: "/primary"},
+		"mule":    {Model: "mule-model", WorkingDir: "/mule"},
+	})
+
+	p := NewWithOptions(runtime.StartOptions{Agent: "mule", Dir: "/override"})
+
+	p.mu.Lock()
+	gotCfg := p.cfg
+	p.mu.Unlock()
+
+	if gotCfg.Model != "mule-model" {
+		t.Errorf("model = %q, want %q", gotCfg.Model, "mule-model")
+	}
+	if gotCfg.WorkingDir != "/override" {
+		t.Errorf("working dir = %q, want %q", gotCfg.WorkingDir, "/override")
+	}
+}
+
+func TestProvider_NewWithOptions_profileModelOverride(t *testing.T) {
+	SetGlobalProfiles("primary", map[string]Config{
+		"primary": {Model: "primary-model"},
+		"mule":    {Model: "mule-model"},
+	})
+
+	p := NewWithOptions(runtime.StartOptions{Agent: "mule", Model: "forced-model", Dir: "/d"})
+
+	p.mu.Lock()
+	gotCfg := p.cfg
+	p.mu.Unlock()
+
+	if gotCfg.Model != "forced-model" {
+		t.Errorf("model = %q, want %q", gotCfg.Model, "forced-model")
+	}
+}
+
+func TestProvider_NewWithOptions_profileDefaultAgentFallback(t *testing.T) {
+	SetGlobalProfiles("primary", map[string]Config{
+		"primary": {Model: "primary-model", WorkingDir: "/primary"},
+		"mule":    {Model: "mule-model", WorkingDir: "/mule"},
+	})
+
+	p := NewWithOptions(runtime.StartOptions{Dir: "/override"})
+
+	p.mu.Lock()
+	gotCfg := p.cfg
+	p.mu.Unlock()
+
+	if gotCfg.Model != "primary-model" {
+		t.Errorf("model = %q, want %q", gotCfg.Model, "primary-model")
+	}
+	if gotCfg.WorkingDir != "/override" {
+		t.Errorf("working dir = %q, want %q", gotCfg.WorkingDir, "/override")
+	}
+}
+
+func TestProvider_NewWithOptions_profileUnknownAgentFailsClosed(t *testing.T) {
+	SetGlobalProfiles("primary", map[string]Config{
+		"primary": {Model: "primary-model"},
+		"mule":    {Model: "mule-model"},
+	})
+
+	p := NewWithOptions(runtime.StartOptions{Agent: "unknown-agent", Dir: "/override"})
+	_, err := p.Start(context.Background(), runtime.StartOptions{})
+	if err == nil {
+		t.Fatal("expected start error for unknown profile")
+	}
+	if !strings.Contains(err.Error(), "unknown profile") {
+		t.Fatalf("error = %q, want contains %q", err.Error(), "unknown profile")
+	}
+}
 
 // ── Orchestration tools tests ────────────────────────────────────────────────
 
@@ -1186,7 +1427,6 @@ func TestOrchestrationTools_sendToParentMissingMessage(t *testing.T) {
 		t.Fatal("expected error for missing message, got nil")
 	}
 }
-
 
 // ── e2e tool with real file read ─────────────────────────────────────────────
 

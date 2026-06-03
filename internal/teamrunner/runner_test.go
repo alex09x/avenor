@@ -3,13 +3,17 @@ package teamrunner
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/phaseconfig"
+	"github.com/sdougbrown/avenor/internal/runtime"
 )
 
 // ---- Test helpers ----
@@ -19,10 +23,13 @@ type discardEventWriter struct{}
 func (discardEventWriter) Write(events.Event) error { return nil }
 
 type recordingEventWriter struct {
+	mu     sync.Mutex
 	events []events.Event
 }
 
 func (w *recordingEventWriter) Write(ev events.Event) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.events = append(w.events, ev)
 	return nil
 }
@@ -49,6 +56,7 @@ func TestRunHappyPath(t *testing.T) {
 	)
 
 	var order []string
+	var orderMu sync.Mutex
 	sink := &recordingEventWriter{}
 	result, err := Run(context.Background(), RunOptions{
 		WorkDir:   t.TempDir(),
@@ -56,7 +64,9 @@ func TestRunHappyPath(t *testing.T) {
 		EventSink: sink,
 		Config:    cfg,
 		PhaseAttempt: func(ctx context.Context, phase phaseconfig.Phase, attemptNum int, prevSessionID string) (PhaseAttemptResult, error) {
+			orderMu.Lock()
 			order = append(order, phase.Name)
+			orderMu.Unlock()
 			return PhaseAttemptResult{ExitCode: 0, SessionID: phase.Name + "-session"}, nil
 		},
 	})
@@ -131,6 +141,7 @@ func TestRunAbortInTeamMember(t *testing.T) {
 	cfg := makeConfig(nil, []phaseconfig.Phase{simplePhase("security", "review"), simplePhase("style", "review")}, nil)
 
 	var executed []string
+	var executedMu sync.Mutex
 	sink := &recordingEventWriter{}
 	result, err := Run(context.Background(), RunOptions{
 		WorkDir:   t.TempDir(),
@@ -138,7 +149,9 @@ func TestRunAbortInTeamMember(t *testing.T) {
 		EventSink: sink,
 		Config:    cfg,
 		PhaseAttempt: func(ctx context.Context, phase phaseconfig.Phase, attemptNum int, prevSessionID string) (PhaseAttemptResult, error) {
+			executedMu.Lock()
 			executed = append(executed, phase.Name)
+			executedMu.Unlock()
 			if phase.Name == "security" {
 				return PhaseAttemptResult{
 					ExitCode:      5,
@@ -183,13 +196,16 @@ func TestRunMemberFailureDoesNotCancelPeers(t *testing.T) {
 	cfg := makeConfig(nil, []phaseconfig.Phase{simplePhase("security", "review"), simplePhase("style", "review")}, nil)
 
 	var executed []string
+	var executedMu sync.Mutex
 	result, err := Run(context.Background(), RunOptions{
 		WorkDir:   t.TempDir(),
 		RunID:     "test-run",
 		EventSink: discardEventWriter{},
 		Config:    cfg,
 		PhaseAttempt: func(ctx context.Context, phase phaseconfig.Phase, attemptNum int, prevSessionID string) (PhaseAttemptResult, error) {
+			executedMu.Lock()
 			executed = append(executed, phase.Name)
+			executedMu.Unlock()
 			if phase.Name == "security" {
 				return PhaseAttemptResult{ExitCode: 2, StopReason: "refusal", SessionID: "sec-s"}, nil
 			}
@@ -732,7 +748,149 @@ func TestRunAgentModelOverride(t *testing.T) {
 	}
 }
 
-func TestRunPreAndPostIgnoreAgentModelOverride(t *testing.T) {
+func TestRunNudgesIncompletePhaseUntilRequiredFileExists(t *testing.T) {
+	dir := t.TempDir()
+	cfg := makeConfig(nil, []phaseconfig.Phase{{
+		Name:   "review",
+		Prompt: "review",
+		Requires: phaseconfig.PhaseRequirements{
+			Files: []string{"REVIEW_CODE.md"},
+		},
+	}}, nil)
+
+	var attempts int
+	var nudgePrompt string
+	var nudgePrevSession string
+	result, err := Run(context.Background(), RunOptions{
+		WorkDir:   dir,
+		RunID:     "test-run",
+		EventSink: discardEventWriter{},
+		Config:    cfg,
+		PhaseAttempt: func(ctx context.Context, phase phaseconfig.Phase, attemptNum int, prevSessionID string) (PhaseAttemptResult, error) {
+			attempts++
+			if attempts == 2 {
+				nudgePrompt = phase.Prompt
+				nudgePrevSession = prevSessionID
+				if err := os.WriteFile(filepath.Join(dir, "REVIEW_CODE.md"), []byte("done"), 0o600); err != nil {
+					return PhaseAttemptResult{}, err
+				}
+			}
+			return PhaseAttemptResult{ExitCode: 0, StopReason: "end_turn", SessionID: fmt.Sprintf("s%d", attempts)}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0", result.ExitCode)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want initial + nudge", attempts)
+	}
+	if nudgePrevSession != "s1" {
+		t.Fatalf("nudge prevSessionID = %q, want s1", nudgePrevSession)
+	}
+	if !strings.Contains(nudgePrompt, "REVIEW_CODE.md") || !strings.Contains(nudgePrompt, "Do not ask for permission") {
+		t.Fatalf("nudge prompt = %q, want default missing-file nudge", nudgePrompt)
+	}
+}
+
+func TestRunIncompleteRequiredFileFailsPhase(t *testing.T) {
+	dir := t.TempDir()
+	cfg := makeConfig(nil, []phaseconfig.Phase{{
+		Name:   "review",
+		Prompt: "review",
+		Requires: phaseconfig.PhaseRequirements{
+			Files: []string{"REVIEW_CODE.md"},
+		},
+		OnIncomplete: phaseconfig.PhaseOnIncomplete{MaxNudges: 1},
+	}}, nil)
+
+	result, err := Run(context.Background(), RunOptions{
+		WorkDir:   dir,
+		RunID:     "test-run",
+		EventSink: discardEventWriter{},
+		Config:    cfg,
+		PhaseAttempt: func(ctx context.Context, phase phaseconfig.Phase, attemptNum int, prevSessionID string) (PhaseAttemptResult, error) {
+			return PhaseAttemptResult{ExitCode: 0, StopReason: "end_turn", SessionID: "s1"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.ExitCode != 1 {
+		t.Fatalf("ExitCode = %d, want 1", result.ExitCode)
+	}
+	if result.StopReason != "incomplete_output" {
+		t.Fatalf("StopReason = %q, want incomplete_output", result.StopReason)
+	}
+}
+
+func TestRunDefaultNudgeUsesCurrentMissingFiles(t *testing.T) {
+	dir := t.TempDir()
+	cfg := makeConfig(nil, []phaseconfig.Phase{{
+		Name:   "review",
+		Prompt: "review",
+		Requires: phaseconfig.PhaseRequirements{
+			Files: []string{"REVIEW_CODE.md", "REVIEW_TESTS.md"},
+		},
+		OnIncomplete: phaseconfig.PhaseOnIncomplete{MaxNudges: 2},
+	}}, nil)
+
+	var nudgePrompts []string
+	_, err := Run(context.Background(), RunOptions{
+		WorkDir:   dir,
+		RunID:     "test-run",
+		EventSink: discardEventWriter{},
+		Config:    cfg,
+		PhaseAttempt: func(ctx context.Context, phase phaseconfig.Phase, attemptNum int, prevSessionID string) (PhaseAttemptResult, error) {
+			if attemptNum > 0 {
+				nudgePrompts = append(nudgePrompts, phase.Prompt)
+			}
+			if attemptNum == 1 {
+				if err := os.WriteFile(filepath.Join(dir, "REVIEW_CODE.md"), []byte("done"), 0o600); err != nil {
+					return PhaseAttemptResult{}, err
+				}
+			}
+			if attemptNum == 2 {
+				if err := os.WriteFile(filepath.Join(dir, "REVIEW_TESTS.md"), []byte("done"), 0o600); err != nil {
+					return PhaseAttemptResult{}, err
+				}
+			}
+			return PhaseAttemptResult{ExitCode: 0, StopReason: "end_turn", SessionID: fmt.Sprintf("s%d", attemptNum)}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(nudgePrompts) != 2 {
+		t.Fatalf("nudge prompts = %d, want 2", len(nudgePrompts))
+	}
+	if !strings.Contains(nudgePrompts[0], "REVIEW_CODE.md") || !strings.Contains(nudgePrompts[0], "REVIEW_TESTS.md") {
+		t.Fatalf("first nudge prompt = %q, want both missing files", nudgePrompts[0])
+	}
+	if strings.Contains(nudgePrompts[1], "REVIEW_CODE.md") || !strings.Contains(nudgePrompts[1], "REVIEW_TESTS.md") {
+		t.Fatalf("second nudge prompt = %q, want only REVIEW_TESTS.md", nudgePrompts[1])
+	}
+}
+
+func TestRequiredFilePathRejectsPathsOutsideWorkDir(t *testing.T) {
+	dir := t.TempDir()
+	for _, path := range []string{"/etc/passwd", "../outside", "nested/../../outside"} {
+		if _, ok := requiredFilePath(dir, path); ok {
+			t.Fatalf("requiredFilePath(%q) allowed path outside workdir", path)
+		}
+	}
+	fullPath, ok := requiredFilePath(dir, "nested/file.txt")
+	if !ok {
+		t.Fatal("expected relative path under workdir to be allowed")
+	}
+	if fullPath != filepath.Join(dir, "nested", "file.txt") {
+		t.Fatalf("fullPath = %q, want nested file under workdir", fullPath)
+	}
+}
+
+func TestRunAllTeamPhasesAllowAgentModelOverride(t *testing.T) {
 	cfg := makeConfig(
 		[]phaseconfig.Phase{{Name: "setup", Prompt: "setup", Agent: "pre-agent", Model: "pre-model"}},
 		[]phaseconfig.Phase{{Name: "review", Prompt: "review", Agent: "team-agent", Model: "team-model"}},
@@ -753,14 +911,14 @@ func TestRunPreAndPostIgnoreAgentModelOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if got["setup"] != [2]string{"", ""} {
-		t.Fatalf("pre phase override leaked through: %+v", got["setup"])
+	if got["setup"] != [2]string{"pre-agent", "pre-model"} {
+		t.Fatalf("pre phase overrides = %+v, want pre-agent/pre-model", got["setup"])
 	}
 	if got["review"] != [2]string{"team-agent", "team-model"} {
 		t.Fatalf("team phase overrides = %+v, want team-agent/team-model", got["review"])
 	}
-	if got["report"] != [2]string{"", ""} {
-		t.Fatalf("post phase override leaked through: %+v", got["report"])
+	if got["report"] != [2]string{"post-agent", "post-model"} {
+		t.Fatalf("post phase overrides = %+v, want post-agent/post-model", got["report"])
 	}
 }
 
@@ -877,6 +1035,45 @@ func TestRunPostPhaseReceivesTeamMemberOutput(t *testing.T) {
 	}
 }
 
+func TestRunTeamFinalOutputTemplate(t *testing.T) {
+	cfg := makeConfig(
+		nil,
+		[]phaseconfig.Phase{
+			simplePhase("worker-a", "do work a"),
+			simplePhase("worker-b", "do work b"),
+		},
+		[]phaseconfig.Phase{
+			{Name: "report", Prompt: "final outputs:\n{{.TeamOutput}}\n---\nfinal replies:\n{{.TeamFinalOutput}}"},
+		},
+	)
+
+	var capturedPostPrompt string
+	_, err := Run(context.Background(), RunOptions{
+		WorkDir:   t.TempDir(),
+		RunID:     "test-run",
+		EventSink: discardEventWriter{},
+		Config:    cfg,
+		PhaseAttempt: func(ctx context.Context, phase phaseconfig.Phase, attemptNum int, prevSessionID string) (PhaseAttemptResult, error) {
+			switch phase.Name {
+			case "worker-a":
+				return PhaseAttemptResult{ExitCode: 0, Output: "thinking a\nfinal a", FinalReply: "final a"}, nil
+			case "worker-b":
+				return PhaseAttemptResult{ExitCode: 0, Output: "thinking b\nfinal b", FinalReply: "final b"}, nil
+			case "report":
+				capturedPostPrompt = phase.Prompt
+			}
+			return PhaseAttemptResult{ExitCode: 0}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	want := "final outputs:\nthinking a\nfinal a\nthinking b\nfinal b\n---\nfinal replies:\nfinal a\nfinal b"
+	if capturedPostPrompt != want {
+		t.Errorf("post phase prompt mismatch.\n got: %q\nwant: %q", capturedPostPrompt, want)
+	}
+}
+
 func TestRunPhaseEndPreservesExplicitStopReason(t *testing.T) {
 	sink := &recordingEventWriter{}
 	result, err := Run(context.Background(), RunOptions{
@@ -908,5 +1105,111 @@ func TestRunPhaseEndPreservesExplicitStopReason(t *testing.T) {
 	}
 	if got != "progress_timeout" {
 		t.Fatalf("phase.end stop_reason = %v, want progress_timeout; events=%+v", got, sink.events)
+	}
+}
+
+// TestRunTeamPreservesCompletedMembersOnDegenerateStream verifies the
+// cross-member behaviour the user asked for: when one team member
+// aborts with degenerate_reasoning_stream, the team result must
+// clearly report the failed member while still preserving the
+// outputs of completed members. This is the user-visible contract
+// that umpire-bot's Run() relies on when it falls back to partial
+// reviewer output (see review/runner.go: reviewRawHasFindings +
+// "Pony team produced no raw findings").
+func TestRunTeamPreservesCompletedMembersOnDegenerateStream(t *testing.T) {
+	cfg := makeConfig(
+		nil,
+		[]phaseconfig.Phase{
+			simplePhase("reviewer", "review code"),
+			simplePhase("test-reviewer", "review tests"),
+		},
+		nil,
+	)
+
+	sink := &recordingEventWriter{}
+	result, err := Run(context.Background(), RunOptions{
+		WorkDir:   t.TempDir(),
+		RunID:     "test-run",
+		EventSink: sink,
+		Config:    cfg,
+		PhaseAttempt: func(ctx context.Context, phase phaseconfig.Phase, attemptNum int, prevSessionID string) (PhaseAttemptResult, error) {
+			switch phase.Name {
+			case "reviewer":
+				// Healthy member: returns a review with output and final reply.
+				return PhaseAttemptResult{
+					ExitCode:   0,
+					SessionID:  "reviewer-s",
+					StopReason: "end_turn",
+					Output:     "reviewer raw output\n## Findings\nnone",
+					FinalReply: "Looks good.",
+				}, nil
+			case "test-reviewer":
+				// Failed member: pony's reasoning stream guard tripped.
+				// The runner returns ExitCode 1 (mapped from
+				// unknown stop reason) and the explicit stop_reason
+				// of degenerate_reasoning_stream.
+				return PhaseAttemptResult{
+					ExitCode:   runtime.ExitCodeForStopReason("degenerate_reasoning_stream"),
+					SessionID:  "test-reviewer-s",
+					StopReason: "degenerate_reasoning_stream",
+				}, nil
+			}
+			return PhaseAttemptResult{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// Team run is reported as a phase failure: exit_code=1, stop_reason
+	// surfaces the failed member's reason.
+	if result.StopReason != "degenerate_reasoning_stream" {
+		t.Errorf("RunResult.StopReason = %q, want degenerate_reasoning_stream", result.StopReason)
+	}
+	if result.ExitCode == 0 {
+		t.Errorf("RunResult.ExitCode = %d, want non-zero for failed member", result.ExitCode)
+	}
+
+	// Verify the team.end event reports the failure with the members counts.
+	// Note: the team runner counts every member that returned a result as
+	// "completed" (only directive=abort counts as aborted). The failure
+	// is signalled by exit_reason=phase_failure together with the
+	// RunResult's stop_reason. This mirrors the actual production
+	// behaviour seen in /tmp/pony/failed-run-18.ndjson where
+	// members_completed=2, members_aborted=0, exit_reason=phase_failure.
+	var teamEnd *events.Event
+	for i := range sink.events {
+		if sink.events[i].Event == "avenor.team.end" {
+			teamEnd = &sink.events[i]
+			break
+		}
+	}
+	if teamEnd == nil {
+		t.Fatal("expected avenor.team.end event in stream")
+	}
+	if got := teamEnd.Fields["exit_reason"]; got != "phase_failure" {
+		t.Errorf("avenor.team.end exit_reason = %v, want phase_failure", got)
+	}
+	if got := teamEnd.Fields["members_aborted"]; got != 0 {
+		t.Errorf("members_aborted = %v, want 0 (no abort directive was issued)", got)
+	}
+
+	// Per-member phase.end events: test-reviewer should carry the
+	// degenerate_reasoning_stream stop_reason, reviewer should be end_turn.
+	phaseEndByName := map[string]string{}
+	for _, ev := range sink.events {
+		if ev.Event != "avenor.phase.end" {
+			continue
+		}
+		name, _ := ev.Fields["phase"].(string)
+		reason, _ := ev.Fields["stop_reason"].(string)
+		phaseEndByName[name] = reason
+	}
+	if phaseEndByName["test-reviewer"] != "degenerate_reasoning_stream" {
+		t.Errorf("test-reviewer phase.end stop_reason = %q, want degenerate_reasoning_stream",
+			phaseEndByName["test-reviewer"])
+	}
+	if phaseEndByName["reviewer"] != "end_turn" {
+		t.Errorf("reviewer phase.end stop_reason = %q, want end_turn", phaseEndByName["reviewer"])
 	}
 }

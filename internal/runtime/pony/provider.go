@@ -2,8 +2,8 @@ package pony
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -25,20 +25,23 @@ var RuntimeIDKey = &runtimeIDKey{}
 
 // Config configures the pony provider.
 type Config struct {
-	Adapter        model.Adapter
-	Model          string
-	MaxTokens      int
-	SystemPrompt   string
-	InitialPrompt  string
-	Executor       OrchestratorExecutor // nil when OrchTools is false
-	LocalTools     bool
-	OrchTools      bool
-	WorkingDir     string // for AGENTS.md discovery
-	InjectAgentsMD bool
-	AllowedReadDirs  []string         // additional directories read tools may access (e.g. skills)
-	AllowedWriteDirs []string         // additional directories write tools may access
-	ToolApproval     map[string]bool  // tool name → requires approval
-	ShellConfig      *ShellConfig     // overrides for shell tool
+	Adapter                model.Adapter
+	Model                  string
+	MaxTokens              int
+	SystemPrompt           string
+	InitialPrompt          string
+	Executor               OrchestratorExecutor // nil when OrchTools is false
+	LocalTools             bool
+	OrchTools              bool
+	WorkingDir             string // for AGENTS.md discovery
+	InjectAgentsMD         bool
+	AllowedReadDirs        []string        // additional directories read tools may access (e.g. skills)
+	AllowedWriteDirs       []string        // additional directories write tools may access
+	ToolApproval           map[string]bool // tool name → requires approval
+	ShellConfig     *ShellConfig     // overrides for shell tool
+	FileReadConfig         *FileReadConfig  // overrides for file_read tool
+	Context                int              // model context window in tokens; 0 = use default compaction
+	CompactionPrompt       string           // override LLM compaction task prompt
 	// Registry is internal; built from tool config.
 	toolRegistry *tools.Registry
 
@@ -58,6 +61,7 @@ type OrchestratorExecutor interface {
 // Provider implements runtime.Provider for the pony backend.
 type Provider struct {
 	cfg Config
+	startErr error
 
 	mu             sync.Mutex
 	sessions       map[string]*sessionState
@@ -67,13 +71,53 @@ type Provider struct {
 
 var _ runtime.Provider = (*Provider)(nil)
 
+// globalSessions provides cross-provider session access so that
+// Resume + Prompt work across phase boundaries where a new provider
+// is created for each phase attempt.
+var (
+	globalSessions   = make(map[string]*sessionState)
+	globalSessionsMu sync.Mutex
+)
+
+const localToolInstructions = "Tool use: use tools when they are the direct way to inspect or change local state. Prefer structured tools first: use list_dir instead of ls, glob for path discovery, grep for content search, and file_read/file_edit/file_write for file access. Use shell only when no structured tool fits. For shell, prefer cmd plus args for exact argv execution; cmd must be only the executable name, with subcommands and flags in args. Examples: use {\"cmd\":\"git\",\"args\":[\"diff\",\"--stat\",\"base...head\"]} rather than putting diff or flags into cmd, and use {\"cmd\":\"ls\",\"args\":[\"packages\"]} rather than repeating ls in args. Do not use pipes, redirects, command chaining, command substitution, or backticks in legacy command strings."
+
+const orchestrationToolInstructions = "Orchestration: use spawn_agents for independent parallel child work, send_prompt for follow-ups, and wait_for_done to collect child results."
+
+const compactionInstructions = "Context management: to keep your context window from overflowing, tool results from older turns are compacted into summaries (marked with [compacted: ...] or [tool result too large: ...]). The most recent ~16K tokens of history are always kept intact. If you need content from a compacted result, re-read the file at a different offset. file_read also returns a reminder instead of re-reading content you've already seen more than twice."
+
+func systemPromptWithToolInstructions(base string, localTools, orchTools bool) string {
+	var parts []string
+	if strings.TrimSpace(base) != "" {
+		parts = append(parts, base)
+	}
+	if localTools {
+		parts = append(parts, localToolInstructions)
+		parts = append(parts, compactionInstructions)
+	}
+	if orchTools {
+		parts = append(parts, orchestrationToolInstructions)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
 // New creates a new pony provider with the given config.
 func New(cfg Config) *Provider {
+	// Derive compaction threshold from context limit (tokens → bytes).
+	// bytesPerToken is conservative — code averages ~3.5, natural language ~4.
+	// Leaves room for output budget and tool definition overhead.
+	const bytesPerToken = 3
+	if cfg.Context > 0 {
+		SetCompactionThreshold(cfg.Context * bytesPerToken)
+	} else {
+		SetCompactionThreshold(0) // reset to default
+	}
+	SetCompactionTaskPrompt(cfg.CompactionPrompt)
+
 	// Build tool registry based on config
 	var toolList []tools.Tool
 	if cfg.LocalTools {
 		toolList = append(toolList,
-			tools.NewFileReadTool(),
+			tools.NewFileReadToolWithConfig(cfg.FileReadConfig),
 			tools.NewFileWriteTool(),
 			tools.NewFileEditTool(),
 			tools.NewGlobTool(),
@@ -101,6 +145,14 @@ func New(cfg Config) *Provider {
 	}
 }
 
+func newWithStartErr(cfg Config, err error) *Provider {
+	return &Provider{
+		cfg:      cfg,
+		startErr: err,
+		sessions: make(map[string]*sessionState),
+	}
+}
+
 // NewWithOptions creates a provider from StartOptions (used by factory).
 // The factory requires a zero-arg or StartOptions-only constructor pattern.
 // This is a thin wrapper — the actual config is loaded by the CLI and stored
@@ -108,19 +160,67 @@ func New(cfg Config) *Provider {
 var (
 	globalConfigMu sync.Mutex
 	globalConfig   *Config
+	globalProfiles map[string]Config
+	globalDefaultAgent string
 )
 
 // SetGlobalConfig stores the pony config for the factory path.
 func SetGlobalConfig(cfg *Config) {
 	globalConfigMu.Lock()
 	globalConfig = cfg
+	globalProfiles = nil
+	globalDefaultAgent = ""
+	globalConfigMu.Unlock()
+}
+
+// SetGlobalProfiles stores pony profile configs for per-attempt agent resolution.
+func SetGlobalProfiles(defaultAgent string, profiles map[string]Config) {
+	globalConfigMu.Lock()
+	globalConfig = nil
+	globalDefaultAgent = defaultAgent
+	if profiles == nil {
+		globalProfiles = nil
+	} else {
+		globalProfiles = make(map[string]Config, len(profiles))
+		for name, cfg := range profiles {
+			globalProfiles[name] = cfg
+		}
+	}
 	globalConfigMu.Unlock()
 }
 
 func NewWithOptions(opts runtime.StartOptions) *Provider {
 	globalConfigMu.Lock()
 	cfg := globalConfig
+	profiles := globalProfiles
+	defaultAgent := globalDefaultAgent
 	globalConfigMu.Unlock()
+	if len(profiles) > 0 {
+		agent := opts.Agent
+		if agent == "" {
+			agent = defaultAgent
+		}
+		selected, ok := profiles[agent]
+		if !ok {
+			if opts.Agent == "" && defaultAgent != "" {
+				if fallback, ok := profiles[defaultAgent]; ok {
+					selected = fallback
+					ok = true
+				}
+			}
+			if !ok && opts.Agent != "" {
+				return newWithStartErr(Config{WorkingDir: opts.Dir}, fmt.Errorf("pony config: unknown profile %q", opts.Agent))
+			}
+		}
+		if ok {
+			pcfg := selected
+			pcfg.WorkingDir = opts.Dir
+			if opts.Model != "" {
+				pcfg.Model = opts.Model
+			}
+			return New(pcfg)
+		}
+	}
 	if cfg == nil {
 		return New(Config{
 			Model:      opts.Model,
@@ -142,6 +242,9 @@ func NewWithOptions(opts runtime.StartOptions) *Provider {
 }
 
 func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtime.Session, error) {
+	if p.startErr != nil {
+		return runtime.Session{}, p.startErr
+	}
 	// Generate a unique session ID
 	id := p.sessionCounter.Add(1)
 	sessionID := fmt.Sprintf("pony_%d", id)
@@ -153,10 +256,10 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	ss.runtimeID = opts.RuntimeID
 
 	// 1. System prompt
-	if p.cfg.SystemPrompt != "" {
+	if systemPrompt := systemPromptWithToolInstructions(p.cfg.SystemPrompt, p.cfg.LocalTools, p.cfg.OrchTools && p.cfg.Executor != nil); systemPrompt != "" {
 		ss.history = append(ss.history, model.Message{
 			Role:    model.RoleSystem,
-			Content: p.cfg.SystemPrompt,
+			Content: systemPrompt,
 		})
 	}
 
@@ -188,6 +291,10 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	p.sessions[sessionID] = ss
 	p.mu.Unlock()
 
+	globalSessionsMu.Lock()
+	globalSessions[sessionID] = ss
+	globalSessionsMu.Unlock()
+
 	return runtime.Session{
 		SessionID: sessionID,
 		Backend:   backendID,
@@ -196,7 +303,21 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 }
 
 func (p *Provider) Resume(ctx context.Context, sessionID string) (runtime.Session, error) {
-	return runtime.Session{}, errors.New("resume not supported by pony backend")
+	p.mu.Lock()
+	_, ok := p.sessions[sessionID]
+	p.mu.Unlock()
+	if !ok {
+		globalSessionsMu.Lock()
+		_, ok = globalSessions[sessionID]
+		globalSessionsMu.Unlock()
+	}
+	if !ok {
+		return runtime.Session{}, fmt.Errorf("unknown session: %s", sessionID)
+	}
+	return runtime.Session{
+		SessionID: sessionID,
+		Backend:   backendID,
+	}, nil
 }
 
 func (p *Provider) Prompt(ctx context.Context, sessionID string, prompt string) error {
@@ -204,7 +325,17 @@ func (p *Provider) Prompt(ctx context.Context, sessionID string, prompt string) 
 	ss, ok := p.sessions[sessionID]
 	p.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("unknown session: %s", sessionID)
+		// Session may have been created by a previous provider (cross-phase resume).
+		// Look it up in the global store and adopt it.
+		globalSessionsMu.Lock()
+		ss, ok = globalSessions[sessionID]
+		globalSessionsMu.Unlock()
+		if !ok {
+			return fmt.Errorf("unknown session: %s", sessionID)
+		}
+		p.mu.Lock()
+		p.sessions[sessionID] = ss
+		p.mu.Unlock()
 	}
 
 	ss.mu.Lock()
