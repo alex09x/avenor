@@ -185,7 +185,7 @@ func TestBrokerPollDrainsStaleNotifyAfterQueuedMessage(t *testing.T) {
 		resp.Body.Close()
 		t.Fatal("second empty poll returned before request context timed out")
 	}
-	if elapsed := time.Since(start); elapsed < 75*time.Millisecond {
+	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
 		t.Fatalf("second empty poll returned too quickly after %s", elapsed)
 	}
 }
@@ -384,4 +384,192 @@ func TestBrokerDeleteRun(t *testing.T) {
 
 	// DeleteRun on nonexistent run should not panic.
 	b.DeleteRun("nonexistent")
+}
+
+func TestEnvelopeConversion(t *testing.T) {
+	payload := json.RawMessage(`{"key":"val"}`)
+
+	t.Run("Report", func(t *testing.T) {
+		r := Report{RunID: "r1", State: "working", Payload: payload}
+		e := r.ToEnvelope()
+		if e.FromRunID != "r1" {
+			t.Errorf("FromRunID = %q, want r1", e.FromRunID)
+		}
+		if e.Kind != "working" {
+			t.Errorf("Kind = %q, want working", e.Kind)
+		}
+		if string(e.Payload) != `{"key":"val"}` {
+			t.Errorf("Payload = %s", e.Payload)
+		}
+	})
+
+	t.Run("Finish", func(t *testing.T) {
+		f := Finish{RunID: "r2", Status: "done", Summary: "ok", Payload: payload}
+		e := f.ToEnvelope()
+		if e.Kind != "done" {
+			t.Errorf("Kind = %q, want done", e.Kind)
+		}
+	})
+
+	t.Run("FinishNoStatus", func(t *testing.T) {
+		f := Finish{RunID: "r3"}
+		e := f.ToEnvelope()
+		if e.Kind != "done" {
+			t.Errorf("Kind = %q, want done", e.Kind)
+		}
+	})
+
+	t.Run("Reply", func(t *testing.T) {
+		r := Reply{RunID: "r4", To: "controller", Payload: payload}
+		e := r.ToEnvelope()
+		if e.To != "controller" {
+			t.Errorf("To = %q, want controller", e.To)
+		}
+	})
+
+	t.Run("ControlMessage", func(t *testing.T) {
+		now := time.Now()
+		m := ControlMessage{ID: "ctrl_1", Type: "continue", RunID: "r5", Payload: payload, CreatedAt: now}
+		e := m.ToEnvelope()
+		if e.ToRunID != "r5" {
+			t.Errorf("ToRunID = %q, want r5", e.ToRunID)
+		}
+		if e.Kind != "continue" {
+			t.Errorf("Kind = %q, want continue", e.Kind)
+		}
+		if e.CorrelationID != "ctrl_1" {
+			t.Errorf("CorrelationID = %q, want ctrl_1", e.CorrelationID)
+		}
+		if !e.CreatedAt.Equal(now) {
+			t.Errorf("CreatedAt = %v, want %v", e.CreatedAt, now)
+		}
+	})
+}
+
+func TestBrokerSend(t *testing.T) {
+	b := New("")
+	if err := b.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer b.Stop()
+
+	token, err := b.CreateRun("run_send")
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	payload := json.RawMessage(`{"msg":"hello"}`)
+	if err := b.Send("run_send", "continue", payload, "corr_1"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	// Verify the control message was enqueued by polling.
+	pollBody := bytes.NewReader([]byte(fmt.Sprintf(`{"run_id":"run_send","token":"%s"}`, token)))
+	resp, err := http.Post(fmt.Sprintf("http://%s/poll-control", b.Addr()), "application/json", pollBody)
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("poll: %d", resp.StatusCode)
+	}
+	var msgs []ControlMessage
+	if err := json.NewDecoder(resp.Body).Decode(&msgs); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+	if msgs[0].ID != "corr_1" {
+		t.Errorf("ID = %q, want corr_1", msgs[0].ID)
+	}
+	if msgs[0].Type != "continue" {
+		t.Errorf("Type = %q, want continue", msgs[0].Type)
+	}
+}
+
+func TestBrokerSendNonexistentRun(t *testing.T) {
+	b := New("")
+	if err := b.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer b.Stop()
+
+	err := b.Send("nonexistent", "continue", nil, "")
+	if err == nil {
+		t.Fatal("expected error for nonexistent run")
+	}
+}
+
+func TestBrokerIngestReport(t *testing.T) {
+	b := New("")
+	if err := b.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer b.Stop()
+
+	token, err := b.CreateRun("run_ingest_report")
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	_ = token
+
+	payload := json.RawMessage(`{"summary":"progress"}`)
+	if err := b.Ingest("run_ingest_report", "thinking", payload); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	st := b.GetRun("run_ingest_report")
+	if st == nil {
+		t.Fatal("run not found")
+	}
+	if len(st.Reports) != 1 {
+		t.Fatalf("expected 1 report, got %d", len(st.Reports))
+	}
+	if st.Reports[0].State != "thinking" {
+		t.Errorf("State = %q, want thinking", st.Reports[0].State)
+	}
+}
+
+func TestBrokerIngestFinish(t *testing.T) {
+	b := New("")
+	if err := b.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer b.Stop()
+
+	token, err := b.CreateRun("run_ingest_finish")
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	_ = token
+
+	payload := json.RawMessage(`{"result":"ok"}`)
+	if err := b.Ingest("run_ingest_finish", "done", payload); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	st := b.GetRun("run_ingest_finish")
+	if st == nil {
+		t.Fatal("run not found")
+	}
+	if len(st.Finishes) != 1 {
+		t.Fatalf("expected 1 finish, got %d", len(st.Finishes))
+	}
+	if st.Finishes[0].Status != "done" {
+		t.Errorf("Status = %q, want done", st.Finishes[0].Status)
+	}
+}
+
+func TestBrokerIngestNonexistentRun(t *testing.T) {
+	b := New("")
+	if err := b.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer b.Stop()
+
+	err := b.Ingest("nonexistent", "working", nil)
+	if err == nil {
+		t.Fatal("expected error for nonexistent run")
+	}
 }

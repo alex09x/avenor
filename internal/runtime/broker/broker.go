@@ -1,6 +1,9 @@
-// Package broker implements the in-process HTTP broker for the claude-channel backend.
-// It handles sidecar registration, control message queuing, report/finish/reply ingestion,
+// Package broker provides a harness-agnostic run broker for agent communication.
+// It handles run registration, control message queuing, report/finish/reply ingestion,
 // and heartbeat tracking scoped by run ID.
+//
+// Harness-specific concerns (e.g., MCP sidecar registration, tmux bootstrap, .mcp.json entries)
+// live in the individual harness adapter packages, not here.
 package broker
 
 import (
@@ -51,6 +54,57 @@ type Reply struct {
 	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
+// Envelope is the internal generic message format used by the broker.
+// It is not exposed on the wire; HTTP endpoints continue to use the
+// existing Report/Finish/Reply/ControlMessage types.
+type Envelope struct {
+	FromRunID     string          `json:"from_run_id"`
+	ToRunID       string          `json:"to_run_id"`
+	To            string          `json:"to,omitempty"`
+	Kind          string          `json:"kind"`
+	CorrelationID string          `json:"correlation_id,omitempty"`
+	Payload       json.RawMessage `json:"payload,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+}
+
+func (r Report) ToEnvelope() Envelope {
+	return Envelope{
+		FromRunID: r.RunID,
+		Kind:      r.State,
+		Payload:   r.Payload,
+	}
+}
+
+func (f Finish) ToEnvelope() Envelope {
+	kind := f.Status
+	if kind == "" {
+		kind = "done"
+	}
+	return Envelope{
+		FromRunID: f.RunID,
+		Kind:      kind,
+		Payload:   f.Payload,
+	}
+}
+
+func (r Reply) ToEnvelope() Envelope {
+	return Envelope{
+		FromRunID: r.RunID,
+		To:        r.To,
+		Payload:   r.Payload,
+	}
+}
+
+func (m ControlMessage) ToEnvelope() Envelope {
+	return Envelope{
+		ToRunID:       m.RunID,
+		Kind:          m.Type,
+		CorrelationID: m.ID,
+		Payload:       m.Payload,
+		CreatedAt:     m.CreatedAt,
+	}
+}
+
 // PermissionState holds a pending permission relay request.
 type PermissionState struct {
 	RequestID string
@@ -95,38 +149,103 @@ func (b *Broker) PushControl(runID string, msg ControlMessage) error {
 	return nil
 }
 
+// Send enqueues a control message for the given run using raw fields.
+// It is a convenience wrapper around PushControl that builds the
+// ControlMessage internally. correlationID is optional; it is used as
+// the ControlMessage ID when non-empty.
+func (b *Broker) Send(runID string, kind string, payload json.RawMessage, correlationID string) error {
+	if correlationID == "" {
+		correlationID = MakeToken()
+	}
+	msg := ControlMessage{
+		ID:      correlationID,
+		Type:    kind,
+		RunID:   runID,
+		Payload: payload,
+	}
+	return b.PushControl(runID, msg)
+}
+
+// Ingest routes an incoming message from an agent into the appropriate
+// RunState bucket based on kind.
+//
+// Known kinds:
+//   - "done", "failed", "blocked" → stored in Finishes
+//   - everything else            → stored in Reports
+func (b *Broker) Ingest(runID string, kind string, payload json.RawMessage) error {
+	if payload == nil {
+		return fmt.Errorf("payload must not be nil")
+	}
+	b.mu.Lock()
+	st, ok := b.runs[runID]
+	b.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("run not found: %s", runID)
+	}
+	st.Mu.Lock()
+	defer st.Mu.Unlock()
+
+	switch kind {
+	case "done", "failed", "blocked":
+		st.Finishes = append(st.Finishes, Finish{
+			RunID:   runID,
+			Status:  kind,
+			Payload: payload,
+		})
+	default:
+		st.Reports = append(st.Reports, Report{
+			RunID:   runID,
+			State:   kind,
+			Payload: payload,
+		})
+	}
+	st.LastSeen = time.Now()
+	return nil
+}
+
+// signalLocked sends a non-blocking signal on st.Notify to wake a
+// waiting poller. Because the channel is buffered to 1, stale signals
+// may sit unread — the consumer must drain Notify after each poll
+// to avoid a spurious immediate return when the queue is actually empty.
 func (st *RunState) signalLocked() {
+	// Non-blocking send means stale signals can be lost if the consumer
+	// doesn't drain Notify fast enough. This is intentional — it ensures
+	// poll-control never blocks longer than necessary, but means a signal
+	// arriving before the consumer drains the channel may be silently dropped.
 	select {
 	case st.Notify <- struct{}{}:
 	default:
 	}
 }
 
-// Broker is the in-process HTTP server for channel sidecar coordination.
+// Broker is a harness-agnostic, in-process HTTP server that coordinates
+// communication between agent harnesses and their orchestrators.
+// It owns run-scoped state, message queuing, and lifecycle event ingestion.
 type Broker struct {
-	addr      string
-	listener  net.Listener
-	mu        sync.RWMutex
-	runs      map[string]*RunState
-	server    *http.Server
-	httpToken string // optional global HTTP auth token for push-control endpoint
+	addr        string
+	listener    net.Listener
+	mu          sync.RWMutex
+	runs        map[string]*RunState
+	server      *http.Server
+	httpToken   string        // optional global HTTP auth token for push-control endpoint
+	pollTimeout time.Duration // max wait for poll-control before returning empty
 }
 
 // New creates a broker on an ephemeral loopback port.
 // The resulting addr is available after Start.
 func New(globalToken string) *Broker {
 	return &Broker{
-		runs:      make(map[string]*RunState),
-		httpToken: globalToken,
+		runs:        make(map[string]*RunState),
+		httpToken:   globalToken,
+		pollTimeout: 2 * time.Second,
 	}
 }
 
 func MakeToken() string {
 	b := make([]byte, 16)
-	for i := 0; i < 3; i++ {
-		if _, err := rand.Read(b); err == nil {
-			return hex.EncodeToString(b)
-		}
+	_, err := rand.Read(b)
+	if err != nil {
+		panic(fmt.Sprintf("crypto/rand: %v", err))
 	}
 	return hex.EncodeToString(b)
 }
@@ -277,8 +396,8 @@ func (b *Broker) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	b.mu.Lock()
 	if st, exists := b.runs[body.RunID]; exists {
-		b.mu.Unlock()
 		if body.Token == "" || subtle.ConstantTimeCompare([]byte(body.Token), []byte(st.Token)) != 1 {
+			b.mu.Unlock()
 			http.Error(w, "run already registered", http.StatusConflict)
 			return
 		}
@@ -286,6 +405,7 @@ func (b *Broker) handleRegister(w http.ResponseWriter, r *http.Request) {
 		st.RegisteredAt = time.Now()
 		st.LastSeen = time.Now()
 		st.Mu.Unlock()
+		b.mu.Unlock()
 		resp := map[string]string{
 			"token":  st.Token,
 			"run_id": st.RunID,
@@ -391,7 +511,7 @@ func (b *Broker) handlePollControl(w http.ResponseWriter, r *http.Request) {
 		st.Mu.Unlock()
 		select {
 		case <-notify:
-		case <-time.After(2 * time.Second):
+		case <-time.After(b.pollTimeout):
 		case <-r.Context().Done():
 			return
 		}
