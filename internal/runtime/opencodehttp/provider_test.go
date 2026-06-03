@@ -604,8 +604,9 @@ func TestPublishDropsSlowSubscriberWithoutBlocking(t *testing.T) {
 func TestSSESessionEndFallsBackWhenPOSTHasNoStopReason(t *testing.T) {
 	// When POST /message returns a response without a stop_reason,
 	// messageResultEndEvent returns false and Prompt does NOT emit
-	// session.end. The SSE stream's session.end must still be published
-	// so that WaitForSession doesn't hang.
+	// session.end. The SSE stream must still publish session.end
+	// so that WaitForSession does not hang.
+	emitEvents := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/global/health":
@@ -615,15 +616,17 @@ func TestSSESessionEndFallsBackWhenPOSTHasNoStopReason(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]string{"id": "ses_fallback"})
 		case "/session/ses_fallback/message":
 			w.Header().Set("Content-Type", "application/json")
-			// No stop_reason — simulates a response where messageResultEndEvent returns false.
+			// No stop_reason: simulates a response where messageResultEndEvent returns false.
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": "msg_1"})
+			close(emitEvents)
 		case "/event":
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
 			}
-			// First mark the session as busy, then idle — mirrors real server behavior.
+			<-emitEvents
+			// First mark the session as busy, then idle to mirror real server behavior.
 			fmt.Fprint(w, `data: {"type":"session.status","properties":{"sessionID":"ses_fallback","status":{"type":"busy"}}}`+"\n\n")
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
@@ -656,7 +659,7 @@ func TestSSESessionEndFallsBackWhenPOSTHasNoStopReason(t *testing.T) {
 		t.Fatalf("Events error = %v", err)
 	}
 
-	// Prompt returns successfully but without emitting session.end (no stop_reason).
+	// Prompt returns successfully but without emitting session.end because there is no stop_reason.
 	err = p.Prompt(context.Background(), session.SessionID, "hello")
 	if err != nil {
 		t.Fatalf("Prompt error = %v", err)
@@ -679,6 +682,7 @@ func TestSSESessionEndFallsBackWhenPOSTHasNoStopReason(t *testing.T) {
 func TestSSESessionEndSkippedWhenPOSTAlreadyEmitted(t *testing.T) {
 	// When POST /message already emits session.end via publishSessionEnd,
 	// the SSE session.end should be deduplicated and not published again.
+	emitEvents := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/global/health":
@@ -694,13 +698,15 @@ func TestSSESessionEndSkippedWhenPOSTAlreadyEmitted(t *testing.T) {
 					"finish": "stop",
 				},
 			})
+			close(emitEvents)
 		case "/event":
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
 			}
-			// Busy then idle — readSSEEvents maps the idle transition to session.end.
+			<-emitEvents
+			// Busy then idle: readSSEEvents maps the idle transition to session.end.
 			fmt.Fprint(w, `data: {"type":"session.status","properties":{"sessionID":"ses_dedup","status":{"type":"busy"}}}`+"\n\n")
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
@@ -738,7 +744,7 @@ func TestSSESessionEndSkippedWhenPOSTAlreadyEmitted(t *testing.T) {
 		t.Fatalf("Prompt error = %v", err)
 	}
 
-	// First session.end should arrive from publishSessionEnd (called by Prompt).
+	// First session.end should arrive from publishSessionEnd called by Prompt.
 	var endCount int
 	timeout := time.After(2 * time.Second)
 loop:
