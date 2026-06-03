@@ -1,6 +1,6 @@
 # Backends
 
-Avenor talks to agents through backends. Each backend speaks a different protocol to a different runtime — OpenCode, Codex, Gemini, Cursor, or PI. Pick the one that matches what's running locally and what you need from the orchestration layer.
+Avenor talks to agents through backends. Each backend speaks a different protocol to a different runtime — OpenCode, Claude, Codex, Gemini, Cursor, or PI. Pick the one that matches what's running locally and what you need from the orchestration layer.
 
 ## Backend selection
 
@@ -13,25 +13,74 @@ avenor --backend codex-app-server --prompt "say hi"
 avenor --backend gemini-acp --prompt "say hi"
 avenor --backend cursor-acp --prompt "say hi"
 avenor --backend pi --model anthropic/claude-sonnet-4-5 --prompt "say hi"
+avenor --backend claude-channel --prompt "say hi"
 ```
+
+`claude-channel` has an extra local dependency: it requires `tmux` on `PATH` because Avenor launches Claude Code inside a real interactive tmux session.
 
 ## Capability matrix
 
-| Capability | opencode-acp | opencode-http | codex-app-server | gemini-acp | cursor-acp | pi |
-|---|---|---|---|---|---|---|
-| New sessions | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Session resume | ✓ | ✓ | ✓ | — | — | ✓ |
-| Prompt execution | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Cancel | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Event streaming | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Permission relay | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ |
-| Model selection | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ |
-| External server URL | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ |
-| Subprocess discovery | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Capability | opencode-acp | opencode-http | codex-app-server | gemini-acp | cursor-acp | pi | claude-channel |
+|---|---|---|---|---|---|---|---|
+| New sessions | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Session resume | ✓ | ✓ | ✓ | — | — | ✓ | ✗ |
+| Prompt execution | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓  |
+| Cancel | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓  |
+| Event streaming | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Permission relay | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ⚠  |
+| Model selection | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ | ✓  |
+| External server URL | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Subprocess discovery | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ |
 
-`—` means not verified; `✗` means not supported.
+`—` means not verified; `✗` means not supported, `⚠ ` means experimental.
 
 ---
+
+## claude-channel (experimental)
+
+Starts a full interactive Claude Code session in the background, controlled via
+`claude/channel` MCP push events with tmux PTY lifecycle fallback. This backend requires `tmux`; it will fail at startup if `tmux` is not installed or not on `PATH`.
+
+### How it works
+
+1. Avenor generates a unique run ID (e.g., `47212ef3`) and writes an MCP server entry to the project's `.mcp.json` with a name like `avenor-channel-47212ef3`.
+2. The MCP entry uses the avenor binary itself as the command: `avenor claude-channel --run-id <id> --token <token> --broker-url <url>`.
+3. Avenor spawns Claude Code in a detached tmux session with `--dangerously-load-development-channels server:avenor-channel-47212ef3`.
+4. Claude discovers the MCP server from `.mcp.json`, loads it, and the bidirectional channel opens.
+5. Avenor pushes control messages (continue, cancel, permission decisions) to Claude via `claude/channel` events.
+6. Claude calls `avenor_report`, `avenor_finish`, and `avenor_reply` tools to communicate back.
+7. If the channel is ignored or not yet active, Avenor falls back to tmux PTY prompt injection.
+8. On session exit, Avenor removes the `avenor-channel-*` entry from `.mcp.json`.
+
+The `.mcp.json` is written to the project directory so Claude Code can discover it. Manual cleanup is available via `avenor claude-channel-cleanup --dir <project-dir>` if a session crashes without removing its entry.
+
+### Requirements
+
+- Claude Code v2.1.80 or later installed and on `PATH`.
+- `tmux` installed and on `PATH`.
+- No separate sidecar runtime needed — the avenor binary implements both the orchestrator and the MCP server.
+- Research-preview channels may be blocked by org policy.
+- This backend does **not** use `claude -p`; it launches a real interactive session in tmux.
+
+### Security
+
+- Only load trusted local channel servers.
+- The broker binds to `127.0.0.1` and requires a per-run random bearer token.
+- Do not use `--dangerously-skip-permissions` in environments you do not fully trust.
+
+### Capabilities
+
+| Capability | Supported |
+|---|---|
+| New sessions | ✓ |
+| Session resume | ✗ |
+| Prompt execution | ✓ (via channel push) |
+| Cancel | ✓ (channel cancel → signal → kill) |
+| Event streaming | ✓ |
+| Permission relay | ⚠ (experimental, not yet verified) |
+| Model selection | ✓ (via `--model`) |
+| External server URL | ✗ |
+| Subprocess discovery | ✓ |
 
 ## opencode-acp
 

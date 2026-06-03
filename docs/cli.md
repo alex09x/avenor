@@ -33,7 +33,7 @@ avenor [flags]  # equivalent; explicit "run" is optional
 | `--dir` | `.` | Working directory for the agent |
 | `--resume` | (none) | Resume an existing session by ID; incompatible with `--loop-file` |
 | `--server-url` | (none) | Long-lived ACP server endpoint; required for `--backend opencode-http` |
-| `--backend` | `opencode-acp` | Runtime backend: `opencode-acp`, `gemini-acp`, `cursor-acp`, `codex-app-server`, `opencode-http` |
+| `--backend` | `opencode-acp` | Runtime backend: `opencode-acp`, `gemini-acp`, `cursor-acp`, `codex-app-server`, `opencode-http`, `claude-channel` |
 | `--model` | (none) | Backend-specific model ID; if not set, resolved from opencode config via `--agent` |
 | `--on-event` | (none) | Path to write NDJSON event stream; events are discarded if unset |
 | `--sentinel-file` | (none) | Path to write a completion sentinel (exit code, session ID, stop reason); also derives permission handler unless `--permission-handler` is set |
@@ -151,7 +151,7 @@ Spawn flags (all optional):
 | `--agent` | Agent name |
 | `--label` | Free-form label for log correlation |
 | `--model` | Backend-specific model ID |
-| `--backend` | Runtime backend |
+| `--backend` | Runtime backend: `opencode-acp`, `gemini-acp`, `cursor-acp`, `codex-app-server`, `opencode-http`, `claude-channel` |
 | `--server-url` | Long-lived ACP server endpoint |
 | `--on-event` | Path to write NDJSON events |
 | `--sentinel-file` | Path to write completion sentinel |
@@ -354,6 +354,65 @@ avenor watch /tmp/probe.jsonl
 ```
 
 See [backends.md](backends.md) for more on backend discovery.
+
+## avenor claude-channel
+
+Internal MCP sidecar invoked automatically by Claude Code when using the `claude-channel` backend. You don't run this directly — Avenor writes a per-run entry to the project's `.mcp.json` that tells Claude Code how to invoke it, then removes the entry when the session ends. The backend requires `tmux` on `PATH` because Avenor boots Claude Code inside a detached interactive tmux session.
+
+```
+avenor claude-channel --run-id <id> --token <token> --broker-url <url>
+```
+
+### Flags
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--run-id` | yes | Avenor run ID issued by the broker |
+| `--token` | yes | Per-run bearer token for broker authentication |
+| `--broker-url` | yes | HTTP base URL of the in-process broker |
+
+### Bootstrap and cleanup
+
+When starting a `claude-channel` backend session, Avenor:
+1. Generates a unique 8-character run ID (e.g., `47212ef3`)
+2. Writes an MCP server entry to `<project-dir>/.mcp.json` with name `avenor-channel-47212ef3`
+3. The entry uses the avenor binary itself: `avenor claude-channel --run-id <id> --token <token> --broker-url <url>`
+4. On session exit, removes the entry from `.mcp.json`
+
+If the session crashes or is forcibly killed, the entry may remain. Use `avenor claude-channel-cleanup --dir <project-dir>` as a recovery command to remove stale entries manually after crash cleanup did not run.
+
+The sidecar speaks JSON-RPC 2.0 over stdio, declares `claude/channel` and `claude/channel/permission` capabilities, and exposes the three tools Claude uses to communicate back:
+
+- `avenor_report` — progress update
+- `avenor_finish` — session completion with status and summary
+- `avenor_reply` — directed reply to a named recipient
+
+See [backends.md](backends.md#claude-channel-experimental) for architecture and security notes.
+
+## avenor claude-channel-cleanup
+
+Remove all `avenor-channel-*` MCP server entries from a project's `.mcp.json`. Use this to clean up stale entries if an avenor session crashes or is forcibly killed before it can remove its bootstrap config.
+
+```
+avenor claude-channel-cleanup --dir <project-dir>
+```
+
+### Flags
+
+| Flag | Default | Description |
+|------|----------|-------------|
+| `--dir` | `.` | Project directory containing `.mcp.json` |
+
+### Example
+
+Clean up stale avenor-channel entries from a project:
+
+```sh
+avenor claude-channel-cleanup --dir /path/to/project
+# Output: removed 2 avenor-channel entries from /path/to/project/.mcp.json
+```
+
+The cleanup command is safe to run at any time — it only removes entries with names starting with `avenor-channel-` and leaves all other MCP servers intact. If no avenor-channel entries exist, it reports `removed 0` and exits successfully.
 
 ## Common Patterns
 
