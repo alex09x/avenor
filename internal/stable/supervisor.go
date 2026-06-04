@@ -20,6 +20,7 @@ import (
 	"github.com/sdougbrown/avenor/internal/runtime"
 	"github.com/sdougbrown/avenor/internal/runtime/factory"
 	"github.com/sdougbrown/avenor/internal/teamrunner"
+	"github.com/sdougbrown/avenor/internal/runtime/broker"
 )
 
 type Config struct {
@@ -118,6 +119,7 @@ type Supervisor struct {
 	httpServerCond       *sync.Cond
 	fileSnapshots        map[string][]string // runtimeID → pre-run file list for output detection
 	fileSnapMu           sync.Mutex
+	broker               *broker.Broker
 }
 
 func NewSupervisor(cfg Config) *Supervisor {
@@ -137,6 +139,10 @@ func NewSupervisor(cfg Config) *Supervisor {
 		permOptions:          map[string][]any{},
 		httpServers:          map[string]any{},
 		fileSnapshots:        map[string][]string{},
+	}
+	sup.broker = broker.New("")
+	if err := sup.broker.Start(); err != nil {
+		// Non-fatal — broker is optional. Runs will still work without it.
 	}
 	sup.httpServerCond = sync.NewCond(&sup.httpServerMu)
 	if sup.childQuestionTimeout <= 0 {
@@ -439,6 +445,7 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 		Dir:       params.Dir,
 		Model:     params.Model,
 		RuntimeID: rtID,
+		Broker:    s.broker,
 	}
 	discovery := cli.DiscoverServer(params.ServerURL, os.Getenv)
 	startOpts.ServerURL = discovery.URL
@@ -538,6 +545,10 @@ func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptTe
 		child.completed = true
 		child.mu.Unlock()
 	}()
+
+	if s.broker != nil {
+		s.broker.CreateRun(child.id)
+	}
 
 	var timer <-chan time.Time
 	if timeoutSec > 0 {
@@ -639,13 +650,20 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 		s.controlMu.Lock()
 		delete(s.runtimes, child.id)
 		s.controlMu.Unlock()
+		if s.broker != nil {
+			s.broker.DeleteRun(child.id)
+		}
 	}()
 
+	if s.broker != nil {
+		s.broker.CreateRun(child.id)
+	}
 	taggedWriter := &runtimeFanoutWriter{
 		base:            child.eventWriter,
 		runtimeID:       child.id,
 		control:         s.control,
 		onPermissionReq: s.cachePermissionOptions,
+		recorder:        newRecorderFor(s, child.id),
 	}
 
 	opts := looprunner.RunOptions{
@@ -660,6 +678,7 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 				Model:     model,
 				Dir:       child.dir,
 				ServerURL: serverURL,
+				Broker:    s.broker,
 			}
 
 			resumeID := prevSessionID
@@ -776,13 +795,20 @@ func (s *Supervisor) runTeamChild(ctx context.Context, child *childRuntime, cfg 
 		s.controlMu.Lock()
 		delete(s.runtimes, child.id)
 		s.controlMu.Unlock()
+		if s.broker != nil {
+			s.broker.DeleteRun(child.id)
+		}
 	}()
 
+	if s.broker != nil {
+		s.broker.CreateRun(child.id)
+	}
 	taggedWriter := &runtimeFanoutWriter{
 		base:            child.eventWriter,
 		runtimeID:       child.id,
 		control:         s.control,
 		onPermissionReq: s.cachePermissionOptions,
+		recorder:        newRecorderFor(s, child.id),
 	}
 
 	opts := teamrunner.RunOptions{
@@ -805,6 +831,7 @@ func (s *Supervisor) runTeamChild(ctx context.Context, child *childRuntime, cfg 
 				Model:     m,
 				Dir:       child.dir,
 				ServerURL: serverURL,
+				Broker:    s.broker,
 			}
 
 			resumeID := prevSessionID
@@ -994,6 +1021,7 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 		runtimeID:       child.id,
 		control:         s.control,
 		onPermissionReq: s.cachePermissionOptions,
+		recorder:        newRecorderFor(s, child.id),
 	}
 	result := cli.WaitForSession(turnCtx, child.provider, cli.SessionWaitConfig{
 		EventCh:                eventCh,
@@ -1191,6 +1219,9 @@ func (s *Supervisor) shutdown(mode string) int {
 			fmt.Fprintf(os.Stderr, "avenor stable: %d runtimes did not finish within %v\n", remaining, timeout)
 		}
 	}
+	if s.broker != nil {
+		_ = s.broker.Stop()
+	}
 	return 0
 }
 
@@ -1325,6 +1356,7 @@ type runtimeFanoutWriter struct {
 	runtimeID       string
 	control         *control.ControlServer
 	onPermissionReq func(runtimeID, requestID string, options []any)
+	recorder        *broker.Recorder
 }
 
 func (w *runtimeFanoutWriter) Write(ev events.Event) error {
@@ -1342,10 +1374,22 @@ func (w *runtimeFanoutWriter) Write(ev events.Event) error {
 	if w.control != nil {
 		w.control.PublishEvent(ev)
 	}
+	if w.recorder != nil {
+		w.recorder.Feed(ev)
+	}
 	return w.base.Write(ev)
 }
 
 func (w *runtimeFanoutWriter) Close() error { return w.base.Close() }
+
+// Broker helpers.
+
+func newRecorderFor(s *Supervisor, runID string) *broker.Recorder {
+	if s.broker == nil {
+		return nil
+	}
+	return broker.NewRecorder(s.broker, runID)
+}
 
 // StableHandler implementation.
 

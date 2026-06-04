@@ -107,28 +107,10 @@ func New() runtime.Provider {
 	return NewWithOptions(runtime.StartOptions{})
 }
 
-func mergeStartOptions(base, override runtime.StartOptions) runtime.StartOptions {
-	merged := base
-	if override.Agent != "" {
-		merged.Agent = override.Agent
-	}
-	if override.Label != "" {
-		merged.Label = override.Label
-	}
-	if override.Dir != "" {
-		merged.Dir = override.Dir
-	}
-	if override.ServerURL != "" {
-		merged.ServerURL = override.ServerURL
-	}
-	if override.Model != "" {
-		merged.Model = override.Model
-	}
-	return merged
-}
+
 
 func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtime.Session, error) {
-	merged := mergeStartOptions(p.opts, opts)
+	merged := runtime.MergeStartOptions(p.opts, opts)
 	if merged.Dir == "" {
 		var err error
 		merged.Dir, err = os.Getwd()
@@ -158,7 +140,9 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.broker == nil {
+	if merged.Broker != nil {
+		p.broker = merged.Broker
+	} else if p.broker == nil {
 		p.broker = broker.New(p.globalTok)
 		if err := p.broker.Start(); err != nil {
 			return runtime.Session{}, fmt.Errorf("broker.Start: %w", err)

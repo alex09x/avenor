@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/sdougbrown/avenor/internal/runtime/broker"
 )
 
 // Provider is the interface that all ACP runtime backends must implement.
@@ -25,6 +26,7 @@ type StartOptions struct {
 	ServerURL string
 	Model     string
 	RuntimeID string // supervisor-assigned runtime ID (rt_N), for parent-child routing
+	Broker    *broker.Broker // optional shared broker instance; backends may create their own if nil
 }
 
 // Session represents an active ACP session.
@@ -58,4 +60,33 @@ type Capabilities struct {
 	ExternalServerURL   bool
 	SubprocessDiscovery bool
 	ModelSelection      bool
+}
+
+// MergeStartOptions returns a new StartOptions with non-zero fields from
+// override applied over base. Use this to combine provider-scoped defaults
+// with per-start overrides.
+func MergeStartOptions(base, override StartOptions) StartOptions {
+	merged := base
+	if override.Agent != "" {
+		merged.Agent = override.Agent
+	}
+	if override.Label != "" {
+		merged.Label = override.Label
+	}
+	if override.Dir != "" {
+		merged.Dir = override.Dir
+	}
+	if override.ServerURL != "" {
+		merged.ServerURL = override.ServerURL
+	}
+	if override.Model != "" {
+		merged.Model = override.Model
+	}
+	if override.RuntimeID != "" {
+		merged.RuntimeID = override.RuntimeID
+	}
+	if override.Broker != nil {
+		merged.Broker = override.Broker
+	}
+	return merged
 }
