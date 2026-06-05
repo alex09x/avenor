@@ -18,6 +18,8 @@ import (
 	"github.com/sdougbrown/avenor/internal/looprunner"
 	"github.com/sdougbrown/avenor/internal/phaseconfig"
 	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/sdougbrown/avenor/internal/runtime/broker"
+	"github.com/sdougbrown/avenor/internal/teamrunner"
 )
 
 func TestNewSupervisor(t *testing.T) {
@@ -400,10 +402,17 @@ func TestShutdownTimeoutDoesNotHangWithMultipleStuckRuntimes(t *testing.T) {
 }
 
 func TestRunLoopChildCleansUpOnLooprunnerError(t *testing.T) {
+	b := broker.New("loop-test-token")
+	if err := b.Start(); err != nil {
+		t.Fatalf("broker.Start: %v", err)
+	}
+	defer b.Stop()
+
 	sup := NewSupervisor(Config{
 		ControlSocket: "/tmp/test-loop-cleanup.sock",
 		MaxRuntimes:   1,
 	})
+	sup.broker = b
 	sink := &closeRecordingSink{}
 	cancelled := false
 	child := &childRuntime{
@@ -453,6 +462,105 @@ func TestRunLoopChildCleansUpOnLooprunnerError(t *testing.T) {
 	if _, ok := sup.runtimes[child.id]; ok {
 		t.Fatal("loop child was not removed from supervisor runtimes")
 	}
+	if got := b.RunCount(); got != 0 {
+		t.Fatalf("broker run count = %d, want 0 after loop cleanup", got)
+	}
+}
+
+func TestRunTeamChildCleansUpBrokerRuns(t *testing.T) {
+	b := broker.New("team-test-token")
+	if err := b.Start(); err != nil {
+		t.Fatalf("broker.Start: %v", err)
+	}
+	defer b.Stop()
+
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-team-cleanup.sock",
+		MaxRuntimes:   1,
+	})
+	sup.broker = b
+	sink := &closeRecordingSink{}
+	cancelled := false
+	child := &childRuntime{
+		id:          "rt_team",
+		done:        make(chan struct{}),
+		promptCh:    make(chan struct{}, 1),
+		eventWriter: sink,
+		cancelFn:    func() { cancelled = true },
+	}
+	sup.runtimes[child.id] = child
+
+	cfg := &teamrunner.TeamConfig{
+		Team: []phaseconfig.Phase{{Name: "review", Prompt: "review"}},
+	}
+	sup.runTeamChild(context.Background(), child, cfg, 0, "", "", "", "unknown-backend")
+
+	select {
+	case <-child.done:
+	default:
+		t.Fatal("team child done channel was not closed")
+	}
+	if !cancelled {
+		t.Fatal("team child cancel function was not called")
+	}
+	child.mu.Lock()
+	completed := child.completed
+	child.mu.Unlock()
+	if !completed {
+		t.Fatal("team child was not marked completed")
+	}
+	if _, ok := sup.runtimes[child.id]; ok {
+		t.Fatal("team child was not removed from supervisor runtimes")
+	}
+
+	if got := b.RunCount(); got != 0 {
+		t.Fatalf("broker run count = %d, want 0 after team cleanup", got)
+	}
+}
+
+func TestRuntimeFanoutWriterFeedsRecorder(t *testing.T) {
+	b := broker.New("writer-test-token")
+	if err := b.Start(); err != nil {
+		t.Fatalf("broker.Start: %v", err)
+	}
+	defer b.Stop()
+	if _, err := b.CreateRun("writer-run"); err != nil {
+		t.Fatalf("broker.CreateRun: %v", err)
+	}
+
+	writer := &runtimeFanoutWriter{
+		base:      stableTestSink{},
+		runtimeID: "rt_writer",
+		recorder:  broker.NewRecorder(b, "writer-run"),
+	}
+
+	if err := writer.Write(events.Event{
+		Event:     "session.end",
+		SessionID: "ses_writer",
+		Fields: map[string]any{
+			"stop_reason": "done",
+			"exit_code":   0,
+		},
+	}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if got := b.FinishCount("writer-run"); got != 1 {
+		t.Fatalf("finish count = %d, want 1", got)
+	}
+	if got := b.LastFinishStatus("writer-run"); got != "done" {
+		t.Fatalf("finish status = %q, want done", got)
+	}
+
+	t.Run("nil recorder", func(t *testing.T) {
+		writer := &runtimeFanoutWriter{
+			base:      stableTestSink{},
+			runtimeID: "rt_writer_nil",
+		}
+		if err := writer.Write(events.Event{Event: "agent.status", Fields: map[string]any{"phase": "idle"}}); err != nil {
+			t.Fatalf("Write with nil recorder: %v", err)
+		}
+	})
 }
 
 func TestRuntimeAnswerPermissionRejectsRuntimeWithoutActiveSession(t *testing.T) {

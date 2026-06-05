@@ -13,6 +13,7 @@ import (
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/phaseconfig"
 	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/sdougbrown/avenor/internal/runtime/broker"
 )
 
 type RunResult struct {
@@ -35,6 +36,7 @@ type RunOptions struct {
 	EventSink    phaseconfig.EventWriter
 	Config       *TeamConfig
 	MaxRetries   int
+	Broker       *broker.Broker
 	PhaseAttempt func(ctx context.Context, phase phaseconfig.Phase, attemptNum int, prevSessionID string) (PhaseAttemptResult, error)
 	NestedRun    func(ctx context.Context, configPath string, runType string) (NestedResult, error)
 	ConfigDir    string
@@ -48,6 +50,7 @@ type PhaseAttemptResult struct {
 	LoopLabel     string
 	Output        string
 	FinalReply    string
+	BrokerRunID   string
 }
 
 func Run(ctx context.Context, opts RunOptions) (RunResult, error) {
@@ -165,6 +168,8 @@ func runPrePhases(ctx context.Context, opts RunOptions, prevCommit *string) (str
 			return output.String(), nil, err
 		}
 
+		enrichFromBroker(opts, &result)
+
 		prevSessionID = result.SessionID
 		*prevCommit = phaseconfig.CaptureHeadCommit(opts.WorkDir)
 		output.WriteString(result.Output)
@@ -236,6 +241,10 @@ func runTeamMembers(ctx context.Context, opts RunOptions, members []phaseconfig.
 	}
 
 	wg.Wait()
+
+	for i := range results {
+		enrichFromBroker(opts, &results[i].result)
+	}
 
 	*prevCommit = phaseconfig.CaptureHeadCommit(opts.WorkDir)
 
@@ -319,6 +328,8 @@ func runSequentialPhases(ctx context.Context, opts RunOptions, phases []phasecon
 			_ = emitTeamEnd(opts.EventSink, opts.RunID, kind+"_failure", "", 0, 0)
 			return nil, err
 		}
+
+		enrichFromBroker(opts, &result)
 
 		prevSessionID = result.SessionID
 		*prevCommit = phaseconfig.CaptureHeadCommit(opts.WorkDir)
@@ -473,11 +484,12 @@ func completePhaseRequirements(ctx context.Context, opts RunOptions, phase phase
 	}
 
 	return PhaseAttemptResult{
-		ExitCode:   1,
-		SessionID:  sessionID,
-		StopReason: "incomplete_output",
-		Output:     result.Output,
-		FinalReply: result.FinalReply,
+		ExitCode:     1,
+		SessionID:    sessionID,
+		StopReason:   "incomplete_output",
+		Output:       result.Output,
+		FinalReply:   result.FinalReply,
+		BrokerRunID:  result.BrokerRunID,
 	}, nil
 }
 
@@ -654,4 +666,11 @@ func nestedLoopDirective(result NestedResult) string {
 		return "abort"
 	}
 	return ""
+}
+
+// enrichFromBroker supplements a PhaseAttemptResult with broker state
+// when available. It is a no-op when no broker is configured or the
+// attempt did not produce a brokerRunID.
+func enrichFromBroker(opts RunOptions, result *PhaseAttemptResult) {
+	broker.EnrichStopReason(opts.Broker, result.BrokerRunID, &result.StopReason)
 }

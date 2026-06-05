@@ -9,6 +9,7 @@ import (
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/phaseconfig"
 	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/sdougbrown/avenor/internal/runtime/broker"
 )
 
 type NestedResult struct {
@@ -24,6 +25,7 @@ type RunOptions struct {
 	EventSink  phaseconfig.EventWriter
 	Config     *LoopConfig
 	MaxRetries int
+	Broker     *broker.Broker
 	PhaseAttempt func(ctx context.Context, phase phaseconfig.Phase, attemptNum int, iteration int, prevSessionID string) (PhaseAttemptResult, error)
 	NestedRun  func(ctx context.Context, configPath string, runType string) (NestedResult, error)
 	ConfigDir  string
@@ -35,6 +37,7 @@ type PhaseAttemptResult struct {
 	StopReason    string
 	LoopDirective string
 	LoopLabel     string
+	BrokerRunID   string
 }
 
 type RunResult struct {
@@ -86,6 +89,8 @@ func Run(ctx context.Context, opts RunOptions) (RunResult, error) {
 				_ = emitLoopEnd(opts.EventSink, opts.RunID, "phase_failure", "", iterationsCompleted)
 				return RunResult{}, err
 			}
+
+			enrichFromBroker(opts, &result)
 
 			prevSessionIDs[phaseIdx] = result.SessionID
 			prevPhaseCommit = phaseconfig.CaptureHeadCommit(opts.WorkDir)
@@ -163,6 +168,8 @@ func runSequentialPhases(ctx context.Context, opts RunOptions, phases []phasecon
 			_ = emitLoopEnd(opts.EventSink, opts.RunID, "phase_failure", "", iterationsCompleted)
 			return nil, err
 		}
+
+		enrichFromBroker(opts, &result)
 
 		prevSessionID = result.SessionID
 		*prevCommit = phaseconfig.CaptureHeadCommit(opts.WorkDir)
@@ -374,4 +381,11 @@ func emitLoopEnd(w phaseconfig.EventWriter, runID string, exitReason, exitLabel 
 		Event:  "avenor.loop.end",
 		Fields: fields,
 	})
+}
+
+// enrichFromBroker supplements a PhaseAttemptResult with broker state
+// when available. It is a no-op when no broker is configured or the
+// attempt did not produce a brokerRunID.
+func enrichFromBroker(opts RunOptions, result *PhaseAttemptResult) {
+	broker.EnrichStopReason(opts.Broker, result.BrokerRunID, &result.StopReason)
 }
