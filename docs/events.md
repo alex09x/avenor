@@ -114,7 +114,7 @@ The `claude-channel` backend emits a few extra synthesized events so non-Claude 
 
 **`agent.prompt_queued`** — A prompt was queued onto the broker control channel for Claude to consume. Fields: `control_id`, `message_type` (currently `"continue"`), `delivery` (`"channel"`), `prompt_length`.
 
-**`agent.prompt_submitted`** — A prompt was injected directly into Claude's tmux pane and submitted with Enter. Fields: `delivery` (`"tmux"`), `prompt_length`.
+**`agent.prompt_submitted`** — A prompt was injected directly into Claude's terminal session and submitted with Enter. Fields: `delivery` (`"tmux"` or `"pty"` depending on which backend the session is running on), `prompt_length`.
 
 **`agent.report`** — The Claude sidecar called `avenor_report`. Fields: `state`, `payload`, `source` (`"channel"`). Avenor may also emit a second derived event such as `agent.message_chunk` or `agent.status` from the same report payload for compatibility with existing consumers.
 
@@ -161,7 +161,7 @@ Example (degenerate reasoning stream):
 
 **`agent.status`** — Synthesized by Avenor to signal agent phase transitions. Emitted before the protocol event that triggered it.
 
-Fields: `phase` (one of `thinking`, `working`, `waiting`, `done`), `source` (`"avenor"` for synthesized transitions, `"agent"` for explicit markers in output text), optional `label` (human-readable activity description), `ts` (Unix milliseconds).
+Fields: `phase` (one of `thinking`, `working`, `waiting`, `done`), `source` (`"avenor"` for synthesized transitions, `"agent"` for explicit markers in output text; for `claude-channel`, also `"transcript"` when derived from JSONL records, or the terminal kind `"tmux"`/`"pty"` for pane-scrape-derived `waiting`/permission states), optional `label` (human-readable activity description), `ts` (Unix milliseconds).
 
 Also includes `run_id` and `run_label` when present.
 

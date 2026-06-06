@@ -3,6 +3,8 @@ module github.com/sdougbrown/avenor
 go 1.25.0
 
 require (
+	github.com/chubin/vt10x v0.0.0-20231112153020-ef4f56837bf1
+	github.com/creack/pty v1.1.24
 	github.com/google/uuid v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.6.0
 )

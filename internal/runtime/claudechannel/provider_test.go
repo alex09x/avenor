@@ -7,10 +7,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/runtime"
 	"github.com/sdougbrown/avenor/internal/runtime/broker"
+	"github.com/sdougbrown/avenor/internal/runtime/claudechannel/terminal"
 )
 
 func TestNewWithOptions(t *testing.T) {
@@ -23,7 +25,33 @@ func TestNewWithOptions(t *testing.T) {
 	}
 }
 
+func TestDefaultLauncherIsTmux(t *testing.T) {
+	// Unset env var.
+	t.Setenv("AVENOR_CLAUDE_CHANNEL_TERMINAL", "")
+	l := defaultLauncher()
+	if _, ok := l.(terminal.TmuxLauncher); !ok {
+		t.Fatalf("expected TmuxLauncher, got %T", l)
+	}
+}
+
+func TestPTYEnvSelectsPTY(t *testing.T) {
+	t.Setenv("AVENOR_CLAUDE_CHANNEL_TERMINAL", "pty")
+	l := defaultLauncher()
+	if _, ok := l.(terminal.PTYLauncher); !ok {
+		t.Fatalf("expected PTYLauncher, got %T", l)
+	}
+}
+
+func TestInvalidValueDefaultsToTmux(t *testing.T) {
+	t.Setenv("AVENOR_CLAUDE_CHANNEL_TERMINAL", "bogus")
+	l := defaultLauncher()
+	if _, ok := l.(terminal.TmuxLauncher); !ok {
+		t.Fatalf("expected TmuxLauncher for invalid value, got %T", l)
+	}
+}
+
 func TestCapabilities(t *testing.T) {
+	t.Setenv("AVENOR_CLAUDE_CHANNEL_TERMINAL", "tmux")
 	p := New()
 	caps, err := p.Capabilities(context.Background())
 	if err != nil {
@@ -35,19 +63,98 @@ func TestCapabilities(t *testing.T) {
 	if !caps.Permissions {
 		t.Error("Permissions should be true")
 	}
-	if caps.Resume {
-		t.Error("Resume should be false")
+	if !caps.Resume {
+		t.Error("Resume should be true for tmux launcher")
 	}
 	if !caps.SubprocessDiscovery {
 		t.Error("SubprocessDiscovery should be true")
 	}
 }
 
-func TestResumeFails(t *testing.T) {
+func TestCapabilitiesPTYResumeFalse(t *testing.T) {
+	t.Setenv("AVENOR_CLAUDE_CHANNEL_TERMINAL", "pty")
 	p := New()
-	_, err := p.Resume(context.Background(), "ses_1")
+	caps, err := p.Capabilities(context.Background())
+	if err != nil {
+		t.Fatalf("Capabilities: %v", err)
+	}
+	if caps.Resume {
+		t.Error("Resume should be false for pty launcher")
+	}
+}
+
+func TestResumeRequiresSupportingLauncher(t *testing.T) {
+	p := &Provider{
+		sessions: make(map[string]*session),
+		launcher: terminal.PTYLauncher{},
+	}
+	_, err := p.Resume(context.Background(), "ses-1")
 	if err == nil {
-		t.Fatal("expected error for resume")
+		t.Fatal("expected error from Resume on PTY launcher")
+	}
+	if !strings.Contains(err.Error(), "resume not supported") {
+		t.Fatalf("error = %q, want 'resume not supported'", err)
+	}
+}
+
+func TestResumeMissingSession(t *testing.T) {
+	p := &Provider{
+		sessions: make(map[string]*session),
+		launcher: terminal.TmuxLauncher{},
+	}
+	_, err := p.Resume(context.Background(), "ses-unknown")
+	if err == nil {
+		t.Fatal("expected error for unknown session")
+	}
+	if !strings.Contains(err.Error(), "session not found") {
+		t.Fatalf("error = %q, want 'session not found'", err)
+	}
+}
+
+func TestResumeReturnsLiveSession(t *testing.T) {
+	p := &Provider{
+		sessions: make(map[string]*session),
+		launcher: terminal.TmuxLauncher{},
+	}
+	term := terminal.NewFakeSession("avenor-claude-ses-live", 4242, "ready")
+	p.sessions["ses-live"] = &session{
+		sessionID: "ses-live",
+		dir:       "/tmp/work",
+		term:      term,
+	}
+	got, err := p.Resume(context.Background(), "ses-live")
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	want := runtime.Session{
+		SessionID: "ses-live",
+		Backend:   backendID,
+		Dir:       "/tmp/work",
+		PID:       4242,
+	}
+	if got != want {
+		t.Fatalf("Resume = %+v, want %+v", got, want)
+	}
+}
+
+func TestResumeAfterTerminalDeath(t *testing.T) {
+	p := &Provider{
+		sessions: make(map[string]*session),
+		launcher: terminal.TmuxLauncher{},
+	}
+	term := terminal.NewFakeSession("avenor-claude-ses-dead", 1, "")
+	term.SetAlive(false)
+	p.sessions["ses-dead"] = &session{
+		sessionID: "ses-dead",
+		dir:       "/tmp/work",
+		term:      term,
+	}
+	_, err := p.Resume(context.Background(), "ses-dead")
+	if err == nil {
+		t.Fatal("expected error when terminal has exited")
+	}
+	if !strings.Contains(err.Error(), "terminal exited") {
+		t.Fatalf("error = %q, want 'terminal exited'", err)
 	}
 }
 
@@ -160,7 +267,18 @@ func TestPromptQueuesChannelEvent(t *testing.T) {
 		t.Fatalf("CreateRun: %v", err)
 	}
 	p := &Provider{broker: b, sessions: make(map[string]*session)}
-	s := &session{sessionID: "session-prompt", runID: runID, tmuxName: "missing", ctx: context.Background(), events: make(chan events.Event, 8)}
+	s := &session{
+		sessionID: "session-prompt",
+		runID:     runID,
+		tmuxName:  "missing",
+		ctx:       context.Background(),
+		events:    make(chan events.Event, 8),
+		term: func() terminal.Session {
+			term := terminal.NewFakeSession("missing", 0, "")
+			term.SetAlive(false)
+			return term
+		}(),
+	}
 	p.sessions[s.sessionID] = s
 
 	if err := p.Prompt(context.Background(), s.sessionID, "hello from test"); err != nil {
@@ -300,7 +418,8 @@ func TestWaitForPaneReadyStopsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if waitForPaneReady(ctx, "missing-session") {
+	term := terminal.NewFakeSession("missing", 0, "")
+	if waitForPaneReady(ctx, term) {
 		t.Fatal("waitForPaneReady should stop when context is canceled")
 	}
 }
@@ -357,6 +476,201 @@ func TestClassifyPane(t *testing.T) {
 	}
 }
 
+// TestScanTerminalTickActiveEmitsNothing pins the Stage-2 behavior: an
+// "active" pane state must NOT emit agent.status working — that's the
+// transcript tick's job. The pane scan only contributes idle/permission.
+func TestScanTerminalTickActiveEmitsNothing(t *testing.T) {
+	p := &Provider{
+		sessions: make(map[string]*session),
+		launcher: terminal.TmuxLauncher{},
+	}
+	// "Churning" classifies as paneStateActive.
+	term := terminal.NewFakeSession("test-term", 1, "✢ Churning… (2m 17s · ↓ 7.2k tokens)")
+	s := &session{
+		sessionID: "ses-active",
+		term:      term,
+		events:    make(chan events.Event, 4),
+		prompted:  true,
+		ctx:       context.Background(),
+	}
+	p.sessions[s.sessionID] = s
+
+	p.scanTerminalTick(s)
+
+	select {
+	case ev := <-s.events:
+		t.Fatalf("scanTerminalTick on active pane should not emit; got %+v", ev)
+	default:
+	}
+	s.mu.Lock()
+	active := s.active
+	s.mu.Unlock()
+	if !active {
+		t.Fatal("scanTerminalTick on active pane should still markActive")
+	}
+}
+
+// TestScanTranscriptTickIsAuthoritativeWorkingSignal verifies that, post-
+// Stage-2, agent.status working events come exclusively from the transcript
+// scanner when records arrive.
+func TestScanTranscriptTickIsAuthoritativeWorkingSignal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"assistant","timestamp":"t1"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := &Provider{
+		sessions: make(map[string]*session),
+		launcher: terminal.TmuxLauncher{},
+	}
+	s := &session{
+		sessionID:  "ses-trans",
+		term:       terminal.NewFakeSession("test-term", 1, "ready"),
+		transcript: newTranscriptReader(path),
+		events:     make(chan events.Event, 4),
+		prompted:   true,
+		ctx:        context.Background(),
+	}
+	p.sessions[s.sessionID] = s
+
+	p.scanTranscriptTick(s)
+
+	select {
+	case ev := <-s.events:
+		if ev.Event != "agent.status" {
+			t.Fatalf("event = %q, want agent.status", ev.Event)
+		}
+		if ev.Fields["phase"] != "working" {
+			t.Fatalf("phase = %v, want working", ev.Fields["phase"])
+		}
+		if ev.Fields["source"] != "transcript" {
+			t.Fatalf("source = %v, want transcript", ev.Fields["source"])
+		}
+		if ev.Fields["records"] != 1 {
+			t.Fatalf("records = %v, want 1", ev.Fields["records"])
+		}
+	default:
+		t.Fatal("expected agent.status working from scanTranscriptTick")
+	}
+}
+
+// Idle pane must emit waiting with source = backend Kind() (tmux or pty),
+// not a hardcoded string. Covers both backends so a regression that
+// reverts to a constant is caught.
+func TestScanTerminalTickIdleEmitsWaitingWithKind(t *testing.T) {
+	cases := []struct {
+		name string
+		kind string
+	}{
+		{"tmux", "tmux"},
+		{"pty", "pty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &Provider{
+				sessions: make(map[string]*session),
+				launcher: terminal.TmuxLauncher{},
+			}
+			term := terminal.NewFakeSession("test-term", 1, "❯ ready for input")
+			term.SetKind(tc.kind)
+			s := &session{
+				sessionID: "ses-idle-" + tc.kind,
+				term:      term,
+				events:    make(chan events.Event, 4),
+				prompted:  true,
+				ctx:       context.Background(),
+			}
+			p.sessions[s.sessionID] = s
+
+			p.scanTerminalTick(s)
+
+			select {
+			case ev := <-s.events:
+				if ev.Event != "agent.status" {
+					t.Fatalf("event = %q, want agent.status", ev.Event)
+				}
+				if ev.Fields["phase"] != "waiting" {
+					t.Fatalf("phase = %v, want waiting", ev.Fields["phase"])
+				}
+				if ev.Fields["source"] != tc.kind {
+					t.Fatalf("source = %v, want %q", ev.Fields["source"], tc.kind)
+				}
+			default:
+				t.Fatalf("expected agent.status waiting; got nothing")
+			}
+		})
+	}
+}
+
+// scanTranscriptTick and scanTerminalTick both short-circuit when the
+// session is finished or has never been prompted. These guards prevent
+// stale or premature status emissions; regressions would silently re-emit.
+func TestScanTicksRespectFinishedAndPromptedGuards(t *testing.T) {
+	writeTranscript := func(t *testing.T) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "session.jsonl")
+		if err := os.WriteFile(path, []byte(`{"type":"assistant","timestamp":"t1"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	newSession := func(t *testing.T) *session {
+		t.Helper()
+		return &session{
+			sessionID:  "ses-guard",
+			term:       terminal.NewFakeSession("test-term", 1, "❯ ready for input"),
+			transcript: newTranscriptReader(writeTranscript(t)),
+			events:     make(chan events.Event, 4),
+			ctx:        context.Background(),
+		}
+	}
+	assertNoEmit := func(t *testing.T, s *session) {
+		t.Helper()
+		select {
+		case ev := <-s.events:
+			t.Fatalf("expected no emit; got %+v", ev)
+		default:
+		}
+	}
+
+	t.Run("transcript skip when finished", func(t *testing.T) {
+		p := &Provider{sessions: make(map[string]*session), launcher: terminal.TmuxLauncher{}}
+		s := newSession(t)
+		s.prompted = true
+		s.finished = true
+		p.sessions[s.sessionID] = s
+		p.scanTranscriptTick(s)
+		assertNoEmit(t, s)
+	})
+
+	t.Run("transcript skip when not prompted", func(t *testing.T) {
+		p := &Provider{sessions: make(map[string]*session), launcher: terminal.TmuxLauncher{}}
+		s := newSession(t)
+		s.prompted = false
+		p.sessions[s.sessionID] = s
+		p.scanTranscriptTick(s)
+		assertNoEmit(t, s)
+	})
+
+	t.Run("terminal skip when finished", func(t *testing.T) {
+		p := &Provider{sessions: make(map[string]*session), launcher: terminal.TmuxLauncher{}}
+		s := newSession(t)
+		s.prompted = true
+		s.finished = true
+		p.sessions[s.sessionID] = s
+		p.scanTerminalTick(s)
+		assertNoEmit(t, s)
+	})
+
+	t.Run("terminal skip when not prompted", func(t *testing.T) {
+		p := &Provider{sessions: make(map[string]*session), launcher: terminal.TmuxLauncher{}}
+		s := newSession(t)
+		s.prompted = false
+		p.sessions[s.sessionID] = s
+		p.scanTerminalTick(s)
+		assertNoEmit(t, s)
+	})
+}
+
 func TestMarkActive(t *testing.T) {
 	s := &session{}
 	markActive(s)
@@ -369,7 +683,7 @@ func TestMarkActive(t *testing.T) {
 	}
 }
 
-func TestParseTmuxPermission(t *testing.T) {
+func TestParseTerminalPermission(t *testing.T) {
 	cases := []struct {
 		name        string
 		text        string
@@ -402,15 +716,15 @@ func TestParseTmuxPermission(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := parseTmuxPermission(tc.text)
+			got := parseTerminalPermission(tc.text)
 			if tc.wantOpts == 0 {
 				if got != nil {
-					t.Fatalf("parseTmuxPermission should return nil, got %+v", got)
+					t.Fatalf("parseTerminalPermission should return nil, got %+v", got)
 				}
 				return
 			}
 			if got == nil {
-				t.Fatal("parseTmuxPermission returned nil")
+				t.Fatal("parseTerminalPermission returned nil")
 			}
 			if got.prompt != tc.wantPrompt {
 				t.Fatalf("prompt = %q, want %q", got.prompt, tc.wantPrompt)
@@ -425,39 +739,40 @@ func TestParseTmuxPermission(t *testing.T) {
 	}
 }
 
-func TestAnswerPermissionTmuxRoute(t *testing.T) {
+func TestAnswerPermissionTerminalRoute(t *testing.T) {
 	p := &Provider{sessions: make(map[string]*session)}
 
-	tmuxPerm := &tmuxPermission{
-		requestID: "tmux-req-1",
+	terminalPerm := &terminalPermission{
+		requestID: "term-req-1",
 		prompt:    "Do you want to proceed?",
 		options:   []permissionOption{{ID: "1", Label: "Yes"}, {ID: "2", Label: "No"}},
-		tmuxName:  "avenor-test",
 	}
 
 	s := &session{
-		sessionID:       "ses-tmux",
-		runID:           "run-tmux",
-		pendingTmuxPerm: tmuxPerm,
-		events:          make(chan events.Event, 64),
+		sessionID:           "ses-tmux",
+		runID:               "run-tmux",
+		pendingTerminalPerm: terminalPerm,
+		events:              make(chan events.Event, 64),
+		term:                terminal.NewFakeSession("test-term", 1, "ready"),
 	}
 
 	p.sessions["ses-tmux"] = s
 
-	// Answering a tmux permission with allow (sends keys via tmux, which won't
-	// exist in tests — we check that it clears the pending state and doesn't
-	// return a broker routing error).
-	err := p.AnswerPermission(context.Background(), "ses-tmux", "tmux-req-1", runtime.PermissionResponse{Allow: true, OptionID: "1"})
-	// Expect tmux error since no tmux session exists, but permission state cleared.
-	if err == nil {
-		t.Fatal("expected tmux error (no session) but got nil")
+	err := p.AnswerPermission(context.Background(), "ses-tmux", "term-req-1", runtime.PermissionResponse{Allow: true, OptionID: "1"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	s.mu.Lock()
-	cleared := s.pendingTmuxPerm
+	cleared := s.pendingTerminalPerm
 	s.mu.Unlock()
 	if cleared != nil {
-		t.Fatal("pendingTmuxPerm should be cleared after AnswerPermission")
+		t.Fatal("pendingTerminalPerm should be cleared after AnswerPermission")
+	}
+
+	sends := s.term.(*terminal.FakeSession).SendCalls()
+	if len(sends) != 1 || len(sends[0]) != 2 || sends[0][0] != "1" || sends[0][1] != string(terminal.KeyEnter) {
+		t.Fatalf("keys sent = %v, want [[1 Enter]]", sends)
 	}
 }
 
@@ -661,5 +976,262 @@ func TestCleanupProjectMCPRemovesOnlyAvenorChannelEntries(t *testing.T) {
 	}
 	if _, ok := servers["context7"]; !ok {
 		t.Fatal("expected context7 entry to remain")
+	}
+}
+
+// ---- Stage 3: Adapter-backed provider tests ----
+
+func TestPromptWaitsForStartupClearBeforePaste(t *testing.T) {
+	// Test that waitForPaneReady returns true when capture doesn't contain needle.
+	term := terminal.NewFakeSession("test-term", 1, "ready")
+	if !waitForPaneReady(context.Background(), term) {
+		t.Fatal("waitForPaneReady should return true when capture doesn't contain needle")
+	}
+
+	// Test that waitForPaneReady waits when capture contains needle, then returns true.
+	term2 := terminal.NewFakeSessionQueue("test-term2", 2, []string{
+		"Loading development channels\n",
+		"ready\n",
+	})
+	if !waitForPaneReady(context.Background(), term2) {
+		t.Fatal("waitForPaneReady should return true after needle disappears")
+	}
+}
+
+func TestPromptQueuesBrokerControlEvenWhenTerminalInjectionAsync(t *testing.T) {
+	runID := "run-queue"
+	b := broker.New("")
+	if _, err := b.CreateRun(runID); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	p := &Provider{
+		broker:   b,
+		sessions: make(map[string]*session),
+		launcher: terminal.TmuxLauncher{},
+	}
+	term := terminal.NewFakeSession("test-term", 1, "ready")
+	sessCtx, sessCancel := context.WithCancel(context.Background())
+	t.Cleanup(sessCancel)
+	s := &session{
+		sessionID: "ses-queue",
+		runID:     runID,
+		ctx:       sessCtx,
+		term:      term,
+		events:    make(chan events.Event, 8),
+	}
+	p.sessions[s.sessionID] = s
+
+	if err := p.Prompt(context.Background(), s.sessionID, "hello"); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+
+	// The broker control message should be pushed synchronously.
+	select {
+	case ev := <-s.events:
+		if ev.Event != "agent.prompt_queued" {
+			t.Fatalf("event = %q, want agent.prompt_queued", ev.Event)
+		}
+		if ev.Fields["delivery"] != "channel" {
+			t.Fatalf("delivery = %v, want channel", ev.Fields["delivery"])
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected agent.prompt_queued event")
+	}
+}
+
+func TestDevelopmentChannelPromptsSendRightKeys(t *testing.T) {
+	cases := []struct {
+		name    string
+		search  string
+		wantSeq []string
+	}{
+		{"mcp found", "New MCP server found in this project", []string{"1", string(terminal.KeyEnter)}},
+		{"loading channels", "Loading development channels", []string{string(terminal.KeyEnter)}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID := "run-" + tc.name
+			b := broker.New("")
+			if _, err := b.CreateRun(runID); err != nil {
+				t.Fatalf("CreateRun: %v", err)
+			}
+			p := &Provider{
+				broker:   b,
+				sessions: make(map[string]*session),
+				launcher: terminal.TmuxLauncher{},
+			}
+			term := terminal.NewFakeSessionQueue("test-term", 1, []string{
+				tc.search + "\n",
+				"ready\n",
+			})
+			sendNotify := make(chan []string, 1)
+			term.SetSendNotify(sendNotify)
+			s := &session{
+				sessionID: "ses-dev",
+				runID:     runID,
+				ctx:       context.Background(),
+				term:      term,
+				events:    make(chan events.Event, 8),
+				done:      make(chan struct{}),
+			}
+			p.sessions[s.sessionID] = s
+
+			// Start autoConfirmDevelopmentChannelPrompt directly since we're not
+			// calling Start() which would normally start it.
+			go autoConfirmDevelopmentChannelPrompt(s.ctx, s)
+			defer close(s.done)
+
+			select {
+			case send := <-sendNotify:
+				if len(send) != len(tc.wantSeq) {
+					t.Fatalf("key count = %d, want %d (got %v)", len(send), len(tc.wantSeq), send)
+				}
+				for i, want := range tc.wantSeq {
+					if send[i] != want {
+						t.Fatalf("key[%d] = %q, want %q (full sequence: %v)", i, send[i], want, send)
+					}
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("expected SendKeys to be called by autoConfirmDevelopmentChannelPrompt")
+			}
+		})
+	}
+}
+
+func TestPermissionAllowedSendsDigitAndEnter(t *testing.T) {
+	runID := "run-allow"
+	b := broker.New("")
+	if _, err := b.CreateRun(runID); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	p := &Provider{
+		broker:   b,
+		sessions: make(map[string]*session),
+		launcher: terminal.TmuxLauncher{},
+	}
+	term := terminal.NewFakeSession("test-term", 1, "ready")
+	sessCtx, sessCancel := context.WithCancel(context.Background())
+	s := &session{
+		sessionID: "ses-allow",
+		runID:     runID,
+		ctx:       sessCtx,
+		cancelFn:  sessCancel,
+		term:      term,
+		pendingTerminalPerm: &terminalPermission{
+			requestID: "perm-1",
+		},
+		events: make(chan events.Event, 8),
+		done:   make(chan struct{}),
+	}
+	p.sessions[s.sessionID] = s
+
+	err := p.AnswerPermission(context.Background(), s.sessionID, "perm-1", runtime.PermissionResponse{Allow: true, OptionID: "1"})
+	if err != nil {
+		t.Fatalf("AnswerPermission: %v", err)
+	}
+
+	sends := term.SendCalls()
+	if len(sends) != 1 {
+		t.Fatalf("SendKeys call count = %d, want 1 (calls: %v)", len(sends), sends)
+	}
+	if len(sends[0]) != 2 {
+		t.Fatalf("keys sent = %v, want [1 Enter]", sends[0])
+	}
+	if sends[0][0] != "1" || sends[0][1] != string(terminal.KeyEnter) {
+		t.Fatalf("keys sent = %v, want [1 Enter]", sends[0])
+	}
+}
+
+func TestPermissionDeniedSendsEscAndEnter(t *testing.T) {
+	runID := "run-deny"
+	b := broker.New("")
+	if _, err := b.CreateRun(runID); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	p := &Provider{
+		broker:   b,
+		sessions: make(map[string]*session),
+		launcher: terminal.TmuxLauncher{},
+	}
+	term := terminal.NewFakeSession("test-term", 1, "ready")
+	sessCtx, sessCancel := context.WithCancel(context.Background())
+	s := &session{
+		sessionID: "ses-deny",
+		runID:     runID,
+		ctx:       sessCtx,
+		cancelFn:  sessCancel,
+		term:      term,
+		pendingTerminalPerm: &terminalPermission{
+			requestID: "perm-2",
+		},
+		events: make(chan events.Event, 8),
+		done:   make(chan struct{}),
+	}
+	p.sessions[s.sessionID] = s
+
+	err := p.AnswerPermission(context.Background(), s.sessionID, "perm-2", runtime.PermissionResponse{Allow: false})
+	if err != nil {
+		t.Fatalf("AnswerPermission: %v", err)
+	}
+
+	sends := term.SendCalls()
+	if len(sends) != 1 {
+		t.Fatalf("SendKeys call count = %d, want 1 (calls: %v)", len(sends), sends)
+	}
+	if len(sends[0]) != 2 {
+		t.Fatalf("keys sent = %v, want [Esc Enter]", sends[0])
+	}
+	if sends[0][0] != string(terminal.KeyEsc) || sends[0][1] != string(terminal.KeyEnter) {
+		t.Fatalf("keys sent = %v, want [Esc Enter]", sends[0])
+	}
+}
+
+func TestSessionGoneEmitsFallbackEnd(t *testing.T) {
+	runID := "run-gone"
+	b := broker.New("")
+	if _, err := b.CreateRun(runID); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	p := &Provider{
+		broker:   b,
+		sessions: make(map[string]*session),
+		launcher: terminal.TmuxLauncher{},
+	}
+	term := terminal.NewFakeSession("test-term", 1, "ready")
+	sessCtx, sessCancel := context.WithCancel(context.Background())
+	mcpDir := t.TempDir()
+	mcpProject := filepath.Join(t.TempDir(), ".mcp.json")
+	s := &session{
+		sessionID:  "ses-gone",
+		runID:      runID,
+		ctx:        sessCtx,
+		cancelFn:   sessCancel,
+		term:       term,
+		mcpDir:     mcpDir,
+		mcpProject: mcpProject,
+		mcpServer:  "test-server",
+		events:     make(chan events.Event, 8),
+		done:       make(chan struct{}),
+	}
+	p.sessions[s.sessionID] = s
+
+	term.SetAlive(false)
+	go p.runSession(s.ctx, s)
+
+	// Wait for session.end event.
+	select {
+	case ev := <-s.events:
+		if ev.Event != "session.end" {
+			t.Fatalf("event = %q, want session.end", ev.Event)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for session.end event after session went away")
+	}
+
+	select {
+	case <-s.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for runSession to exit")
 	}
 }
