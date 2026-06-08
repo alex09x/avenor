@@ -1,6 +1,7 @@
 import type { Plugin, ToolContext } from '@opencode-ai/plugin'
 import { tool } from '@opencode-ai/plugin'
 import { z } from 'zod'
+import * as crypto from 'node:crypto'
 import {
   spawnTool, statusTool, eventsTool, answerPermissionTool,
   followUpTool, shutdownTool,
@@ -9,6 +10,7 @@ import {
 
 type TrackedRun = {
   runId: string
+  agent: string
   orchestratorSessionId: string
   label: string
   supervisorId?: string
@@ -49,23 +51,75 @@ function summarizeEvent(evt: { type?: unknown; event?: unknown; tool?: unknown; 
   return type
 }
 
+// Channel block pattern: <channel source="agent-reviewer" from_run_id="abc123" from_role="reviewer">content</channel>
+const CHANNEL_RE = /<channel\s+source="([^"]*)"(?:\s+from_run_id="([^"]*)")?(?:\s+from_role="([^"]*)")?[^>]*>([\s\S]*?)<\/channel>/g
+
+function formatAgentMessage(source: string, fromRunId: string, fromRole: string, content: string): string {
+  // Strip redundant "agent-" prefix that both the Go sidecar (ChannelWrap) and
+  // the plugin's pollChannelMessages may prepend, so "agent-agent" becomes "agent".
+  const label = source.replace(/^agent-/, '') || source
+  const shortId = fromRunId ? fromRunId.slice(0, 8) : ''
+  const lines = [
+    `📨 ${label} (${shortId})`,
+    '',
+    ...content.trim().split('\n').map(l => `  ${l}`),
+  ]
+  return lines.join('\n') + '\n'
+}
+
+function renderChannelMessage(match: string, source: string, fromRunId: string, fromRole: string, content: string): string {
+  return formatAgentMessage(source, fromRunId, fromRole, content)
+}
+
+function formatChannelBlocks(text: string): string {
+  CHANNEL_RE.lastIndex = 0
+  return text.replace(CHANNEL_RE, (...args: Parameters<typeof renderChannelMessage>) => {
+    return renderChannelMessage(
+      args[0] as string,
+      args[1] as string,
+      args[2] as string,
+      args[3] as string,
+      args[4] as string,
+    )
+  })
+}
+
 export const AvenorPlugin: Plugin = async (ctx) => {
   // Primary state: runId → run info
   const trackedRuns = new Map<string, TrackedRun>()
   // Reverse index: opencode sessionId → avenor runId (for permission routing)
   const sessionIdToRunId = new Map<string, string>()
+  // Reverse index: avenor runtimeId → avenor runId (for channel message attribution)
+  const runtimeIdToRunId = new Map<string, string>()
+  // Channel-messaging state for receiving messages from spawned children.
+  let parentRunId = ''
+  let parentToken = ''
+  let brokerUrl = ''
+  let channelPolling = false
 
-  function registerSessionId(sessionId: string | undefined, runId: string): void {
+  function ensureParentRunId(): string {
+    if (!parentRunId) {
+      parentRunId = crypto.randomUUID()
+    }
+    return parentRunId
+  }
+
+  function registerSessionId(sessionId: string | undefined, runtimeId: string | undefined, runId: string): void {
     if (sessionId && !sessionIdToRunId.has(sessionId)) {
       sessionIdToRunId.set(sessionId, runId)
+    }
+    if (runtimeId && !runtimeIdToRunId.has(runtimeId)) {
+      runtimeIdToRunId.set(runtimeId, runId)
     }
   }
 
   // Used by both fire-and-forget (session.idle trigger) and permision routing
   // to re-prompt the orchestrator when a run completes.
   async function monitorRun(run: TrackedRun): Promise<void> {
+    let firstPoll = true
     while (true) {
-      await sleep(POLL_INTERVAL_MS)
+      if (!firstPoll) await sleep(POLL_INTERVAL_MS)
+      firstPoll = false
 
       let raw: StatusResult | StatusResult[]
       try {
@@ -77,7 +131,7 @@ export const AvenorPlugin: Plugin = async (ctx) => {
       const result = Array.isArray(raw) ? raw[0] : raw
       if (!result) continue
 
-      registerSessionId(result.session_id, run.runId)
+      registerSessionId(result.session_id, result.runtime_id, run.runId)
 
       if (TERMINAL_STATUSES.has(result.status)) {
         trackedRuns.delete(run.runId)
@@ -92,6 +146,65 @@ export const AvenorPlugin: Plugin = async (ctx) => {
     }
   }
 
+  // ── Channel message polling ─────────────────────────────────────────────
+
+   async function pollChannelMessages(sessionId: string): Promise<void> {
+     if (channelPolling || !brokerUrl || !parentRunId || !parentToken) return
+
+     channelPolling = true
+     let consecutiveErrors = 0
+     const MAX_CONSECUTIVE_ERRORS = 10
+
+     try {
+       while (consecutiveErrors < MAX_CONSECUTIVE_ERRORS) {
+         await sleep(POLL_INTERVAL_MS)
+         let msgs: any[]
+         try {
+           const resp = await fetch(`${brokerUrl}/poll-control`, {
+             method: 'POST',
+             headers: { 'Content-Type': 'application/json' },
+             body: JSON.stringify({ run_id: parentRunId, token: parentToken }),
+           })
+           if (!resp.ok) {
+             consecutiveErrors++
+             continue
+           }
+           msgs = await resp.json()
+           consecutiveErrors = 0
+         } catch {
+           consecutiveErrors++
+           continue
+         }
+          for (const msg of (msgs ?? [])) {
+            if (msg.type !== 'agent_message') continue
+            let payload: any
+            try { payload = typeof msg.payload === 'string' ? JSON.parse(msg.payload) : msg.payload } catch { continue }
+            const text = typeof payload?.message === 'string' ? payload.message : ''
+            if (!text) continue
+            const from = payload.from_run_id ?? msg.from_run_id ?? 'unknown'
+            const role = payload.role ?? ''
+            // Resolve the agent name from any known ID: run_id, session_id, or runtime_id.
+            const resolvedRunId = trackedRuns.has(from) ? from
+              : sessionIdToRunId.get(from)
+              ?? runtimeIdToRunId.get(from)
+            const runInfo = resolvedRunId ? trackedRuns.get(resolvedRunId) : undefined
+            const source = runInfo?.agent ?? (role ? `agent-${role}` : 'agent')
+            const channelText = formatAgentMessage(source, from, role, text)
+           try {
+             await ctx.client.session.promptAsync({
+               path: { id: sessionId },
+               body: { parts: [{ type: 'text', text: channelText }] },
+             })
+           } catch {
+             // Session likely gone — stop polling.
+             return
+           }
+         }
+       }
+     } finally {
+       channelPolling = false
+     }
+   }
   return {
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -100,6 +213,8 @@ export const AvenorPlugin: Plugin = async (ctx) => {
       const { sessionID } = (
         event as { type: 'session.idle'; properties: { sessionID: string } }
       ).properties
+
+      pollChannelMessages(sessionID).catch(console.error)
 
       for (const run of trackedRuns.values()) {
         if (run.orchestratorSessionId === sessionID && !run.monitoring) {
@@ -141,6 +256,33 @@ export const AvenorPlugin: Plugin = async (ctx) => {
       }).catch(() => {})
     },
 
+    // ── Channel rendering ────────────────────────────────────────────────────
+    // When a channel message arrives at the top-level orchestrator (injected as
+    // a raw <channel> XML prompt), format it for human readability. The model
+    // still receives the full XML with the untrusted-content instruction; this
+    // only prettifies the display.
+
+    "chat.message": async (message: any, _output: any) => {
+      if (!message?.parts) return
+      for (const part of message.parts) {
+        if (part?.type === 'text' && typeof part?.text === 'string' && part.text.includes('<channel ')) {
+          part.text = formatChannelBlocks(part.text)
+        }
+      }
+    },
+
+    "experimental.text.complete": async (
+      _input: { sessionID: string; messageID: string; partID: string },
+      output: { text: string },
+    ) => {
+      if (typeof output.text !== 'string' || !output.text.includes('<channel ')) return
+      try {
+        output.text = formatChannelBlocks(output.text)
+      } catch {
+        // Leave text as-is if formatting fails
+      }
+    },
+
     // ── Tools ─────────────────────────────────────────────────────────────────
 
     tool: {
@@ -162,6 +304,7 @@ export const AvenorPlugin: Plugin = async (ctx) => {
           ),
         },
         async execute(args, context: ToolContext) {
+          const parentRunId = ensureParentRunId()
           const result = await spawnTool({
             agent: args.agent,
             prompt: args.prompt,
@@ -173,12 +316,23 @@ export const AvenorPlugin: Plugin = async (ctx) => {
             backend: args.backend,
             serverUrl: args.server_url,
             supervisorId: args.supervisor_id,
+            parent_run_id: parentRunId,
           })
+
+           // Capture broker info for channel messaging. Update on every spawn
+           // so a different supervisor can take over if needed.
+           if (result.broker_url) {
+             brokerUrl = result.broker_url
+           }
+           if (result.parent_token) {
+             parentToken = result.parent_token
+           }
 
           const supervisorId = result.supervisor_id || args.supervisor_id
 
           trackedRuns.set(result.run_id, {
             runId: result.run_id,
+            agent: args.agent,
             orchestratorSessionId: context.sessionID,
             label: result.label,
             supervisorId,
@@ -186,8 +340,17 @@ export const AvenorPlugin: Plugin = async (ctx) => {
             monitoring: args.wait,
           })
 
+          // Register runtime_id immediately so channel messages arriving
+          // before the first status poll can still resolve the agent name.
+          if (result.runtime_id) {
+            runtimeIdToRunId.set(result.runtime_id, result.run_id)
+          }
+
           if (!args.wait) {
-            return result as any
+            return {
+              title: `${result.label} — dispatched`,
+              output: `Dispatched "${result.label}" (run_id: ${result.run_id}). Call avenor_status with run_id to check progress, or wait for the completion notification.`,
+            }
           }
 
           // ── Blocking mode: live updates via context.metadata ──────────────
@@ -213,7 +376,7 @@ export const AvenorPlugin: Plugin = async (ctx) => {
             const status = Array.isArray(raw) ? raw[0] : raw
             if (!status) continue
 
-            registerSessionId(status.session_id, result.run_id)
+            registerSessionId(status.session_id, status.runtime_id, result.run_id)
 
             if (status.pending_permission) {
               context.metadata({
@@ -274,10 +437,11 @@ export const AvenorPlugin: Plugin = async (ctx) => {
           supervisor_id: z.string().optional().describe('Reuse an existing supervisor by socket path'),
         },
         async execute(args, _context) {
-          return statusTool({
+          const result = await statusTool({
             runId: args.run_id,
             supervisorId: args.supervisor_id,
-          }) as any
+          })
+          return JSON.stringify(result, null, 2)
         },
       }),
 
@@ -291,12 +455,13 @@ export const AvenorPlugin: Plugin = async (ctx) => {
           supervisor_id: z.string().optional().describe('Reuse an existing supervisor by socket path'),
         },
         async execute(args, _context) {
-          return answerPermissionTool({
+          const result = await answerPermissionTool({
             runId: args.run_id,
             optionId: args.option_id,
             requestId: args.request_id,
             supervisorId: args.supervisor_id,
-          }) as any
+          })
+          return JSON.stringify(result, null, 2)
         },
       }),
 
@@ -309,12 +474,13 @@ export const AvenorPlugin: Plugin = async (ctx) => {
           supervisor_id: z.string().optional().describe('Reuse an existing supervisor by socket path'),
         },
         async execute(args, _context) {
-          return followUpTool({
+          const result = await followUpTool({
             runId: args.run_id,
             message: args.message,
             label: args.label,
             supervisorId: args.supervisor_id,
-          }) as any
+          })
+          return JSON.stringify(result, null, 2)
         },
       }),
 
@@ -327,12 +493,13 @@ export const AvenorPlugin: Plugin = async (ctx) => {
           supervisor_id: z.string().optional().describe('Reuse an existing supervisor by socket path'),
         },
         async execute(args, _context) {
-          return eventsTool({
+          const result = await eventsTool({
             runId: args.run_id,
             types: args.types,
             limit: args.limit,
             supervisorId: args.supervisor_id,
-          }) as any
+          })
+          return JSON.stringify(result, null, 2)
         },
       }),
 
@@ -343,10 +510,11 @@ export const AvenorPlugin: Plugin = async (ctx) => {
           force: z.boolean().optional().describe('Force shutdown instead of graceful'),
         },
         async execute(args, _context) {
-          return shutdownTool({
+          const result = await shutdownTool({
             supervisorId: args.supervisor_id,
             force: args.force,
-          }) as any
+          })
+          return JSON.stringify(result, null, 2)
         },
       }),
     },

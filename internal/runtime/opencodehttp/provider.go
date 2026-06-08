@@ -9,8 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/sdougbrown/avenor/internal/runtime/broker"
 )
 
 const backendID = "opencode-http"
@@ -26,6 +28,13 @@ type Provider struct {
 	sessions      map[string]sessionState
 	subscribers   map[chan events.Event]string
 	endedSessions map[string]bool // guards double-emit of session.end
+
+	// Broker fields for channel-wrapped prompt injection.
+	broker          *broker.Broker
+	runIDs          map[string]string // sessionID → runID
+	pollCancels     map[string]context.CancelFunc
+	pendingMu       sync.Mutex
+	pendingMessages map[string][]string // sessionID → queued wrapped prompts
 }
 
 type sessionState struct {
@@ -42,10 +51,13 @@ func New() (runtime.Provider, error) {
 // NewWithOptions creates a Provider with the given options.
 func NewWithOptions(opts runtime.StartOptions) (runtime.Provider, error) {
 	return &Provider{
-		opts:          opts,
-		sessions:      make(map[string]sessionState),
-		subscribers:   make(map[chan events.Event]string),
-		endedSessions: make(map[string]bool),
+		opts:            opts,
+		sessions:        make(map[string]sessionState),
+		subscribers:     make(map[chan events.Event]string),
+		endedSessions:   make(map[string]bool),
+		runIDs:          make(map[string]string),
+		pollCancels:     make(map[string]context.CancelFunc),
+		pendingMessages: make(map[string][]string),
 	}, nil
 }
 
@@ -73,10 +85,36 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	if err != nil {
 		return runtime.Session{}, fmt.Errorf("create session: %w", err)
 	}
+
+	// Register a broker run for this session.
+	p.mu.Lock()
+	broker := p.broker
+	p.mu.Unlock()
+	var runID string
+	if broker != nil {
+		runID = uuid.New().String()
+		if _, err := broker.CreateRun(runID); err != nil {
+			runID = ""
+		}
+	}
 	p.mu.Lock()
 	merged.Dir = sessionDir
 	p.sessions[sessionID] = sessionState{sessionID: sessionID, dir: sessionDir, opts: merged}
+	p.runIDs[sessionID] = runID
 	p.mu.Unlock()
+
+	// Start the broker message polling goroutine.
+	if runID != "" {
+		pollCtx, cancel := context.WithCancel(ctx)
+		p.mu.Lock()
+		p.pollCancels[sessionID] = cancel
+		p.mu.Unlock()
+		go p.broker.PollAgentMessages(pollCtx, runID, func(wrapped string) {
+			p.pendingMu.Lock()
+			p.pendingMessages[sessionID] = append(p.pendingMessages[sessionID], wrapped)
+			p.pendingMu.Unlock()
+		})
+	}
 
 	return runtime.Session{
 		SessionID: sessionID,
@@ -206,11 +244,25 @@ func (p *Provider) Capabilities(ctx context.Context) (runtime.Capabilities, erro
 // Close shuts down the event stream and releases resources.
 func (p *Provider) Close() error {
 	p.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(p.pollCancels))
+	for _, cancel := range p.pollCancels {
+		cancels = append(cancels, cancel)
+	}
 	if p.streamCancel != nil {
 		p.streamCancel()
 		p.streamCancel = nil
 	}
+	p.pollCancels = make(map[string]context.CancelFunc)
 	p.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	p.mu.Lock()
+	p.runIDs = nil
+	p.mu.Unlock()
+	p.pendingMu.Lock()
+	p.pendingMessages = map[string][]string{}
+	p.pendingMu.Unlock()
 	return nil
 }
 
@@ -222,6 +274,13 @@ func (p *Provider) ensureClient(ctx context.Context, opts runtime.StartOptions) 
 		return c, nil
 	}
 	p.mu.Unlock()
+
+	// Store broker reference if provided.
+	if opts.Broker != nil {
+		p.mu.Lock()
+		p.broker = opts.Broker
+		p.mu.Unlock()
+	}
 
 	co, safeURL := clientOptionsFromURL(opts.ServerURL)
 	client := NewClient(co)
@@ -280,6 +339,8 @@ func (p *Provider) streamEvents(ctx context.Context, c *Client) {
 					goto reconnect
 				}
 				if evt.Event == "session.end" {
+					// Inject pending channel-wrapped messages at turn boundary.
+					p.injectPendingMessages(ctx, evt.SessionID)
 					// POST /message is the authoritative terminal signal. Use
 					// publishSessionEnd to deduplicate: if Prompt already
 					// emitted session.end from the synchronous POST response,
@@ -464,4 +525,19 @@ func clientOptionsFromURL(rawURL string) (ClientOptions, string) {
 	return co, u.Redacted()
 }
 
+// injectPendingMessages injects queued channel-wrapped messages for a session
+// at a turn boundary.
+func (p *Provider) injectPendingMessages(ctx context.Context, sessionID string) {
+	p.pendingMu.Lock()
+	msgs := p.pendingMessages[sessionID]
+	p.pendingMessages[sessionID] = nil
+	p.pendingMu.Unlock()
 
+	if len(msgs) == 0 {
+		return
+	}
+	p.beginSessionTurn(sessionID)
+	for _, msg := range msgs {
+		p.Prompt(ctx, sessionID, msg)
+	}
+}

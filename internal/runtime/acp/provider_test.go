@@ -3,11 +3,15 @@ package acp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/sdougbrown/avenor/internal/runtime/broker"
 )
 
 func TestSelectPermissionOption(t *testing.T) {
@@ -309,6 +313,41 @@ type recordingWriteCloser struct {
 
 func (recordingWriteCloser) Close() error { return nil }
 
+type promptReplyingWriteCloser struct {
+	t       *testing.T
+	client  **Client
+	prompts []string
+}
+
+func (w *promptReplyingWriteCloser) Write(p []byte) (int, error) {
+	var msg rpcEnvelope
+	if err := json.Unmarshal(bytes.TrimSpace(p), &msg); err != nil {
+		w.t.Fatalf("decode request: %v", err)
+	}
+	var params struct {
+		SessionID string `json:"sessionId"`
+		Prompt    []struct {
+			Text string `json:"text"`
+		} `json:"prompt"`
+	}
+	if err := json.Unmarshal(msg.Params, &params); err != nil {
+		w.t.Fatalf("decode params: %v", err)
+	}
+	if len(params.Prompt) > 0 {
+		w.prompts = append(w.prompts, params.Prompt[0].Text)
+	}
+	client := *w.client
+	client.pendingMu.Lock()
+	ch := client.pending[string(msg.ID)]
+	client.pendingMu.Unlock()
+	if ch != nil {
+		ch <- rpcEnvelope{ID: msg.ID, Result: json.RawMessage(`{"stopReason":"end_turn"}`)}
+	}
+	return len(p), nil
+}
+
+func (*promptReplyingWriteCloser) Close() error { return nil }
+
 func TestAnswerPermissionRemovesCacheAfterSuccess(t *testing.T) {
 	stdin := &recordingWriteCloser{}
 	p := &Provider{}
@@ -335,6 +374,56 @@ func TestAnswerPermissionRemovesCacheAfterSuccess(t *testing.T) {
 	p.mu.Unlock()
 	if ok {
 		t.Fatal("pending options should be cleared after successful answer")
+	}
+}
+
+func TestCachePermissionOptionsSessionEndInjectsPendingMessages(t *testing.T) {
+	var client *Client
+	stdin := &promptReplyingWriteCloser{t: t, client: &client}
+	client = &Client{
+		stdin:   stdin,
+		events:  make(chan events.Event, 2),
+		done:    make(chan struct{}),
+		pending: map[string]chan rpcEnvelope{},
+	}
+	p := &Provider{
+		sessions: map[string]*Session{
+			"ses": {Client: client, SessionID: "ses"},
+		},
+		pendingOptions: map[string]map[string][]any{
+			"ses": {
+				"req": {map[string]any{"optionId": "allow", "kind": "allow"}},
+			},
+		},
+		pendingMessages: map[string][]string{"ses": {"<channel>hello</channel>"}},
+		events:          make(chan events.Event, 2),
+	}
+
+	p.cachePermissionOptions(events.Event{Event: "session.end", SessionID: "ses"})
+
+	if len(stdin.prompts) != 1 || stdin.prompts[0] != "<channel>hello</channel>" {
+		t.Fatalf("injected prompts = %#v, want pending channel message", stdin.prompts)
+	}
+	p.pendingMu.Lock()
+	if len(p.pendingMessages["ses"]) != 0 {
+		p.pendingMu.Unlock()
+		t.Fatalf("pending messages not cleared: %#v", p.pendingMessages["ses"])
+	}
+	p.pendingMu.Unlock()
+	p.mu.Lock()
+	if _, ok := p.pendingOptions["ses"]; ok {
+		p.mu.Unlock()
+		t.Fatal("pending permission options should be cleared after session end")
+	}
+	p.mu.Unlock()
+
+	select {
+	case evt := <-p.events:
+		if evt.Event != "agent.message_chunk" || evt.SessionID != "ses" {
+			t.Fatalf("published event = %#v, want agent.message_chunk for ses", evt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for injected agent.message_chunk event")
 	}
 }
 
@@ -423,5 +512,53 @@ func TestAnswerPermissionRemovesFallbackCacheAfterSuccess(t *testing.T) {
 	p.mu.Unlock()
 	if ok {
 		t.Fatal("fallback pending options should be cleared after successful answer")
+	}
+}
+
+func TestStartRunsClientEnvCleanupOnEnsureClientFailure(t *testing.T) {
+	cleaned := false
+	p := &Provider{
+		backendID:       "test-acp",
+		bin:             "definitely-not-a-real-binary",
+		sessions:        map[string]*Session{},
+		runIDs:          map[string]string{},
+		pollContexts:    map[string]context.Context{},
+		pollCancels:     map[string]context.CancelFunc{},
+		pendingMessages: map[string][]string{},
+		broker:          broker.New(""),
+		buildClientEnv: func(opts runtime.StartOptions, runID, brokerToken, brokerAddr string) (map[string]string, func() error) {
+			return map[string]string{"OPENCODE_CONFIG": "/tmp/unused.json"}, func() error {
+				cleaned = true
+				return nil
+			}
+		},
+	}
+
+	_, err := p.Start(context.Background(), runtime.StartOptions{Broker: p.broker})
+	if err == nil {
+		t.Fatal("expected Start to fail with invalid binary")
+	}
+	if !cleaned {
+		t.Fatal("expected client env cleanup to run after ensureClient failure")
+	}
+}
+
+func TestCloseRunsClientEnvCleanup(t *testing.T) {
+	path := t.TempDir() + "/opencode.json"
+	if err := os.WriteFile(path, []byte(`{}`), 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+	p := &Provider{
+		pollCancels:      map[string]context.CancelFunc{},
+		pollContexts:     map[string]context.Context{},
+		pendingMessages:  map[string][]string{},
+		clientEnvCleanup: func() error { return os.Remove(path) },
+	}
+
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("config file still exists after Close cleanup: %v", err)
 	}
 }

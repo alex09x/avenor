@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/google/uuid"
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/sdougbrown/avenor/internal/runtime/broker"
 )
 
 const backendID = "codex-app-server"
@@ -21,13 +23,23 @@ type Provider struct {
 	client  *client
 	threads map[string]string // sessionID (=threadID) → threadID
 	turns   map[string]string // sessionID → current turnID
+
+	// Broker fields for channel-wrapped prompt injection.
+	broker          *broker.Broker
+	runIDs          map[string]string // sessionID → runID
+	pollCancels     map[string]context.CancelFunc
+	pendingMu       sync.Mutex
+	pendingMessages map[string][]string // sessionID → queued wrapped prompts
 }
 
 func NewWithOptions(opts runtime.StartOptions) *Provider {
 	return &Provider{
-		opts:    opts,
-		threads: map[string]string{},
-		turns:   map[string]string{},
+		opts:            opts,
+		threads:         map[string]string{},
+		turns:           map[string]string{},
+		runIDs:          map[string]string{},
+		pollCancels:     map[string]context.CancelFunc{},
+		pendingMessages: map[string][]string{},
 	}
 }
 
@@ -60,9 +72,34 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	}
 	threadID := tsr.Thread.ID
 
+	// Register a broker run for this session.
+	p.mu.Lock()
+	broker := p.broker
+	p.mu.Unlock()
+	var runID string
+	if broker != nil {
+		runID = uuid.New().String()
+		if _, err := broker.CreateRun(runID); err != nil {
+			runID = ""
+		}
+	}
 	p.mu.Lock()
 	p.threads[threadID] = threadID
+	p.runIDs[threadID] = runID
 	p.mu.Unlock()
+
+	// Start the broker message polling goroutine.
+	if runID != "" {
+		pollCtx, cancel := context.WithCancel(ctx)
+		p.mu.Lock()
+		p.pollCancels[threadID] = cancel
+		p.mu.Unlock()
+		go p.broker.PollAgentMessages(pollCtx, runID, func(wrapped string) {
+			p.pendingMu.Lock()
+			p.pendingMessages[threadID] = append(p.pendingMessages[threadID], wrapped)
+			p.pendingMu.Unlock()
+		})
+	}
 
 	return runtime.Session{
 		SessionID: threadID,
@@ -239,8 +276,22 @@ func (p *Provider) Capabilities(ctx context.Context) (runtime.Capabilities, erro
 func (p *Provider) Close() error {
 	p.mu.Lock()
 	c := p.client
+	cancels := make([]context.CancelFunc, 0, len(p.pollCancels))
+	for _, cancel := range p.pollCancels {
+		cancels = append(cancels, cancel)
+	}
 	p.client = nil
+	p.pollCancels = map[string]context.CancelFunc{}
 	p.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	p.mu.Lock()
+	p.runIDs = nil
+	p.mu.Unlock()
+	p.pendingMu.Lock()
+	p.pendingMessages = map[string][]string{}
+	p.pendingMu.Unlock()
 	if c == nil {
 		return nil
 	}
@@ -259,6 +310,16 @@ func (p *Provider) ensureClient(ctx context.Context) (*client, error) {
 	if err != nil {
 		p.mu.Unlock()
 		return nil, err
+	}
+
+	p.mu.Lock()
+	if p.client != nil {
+		p.mu.Unlock()
+		return p.client, nil
+	}
+	// Store broker reference if provided.
+	if p.opts.Broker != nil {
+		p.broker = p.opts.Broker
 	}
 	p.client = c
 	p.mu.Unlock()
@@ -284,4 +345,22 @@ func (p *Provider) getClient() (*client, error) {
 		return nil, errors.New("provider has not been started")
 	}
 	return c, nil
+}
+
+// injectPendingMessages injects queued channel-wrapped messages for a session
+// at a turn boundary.
+func (p *Provider) injectPendingMessages(ctx context.Context, sessionID string) {
+	p.pendingMu.Lock()
+	msgs := p.pendingMessages[sessionID]
+	p.pendingMessages[sessionID] = nil
+	p.pendingMu.Unlock()
+
+	if len(msgs) == 0 {
+		return
+	}
+	for _, msg := range msgs {
+		if err := p.Prompt(ctx, sessionID, msg); err != nil {
+			// Non-fatal: continue with remaining messages.
+		}
+	}
 }

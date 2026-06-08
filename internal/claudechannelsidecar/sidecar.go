@@ -204,6 +204,35 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 		if err := s.brokerPost(ctx, "/reply", map[string]any{"to": p.To, "payload": rawOrObject(p.Payload)}); err != nil {
 			return nil, err
 		}
+	case "avenor_send", "avenor_upsend":
+		var p struct {
+			ToRunID string `json:"to_run_id"`
+			Message string `json:"message"`
+			Role    string `json:"role"`
+		}
+		if err := json.Unmarshal(args, &p); err != nil {
+			return nil, err
+		}
+		if p.ToRunID == "" || p.Message == "" {
+			return nil, fmt.Errorf("to_run_id and message are required")
+		}
+		role := p.Role
+		if role == "" {
+			role = "agent"
+		}
+		if err := s.brokerPost(ctx, "/send", map[string]any{
+			"from_run_id": s.opts.RunID,
+			"to_run_id":   p.ToRunID,
+			"type":        "agent_message",
+			"payload":     map[string]any{"from": s.opts.RunID, "from_run_id": s.opts.RunID, "message": p.Message, "role": role},
+		}); err != nil {
+			return nil, err
+		}
+		resultText := fmt.Sprintf("sent message to run %q", p.ToRunID)
+		if name == "avenor_upsend" {
+			resultText = fmt.Sprintf("sent upward message to run %q", p.ToRunID)
+		}
+		return map[string]any{"content": []map[string]any{{"type": "text", "text": resultText}}}, nil
 	default:
 		return nil, fmt.Errorf("unknown tool %q", name)
 	}
@@ -254,9 +283,10 @@ func (s *Server) pollControlLoop(ctx context.Context) {
 			_ = s.writeNotification("notifications/claude/channel", map[string]any{
 				"content": renderControlMessage(msg),
 				"meta": map[string]string{
-					"run_id":  msg.RunID,
-					"ctrl_id": msg.ID,
-					"type":    msg.Type,
+					"run_id":      msg.RunID,
+					"ctrl_id":     msg.ID,
+					"type":        msg.Type,
+					"from_run_id": msg.FromRunID,
 				},
 			})
 		}
@@ -273,10 +303,11 @@ func sleepContext(ctx context.Context, d time.Duration) {
 }
 
 type controlMessage struct {
-	ID      string          `json:"id"`
-	Type    string          `json:"type"`
-	RunID   string          `json:"run_id"`
-	Payload json.RawMessage `json:"payload"`
+	ID        string          `json:"id"`
+	Type      string          `json:"type"`
+	RunID     string          `json:"run_id"`
+	FromRunID string          `json:"from_run_id,omitempty"`
+	Payload   json.RawMessage `json:"payload"`
 }
 
 func renderControlMessage(msg controlMessage) string {
@@ -302,6 +333,17 @@ func renderControlMessage(msg controlMessage) string {
 		return "Stop work. Call avenor_finish(status=blocked|failed) if possible. Avoid starting new tool calls."
 	case "permission_decision":
 		return "Permission decision: " + payload
+	case "agent_message":
+		// Only the broker-set FromRunID is trusted for attribution.
+		var agent struct {
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(msg.Payload, &agent); err == nil && agent.Message != "" {
+			return fmt.Sprintf("Message from run %s:\n%s\n\nReply by calling avenor_send with to_run_id=%q.",
+				msg.FromRunID, agent.Message, msg.FromRunID)
+		}
+		// Fallback render if payload doesn't parse
+		return "Message from another agent:\n" + payload
 	default:
 		return "Unhandled control type: " + msg.Type
 	}
@@ -416,6 +458,32 @@ func toolSchemas() []map[string]any {
 					"payload": map[string]any{"type": "object"},
 				},
 				"required": []string{"to"},
+			},
+		},
+		{
+			"name":        "avenor_send",
+			"description": "Send a message to another agent run",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"to_run_id": map[string]any{"type": "string"},
+					"message":   map[string]any{"type": "string"},
+					"role":      map[string]any{"type": "string", "description": "Role to display on the receiving side (defaults to agent)"},
+				},
+				"required": []string{"to_run_id", "message"},
+			},
+		},
+		{
+			"name":        "avenor_upsend",
+			"description": "Send a message upward to your parent or supervisor agent. Use this for status updates, findings, or questions that the parent should see as a channel notification.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"to_run_id": map[string]any{"type": "string", "description": "Target parent/supervisor run ID"},
+					"message":   map[string]any{"type": "string", "description": "Message content"},
+					"role":      map[string]any{"type": "string", "description": "Role to display (e.g., reviewer, implementer)"},
+				},
+				"required": []string{"to_run_id", "message"},
 			},
 		},
 	}

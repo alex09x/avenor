@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/sdougbrown/avenor/internal/channelwrap"
 )
 
 // ControlMessage is a message pushed from Avenor to the sidecar for delivery to Claude.
@@ -27,6 +29,7 @@ type ControlMessage struct {
 	ID        string          `json:"id"`
 	Type      string          `json:"type"`
 	RunID     string          `json:"run_id"`
+	FromRunID string          `json:"from_run_id,omitempty"`
 	Payload   json.RawMessage `json:"payload,omitempty"`
 	CreatedAt time.Time       `json:"created_at"`
 }
@@ -166,6 +169,29 @@ func (b *Broker) Send(runID string, kind string, payload json.RawMessage, correl
 	return b.PushControl(runID, msg)
 }
 
+// SendTo sends a message from one run to another run's control queue.
+// The fromRunID must belong to a registered run whose token matches the
+// authenticated caller's token.
+func (b *Broker) SendTo(fromRunID, toRunID, kind string, payload json.RawMessage, correlationID string) error {
+	b.mu.RLock()
+	_, ok := b.runs[toRunID]
+	b.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("run not found: %s", toRunID)
+	}
+	if correlationID == "" {
+		correlationID = MakeToken()
+	}
+	msg := ControlMessage{
+		ID:        correlationID,
+		Type:      kind,
+		RunID:     toRunID,
+		FromRunID: fromRunID,
+		Payload:   payload,
+	}
+	return b.PushControl(toRunID, msg)
+}
+
 // Ingest routes an incoming message from an agent into the appropriate
 // RunState bucket based on kind.
 //
@@ -269,6 +295,7 @@ func (b *Broker) Start() error {
 	router.HandleFunc("/report", b.withMethod("POST", b.withAuth(b.handleReport)))
 	router.HandleFunc("/finish", b.withMethod("POST", b.withAuth(b.handleFinish)))
 	router.HandleFunc("/reply", b.withMethod("POST", b.withAuth(b.handleReply)))
+	router.HandleFunc("/send", b.withMethod("POST", b.withAuth(b.handleSend)))
 	router.HandleFunc("/permission_request", b.withMethod("POST", b.withAuth(b.handlePermissionRequest)))
 	router.HandleFunc("/permission", b.withMethod("POST", b.withAuth(b.handlePermission)))
 
@@ -596,6 +623,52 @@ func (b *Broker) handlePermission(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (b *Broker) handleSend(w http.ResponseWriter, r *http.Request) {
+	// withAuth already read and replaced the body. Parse the full body
+	// once to extract both credentials and send fields.
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	var fullBody struct {
+		RunID     string          `json:"run_id"`
+		Token     string          `json:"token"`
+		FromRunID string          `json:"from_run_id"`
+		ToRunID   string          `json:"to_run_id"`
+		Type      string          `json:"type"`
+		Payload   json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(bodyBytes, &fullBody); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if fullBody.FromRunID == "" || fullBody.ToRunID == "" || fullBody.Type == "" {
+		http.Error(w, "missing fields", http.StatusBadRequest)
+		return
+	}
+	// Validate that the authenticated caller matches from_run_id's token.
+	b.mu.RLock()
+	fromSt, ok := b.runs[fullBody.FromRunID]
+	b.mu.RUnlock()
+	if !ok {
+		http.Error(w, "from run not found", http.StatusNotFound)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(fullBody.Token), []byte(fromSt.Token)) != 1 {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	err = b.SendTo(fullBody.FromRunID, fullBody.ToRunID, fullBody.Type, fullBody.Payload, "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]bool{"queued": true})
+}
+
 func (b *Broker) ingest(w http.ResponseWriter, runID string, fn func(*RunState)) {
 	b.mu.Lock()
 	st, ok := b.runs[runID]
@@ -610,6 +683,45 @@ func (b *Broker) ingest(w http.ResponseWriter, runID string, fn func(*RunState))
 	st.Mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+}
+
+// PollAgentMessages polls the broker for agent_message control messages destined
+// to the given runID every 2 seconds. Each received message is wrapped with
+// channelwrap and passed to onMessage. The goroutine exits when ctx is done.
+func (b *Broker) PollAgentMessages(ctx context.Context, runID string, onMessage func(wrappedContent string)) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		st := b.GetRun(runID)
+		if st == nil {
+			continue
+		}
+		st.Mu.Lock()
+		msgs := make([]ControlMessage, len(st.ControlQueue))
+		for i, m := range st.ControlQueue {
+			msgs[i] = *m
+		}
+		st.ControlQueue = nil
+		st.Mu.Unlock()
+		for _, msg := range msgs {
+			if msg.Type != "agent_message" {
+				continue
+			}
+			var payload struct {
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil || payload.Message == "" {
+				continue
+			}
+			wrapped := channelwrap.ChannelWrap(payload.Message, channelwrap.AgentName("agent"), map[string]string{"from_run_id": msg.FromRunID})
+			onMessage(wrapped)
+		}
+	}
 }
 
 // --- accessors ---
@@ -638,6 +750,27 @@ func (b *Broker) CreateRun(runID string) (string, error) {
 	}
 	b.runs[runID] = st
 	return st.Token, nil
+}
+
+// EnsureRun registers a new run if one does not already exist for the
+// given runID. Returns the run's token (existing or newly created) and
+// whether the run was newly created.
+func (b *Broker) EnsureRun(runID string) (string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if st, exists := b.runs[runID]; exists {
+		return st.Token, false
+	}
+	st := &RunState{
+		RunID:               runID,
+		Token:               MakeToken(),
+		LastSeen:            time.Now(),
+		Notify:              make(chan struct{}, 1),
+		PermissionRequests:  make(map[string]*PermissionState),
+		PermissionDecisions: make(map[string]string),
+	}
+	b.runs[runID] = st
+	return st.Token, true
 }
 
 // DeleteRun removes a run from the broker. Safe to call even if the run

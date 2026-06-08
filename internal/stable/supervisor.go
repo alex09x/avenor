@@ -52,7 +52,8 @@ type SpawnParams struct {
 	LoopFile          string `json:"loop_file,omitempty"`
 	TeamFile          string `json:"team_file,omitempty"`
 	SessionID         string `json:"session_id,omitempty"`
-	ParentID          string `json:"parent_id,omitempty"` // runtime ID of the parent agent
+	ParentID          string `json:"parent_id,omitempty"`     // runtime ID of the parent agent
+	ParentRunID       string `json:"parent_run_id,omitempty"` // broker run ID of the parent, for channel messaging
 }
 
 type SpawnResult struct {
@@ -60,6 +61,8 @@ type SpawnResult struct {
 	SessionID    string `json:"session_id"`
 	OnEvent      string `json:"on_event"`
 	SentinelFile string `json:"sentinel_file"`
+	BrokerURL    string `json:"broker_url,omitempty"`
+	ParentToken  string `json:"parent_token,omitempty"`
 }
 
 type childRuntime struct {
@@ -306,6 +309,16 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 		}
 		promptText = string(data)
 	}
+
+	// Ensure the parent has a broker run for channel messaging and prepend
+	// the parent run ID to the child's prompt so it knows where to reply.
+	var parentToken string
+	if params.ParentRunID != "" && s.broker != nil {
+		parentToken, _ = s.broker.EnsureRun(params.ParentRunID)
+		parentNote := fmt.Sprintf("Your parent's broker run ID is %q. Use avenor_upsend with this run ID to send status updates, findings, or questions back to your parent.\n\n", params.ParentRunID)
+		promptText = parentNote + promptText
+	}
+
 	if params.LoopFile != "" && params.TeamFile != "" {
 		return SpawnResult{}, fmt.Errorf("loop_file and team_file are mutually exclusive")
 	}
@@ -365,6 +378,7 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 			RuntimeID:    rtID,
 			OnEvent:      onEvent,
 			SentinelFile: sentinelFile,
+			BrokerURL:    s.brokerURL(),
 		}
 
 		childCtx, childCancel := context.WithCancel(context.Background())
@@ -409,6 +423,7 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 			RuntimeID:    rtID,
 			OnEvent:      onEvent,
 			SentinelFile: sentinelFile,
+			BrokerURL:    s.brokerURL(),
 		}
 
 		childCtx, childCancel := context.WithCancel(context.Background())
@@ -518,12 +533,22 @@ func (s *Supervisor) spawn(params SpawnParams) (SpawnResult, error) {
 	default:
 	}
 
+	brokerURL := s.brokerURL()
 	return SpawnResult{
 		RuntimeID:    rtID,
 		SessionID:    session.SessionID,
 		OnEvent:      onEvent,
 		SentinelFile: sentinelFile,
+		BrokerURL:    brokerURL,
+		ParentToken:  parentToken,
 	}, nil
+}
+
+func (s *Supervisor) brokerURL() string {
+	if s.broker == nil {
+		return ""
+	}
+	return fmt.Sprintf("http://%s", s.broker.Addr())
 }
 
 func (s *Supervisor) runChild(ctx context.Context, child *childRuntime, promptText string, timeoutSec, maxRetries int) {
@@ -670,7 +695,8 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 		recorder:        newRecorderFor(s, child.id),
 	}
 
-	opts := looprunner.RunOptions{
+	var opts looprunner.RunOptions
+	opts = looprunner.RunOptions{
 		WorkDir:    child.dir,
 		RunID:      s.runID,
 		EventSink:  taggedWriter,
@@ -695,6 +721,11 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 				s.broker.CreateRun(brokerRunID)
 				brokerAttemptIDs = append(brokerAttemptIDs, brokerRunID)
 				attemptWriter = taggedWriter.withRecorder(broker.NewRecorder(s.broker, brokerRunID))
+			}
+
+			if opts.SeedMessage != nil && s.broker != nil && brokerRunID != "" {
+				payload, _ := json.Marshal(opts.SeedMessage)
+				_ = s.broker.SendTo(opts.SeedMessage.FromRunID, brokerRunID, "agent_message", payload, "")
 			}
 
 			provider, err := factory.NewProvider(startOpts, backend)
@@ -831,7 +862,8 @@ func (s *Supervisor) runTeamChild(ctx context.Context, child *childRuntime, cfg 
 		recorder:        newRecorderFor(s, child.id),
 	}
 
-	opts := teamrunner.RunOptions{
+	var opts teamrunner.RunOptions
+	opts = teamrunner.RunOptions{
 		WorkDir:    child.dir,
 		RunID:      s.runID,
 		EventSink:  taggedWriter,
@@ -866,6 +898,11 @@ func (s *Supervisor) runTeamChild(ctx context.Context, child *childRuntime, cfg 
 				brokerAttemptIDs = append(brokerAttemptIDs, brokerRunID)
 				brokerAttemptIDsMu.Unlock()
 				attemptWriter = taggedWriter.withRecorder(broker.NewRecorder(s.broker, brokerRunID))
+			}
+
+			if opts.SeedMessage != nil && s.broker != nil && brokerRunID != "" {
+				payload, _ := json.Marshal(opts.SeedMessage)
+				_ = s.broker.SendTo(opts.SeedMessage.FromRunID, brokerRunID, "agent_message", payload, "")
 			}
 
 			provider, err := factory.NewProvider(startOpts, backend)

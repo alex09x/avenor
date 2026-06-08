@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/sdougbrown/avenor/internal/runtime/broker"
 )
 
 type ProviderConfig struct {
@@ -19,6 +22,7 @@ type ProviderConfig struct {
 	AppendCWDArg        bool
 	Authenticate        string // optional: if non-empty, call Client.Authenticate with this methodId after Initialize
 	ConfigureSession    func(ctx context.Context, session *Session, opts runtime.StartOptions) error
+	BuildClientEnv      func(opts runtime.StartOptions, runID, brokerToken, brokerAddr string) (map[string]string, func() error)
 }
 
 type Provider struct {
@@ -37,6 +41,16 @@ type Provider struct {
 	appendCWDArg        bool
 	authenticateID      string
 	configureSession    func(ctx context.Context, session *Session, opts runtime.StartOptions) error
+	buildClientEnv      func(opts runtime.StartOptions, runID, brokerToken, brokerAddr string) (map[string]string, func() error)
+	clientEnvCleanup    func() error
+
+	// Broker fields for channel-wrapped prompt injection.
+	broker          *broker.Broker
+	runIDs          map[string]string // sessionID → runID
+	pollContexts    map[string]context.Context
+	pollCancels     map[string]context.CancelFunc
+	pendingMu       sync.Mutex
+	pendingMessages map[string][]string // sessionID → queued wrapped prompts
 }
 
 func NewProvider(cfg ProviderConfig) runtime.Provider {
@@ -46,10 +60,15 @@ func NewProvider(cfg ProviderConfig) runtime.Provider {
 		bin:                 cfg.Bin,
 		args:                cfg.Args,
 		sessions:            map[string]*Session{},
+		runIDs:              map[string]string{},
+		pollContexts:        map[string]context.Context{},
+		pollCancels:         map[string]context.CancelFunc{},
+		pendingMessages:     map[string][]string{},
 		subprocessDiscovery: cfg.SubprocessDiscovery,
 		appendCWDArg:        cfg.AppendCWDArg,
 		authenticateID:      cfg.Authenticate,
 		configureSession:    cfg.ConfigureSession,
+		buildClientEnv:      cfg.BuildClientEnv,
 	}
 }
 
@@ -57,11 +76,51 @@ var _ runtime.Provider = (*Provider)(nil)
 
 func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtime.Session, error) {
 	merged := runtime.MergeStartOptions(p.opts, opts)
-	if err := p.ensureClient(ctx, merged); err != nil {
+
+	// Store broker reference from the merged opts so sub-providers can
+	// create authenticated per-run MCP tool servers.
+	p.mu.Lock()
+	if merged.Broker != nil && p.broker == nil {
+		p.broker = merged.Broker
+	}
+	brokerRef := p.broker
+	buildClientEnv := p.buildClientEnv
+	p.mu.Unlock()
+
+	// Create a broker run for this session before the client starts so provider-specific
+	// process config can authenticate outbound sends from the first turn.
+	// Use the supervisor-assigned RuntimeID when available (parent-child routing),
+	// falling back to a generated UUID for standalone sessions.
+	runID := ""
+	brokerToken := ""
+	if brokerRef != nil {
+		runID = merged.RuntimeID
+		if runID == "" {
+			runID = uuid.New().String()
+		}
+		brokerToken, _ = brokerRef.EnsureRun(runID)
+	}
+	var clientEnv map[string]string
+	var cleanup func() error
+	if runID != "" && brokerToken != "" && brokerRef != nil && buildClientEnv != nil {
+		clientEnv, cleanup = buildClientEnv(merged, runID, brokerToken, brokerRef.Addr())
+	}
+	created, err := p.ensureClient(ctx, merged, clientEnv)
+	if err != nil {
+		if cleanup != nil {
+			_ = cleanup()
+		}
 		return runtime.Session{}, err
 	}
+	if created {
+		p.mu.Lock()
+		p.clientEnvCleanup = cleanup
+		p.mu.Unlock()
+	} else if cleanup != nil {
+		_ = cleanup()
+	}
 
-	session, err := p.client.NewSession(ctx)
+	session, err := p.client.NewSessionWithOptions(ctx, SessionOpenOptions{})
 	if err != nil {
 		return runtime.Session{}, err
 	}
@@ -71,9 +130,28 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 		}
 	}
 
+	session.RunID = runID
+	session.BrokerToken = brokerToken
 	p.mu.Lock()
 	p.sessions[session.SessionID] = session
+	if runID != "" {
+		p.runIDs[session.SessionID] = runID
+	}
 	p.mu.Unlock()
+
+	// Start the broker message polling goroutine if we have a broker and runID.
+	if runID != "" {
+		pollCtx, cancel := context.WithCancel(ctx)
+		p.mu.Lock()
+		p.pollContexts[session.SessionID] = pollCtx
+		p.pollCancels[session.SessionID] = cancel
+		p.mu.Unlock()
+		go brokerRef.PollAgentMessages(pollCtx, runID, func(wrapped string) {
+			p.pendingMu.Lock()
+			p.pendingMessages[session.SessionID] = append(p.pendingMessages[session.SessionID], wrapped)
+			p.pendingMu.Unlock()
+		})
+	}
 
 	return runtime.Session{
 		SessionID: session.SessionID,
@@ -87,7 +165,7 @@ func (p *Provider) Resume(ctx context.Context, sessionID string) (runtime.Sessio
 	if sessionID == "" {
 		return runtime.Session{}, errors.New("session id is required")
 	}
-	if err := p.ensureClient(ctx, p.opts); err != nil {
+	if _, err := p.ensureClient(ctx, p.opts, nil); err != nil {
 		return runtime.Session{}, err
 	}
 
@@ -210,45 +288,64 @@ func (p *Provider) Capabilities(ctx context.Context) (runtime.Capabilities, erro
 func (p *Provider) Close() error {
 	p.mu.Lock()
 	client := p.client
+	cancels := make([]context.CancelFunc, 0, len(p.pollCancels))
+	for _, cancel := range p.pollCancels {
+		cancels = append(cancels, cancel)
+	}
 	p.client = nil
+	cleanup := p.clientEnvCleanup
+	p.clientEnvCleanup = nil
 	p.pendingOptions = nil
+	p.runIDs = nil
+	p.pollContexts = map[string]context.Context{}
+	p.pollCancels = map[string]context.CancelFunc{}
 	p.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	p.pendingMu.Lock()
+	p.pendingMessages = map[string][]string{}
+	p.pendingMu.Unlock()
+	if cleanup != nil {
+		_ = cleanup()
+	}
 	if client == nil {
 		return nil
 	}
 	return client.Close()
 }
 
-func (p *Provider) ensureClient(ctx context.Context, opts runtime.StartOptions) error {
+func (p *Provider) ensureClient(ctx context.Context, opts runtime.StartOptions, env map[string]string) (bool, error) {
 	p.mu.Lock()
 	if p.client != nil {
 		p.mu.Unlock()
-		return nil
+		return false, nil
 	}
 	p.mu.Unlock()
 
 	if opts.ServerURL != "" {
-		return fmt.Errorf("%s external server URL transport is not implemented by the stdio client", p.backendID)
+		return false, fmt.Errorf("%s external server URL transport is not implemented by the stdio client", p.backendID)
 	}
 
 	client, err := NewClient(ctx, ClientConfig{
 		Bin:                  p.bin,
 		Args:                 p.args,
 		Dir:                  opts.Dir,
+		Env:                  env,
 		AutoAnswerPermission: false,
 		AppendCWDArg:         p.appendCWDArg,
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	if _, err := client.Initialize(ctx); err != nil {
 		_ = client.Close()
-		return err
+		return false, err
 	}
 	if p.authenticateID != "" {
 		if err := client.Authenticate(ctx, p.authenticateID); err != nil {
 			_ = client.Close()
-			return err
+			return false, err
 		}
 	}
 
@@ -256,12 +353,12 @@ func (p *Provider) ensureClient(ctx context.Context, opts runtime.StartOptions) 
 	defer p.mu.Unlock()
 	if p.client != nil {
 		_ = client.Close()
-		return nil
+		return false, nil
 	}
 	p.client = client
 	p.events = make(chan events.Event, 256)
 	go p.pumpClientEvents(client, p.events)
-	return nil
+	return true, nil
 }
 
 func (p *Provider) pumpClientEvents(client *Client, out chan<- events.Event) {
@@ -284,6 +381,9 @@ func (p *Provider) publish(event events.Event) {
 
 func (p *Provider) cachePermissionOptions(event events.Event) {
 	if event.Event == "session.end" {
+		// Inject any pending channel-wrapped messages before clearing.
+		p.injectPendingMessages(event.SessionID)
+
 		p.mu.Lock()
 		if event.SessionID == "" {
 			p.pendingOptions = nil
@@ -357,6 +457,48 @@ func permissionResponseResult(response runtime.PermissionResponse, optionID stri
 	return map[string]any{"outcome": result}
 }
 
+// injectPendingMessages injects queued channel-wrapped messages for a session
+// at a turn boundary (after session.end).
+func (p *Provider) injectPendingMessages(sessionID string) {
+	p.pendingMu.Lock()
+	if p.pendingMessages == nil {
+		p.pendingMu.Unlock()
+		return
+	}
+	msgs := p.pendingMessages[sessionID]
+	p.pendingMessages[sessionID] = nil
+	p.pendingMu.Unlock()
+
+	if len(msgs) == 0 {
+		return
+	}
+
+	p.mu.Lock()
+	session := p.sessions[sessionID]
+	pollCtx := p.pollContexts[sessionID]
+	p.mu.Unlock()
+	if session == nil {
+		return
+	}
+	if pollCtx == nil {
+		pollCtx = context.Background()
+	}
+
+	for _, msg := range msgs {
+		promptCtx, cancel := context.WithTimeout(pollCtx, 10*time.Second)
+		_, err := session.Prompt(promptCtx, msg)
+		cancel()
+		if err != nil {
+			continue
+		}
+		p.publish(events.Event{
+			Event:     "agent.message_chunk",
+			SessionID: sessionID,
+			Fields:    map[string]any{"source": "avenor-channel"},
+		})
+	}
+}
+
 func selectPermissionOption(options []any, approve bool) (string, error) {
 	want := "reject"
 	if approve {
@@ -404,5 +546,3 @@ func selectPermissionResponseOption(options []any, response runtime.PermissionRe
 	}
 	return "", fmt.Errorf("permission options missing optionId %q", response.OptionID)
 }
-
-

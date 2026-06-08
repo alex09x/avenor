@@ -48,6 +48,23 @@ async function sentinelExists(filePath: string): Promise<boolean> {
   }
 }
 
+function sentinelStatusToResult(sentinelStatus: string): string {
+  switch (sentinelStatus) {
+    case 'DONE':
+      return 'done'
+    case 'FAILED':
+      return 'failed'
+    case 'TIMEOUT':
+      return 'timeout'
+    case 'KILLED':
+      return 'killed'
+    case 'BLOCKED':
+      return 'failed'
+    default:
+      return 'running'
+  }
+}
+
 function translateStatus(
   rawPhase: string,
   sentinelData: Record<string, string> | null,
@@ -56,27 +73,11 @@ function translateStatus(
 
   switch (rawPhase) {
     case 'idle':
+      return sentinelStatus ? sentinelStatusToResult(sentinelStatus) : 'running'
     case 'running':
       return 'running'
-    case 'ended': {
-      if (sentinelStatus) {
-        switch (sentinelStatus) {
-          case 'DONE':
-            return 'done'
-          case 'FAILED':
-            return 'failed'
-          case 'TIMEOUT':
-            return 'timeout'
-          case 'KILLED':
-            return 'killed'
-          case 'BLOCKED':
-            return 'failed'
-          default:
-            return 'running'
-        }
-      }
-      return 'running'
-    }
+    case 'ended':
+      return sentinelStatus ? sentinelStatusToResult(sentinelStatus) : 'running'
     case 'DONE':
       return 'done'
     case 'FAILED':
@@ -96,6 +97,7 @@ export interface StatusResult {
   run_id: string
   label: string
   status: string
+  runtime_id?: string
   phase?: string
   phase_label?: string
   pending_permission?: {
@@ -124,6 +126,7 @@ async function buildRunStatus(
     run_id: runInfo.label,
     label: runInfo.label,
     status: translated,
+    runtime_id: (liveStatus?.runtime_id as string) ?? runInfo.runtimeId,
     phase: liveStatus?.phase as string | undefined,
     phase_label: liveStatus?.phase_label as string | undefined,
     session_id:
@@ -181,6 +184,7 @@ export async function statusTool(
           run_id: args.runId,
           label: args.runId,
           status: translateStatus((liveStatus?.phase ?? liveStatus?.status ?? 'running') as string, sentinel),
+          runtime_id: liveStatus?.runtime_id as string | undefined,
           phase: liveStatus?.phase as string | undefined,
           phase_label: liveStatus?.phase_label as string | undefined,
           session_id:
