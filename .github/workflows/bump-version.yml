@@ -1,4 +1,4 @@
-name: Bump app version
+name: Bump package versions
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   bump-version:
-    name: Bump app version and open PR
+    name: Bump package versions and open PR
     runs-on: ubuntu-latest
 
     steps:
