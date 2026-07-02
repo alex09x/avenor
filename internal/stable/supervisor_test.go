@@ -3,6 +3,8 @@ package stable
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +16,8 @@ import (
 	"time"
 
 	"github.com/sdougbrown/avenor/client"
+	"github.com/sdougbrown/avenor/internal/cli"
+	"github.com/sdougbrown/avenor/internal/control"
 	"github.com/sdougbrown/avenor/internal/events"
 	"github.com/sdougbrown/avenor/internal/looprunner"
 	"github.com/sdougbrown/avenor/internal/phaseconfig"
@@ -860,6 +864,87 @@ type permRecordingProvider struct {
 	called       bool
 }
 
+type blockingPermissionProvider struct {
+	permRecordingProvider
+	started chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	calls   int
+}
+
+func (p *blockingPermissionProvider) AnswerPermission(_ context.Context, _ string, _ string, _ runtime.PermissionResponse) error {
+	p.mu.Lock()
+	p.calls++
+	p.mu.Unlock()
+	select {
+	case p.started <- struct{}{}:
+	default:
+	}
+	<-p.release
+	return nil
+}
+
+func (p *blockingPermissionProvider) callCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+type retryPermissionProvider struct {
+	permRecordingProvider
+	mu    sync.Mutex
+	calls int
+}
+
+func (p *retryPermissionProvider) AnswerPermission(_ context.Context, _ string, _ string, _ runtime.PermissionResponse) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	if p.calls == 1 {
+		return fmt.Errorf("temporary provider failure")
+	}
+	return nil
+}
+
+type stablePermissionProvider struct {
+	answers chan string
+}
+
+func (p *stablePermissionProvider) Start(context.Context, runtime.StartOptions) (runtime.Session, error) {
+	return runtime.Session{}, nil
+}
+func (p *stablePermissionProvider) Resume(context.Context, string) (runtime.Session, error) {
+	return runtime.Session{}, nil
+}
+func (p *stablePermissionProvider) Prompt(context.Context, string, string) error { return nil }
+func (p *stablePermissionProvider) Cancel(context.Context, string) error         { return nil }
+func (p *stablePermissionProvider) Events(context.Context, string) (<-chan events.Event, error) {
+	return nil, nil
+}
+func (p *stablePermissionProvider) AnswerPermission(_ context.Context, _ string, requestID string, _ runtime.PermissionResponse) error {
+	p.answers <- requestID
+	return nil
+}
+func (p *stablePermissionProvider) Capabilities(context.Context) (runtime.Capabilities, error) {
+	return runtime.Capabilities{}, nil
+}
+
+type synchronousStablePermissionSink struct {
+	answer    func() error
+	responses chan events.Event
+}
+
+func (s *synchronousStablePermissionSink) Write(event events.Event) error {
+	if event.Event == "permission.request" {
+		return s.answer()
+	}
+	if event.Event == "permission.response" {
+		s.responses <- event
+	}
+	return nil
+}
+func (s *synchronousStablePermissionSink) Close() error { return nil }
+
 func (p *permRecordingProvider) Start(context.Context, runtime.StartOptions) (runtime.Session, error) {
 	return runtime.Session{SessionID: "ses_rec"}, nil
 }
@@ -914,6 +999,271 @@ func TestAnswerPermissionRejectsUnknownOptionIDWithoutConsumingCache(t *testing.
 	}
 	if _, ok := sup.permOptions["rt_unknown:req_unknown"]; !ok {
 		t.Fatal("cache entry was consumed on invalid option_id")
+	}
+}
+
+func TestAnswerPermissionUsesActiveControlClaim(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket:          "/tmp/test-answer-claim.sock",
+		MaxRuntimes:            1,
+		PermissionClaimTimeout: 5 * time.Second,
+	})
+	provider := &permRecordingProvider{}
+	sup.runtimes["rt_claim"] = &childRuntime{
+		id:       "rt_claim",
+		provider: provider,
+		session:  runtime.Session{SessionID: "ses_claim"},
+		done:     make(chan struct{}),
+		promptCh: make(chan struct{}, 1),
+	}
+	cachePermissionOptionsThroughFanout(t, sup, "rt_claim", events.Event{
+		Event: "permission.request",
+		Fields: map[string]any{
+			"request_id": "req_claim",
+			"options": []any{
+				map[string]any{"optionId": "allow_it", "kind": "allow"},
+			},
+		},
+	})
+	answerCh, ok := sup.control.BeginPermissionClaim("rt_claim", "req_claim")
+	if !ok {
+		t.Fatal("BeginPermissionClaim returned false")
+	}
+	defer sup.control.EndPermissionClaim("rt_claim", "req_claim")
+
+	if err := sup.answerPermission("rt_claim", "req_claim", "allow_it"); err != nil {
+		t.Fatalf("answerPermission: %v", err)
+	}
+	if provider.called {
+		t.Fatal("provider was called directly instead of through the active resolver claim")
+	}
+	if _, ok := sup.permOptions["rt_claim:req_claim"]; ok {
+		t.Fatal("cache entry was not consumed after delivering the claim answer")
+	}
+	select {
+	case answer := <-answerCh:
+		if answer.RequestID != "req_claim" || answer.OptionID != "allow_it" {
+			t.Fatalf("claim answer = %+v", answer)
+		}
+	default:
+		t.Fatal("active resolver claim did not receive the answer")
+	}
+}
+
+func TestAnswerPermissionScopesSameRequestIDByRuntime(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket:          "/tmp/test-answer-scoped-claims.sock",
+		MaxRuntimes:            2,
+		PermissionClaimTimeout: 5 * time.Second,
+	})
+	for _, runtimeID := range []string{"rt_1", "rt_2"} {
+		sup.runtimes[runtimeID] = &childRuntime{
+			id:       runtimeID,
+			provider: &permRecordingProvider{},
+			session:  runtime.Session{SessionID: "ses_" + runtimeID},
+			done:     make(chan struct{}),
+			promptCh: make(chan struct{}, 1),
+		}
+		cachePermissionOptionsThroughFanout(t, sup, runtimeID, events.Event{
+			Event: "permission.request",
+			Fields: map[string]any{
+				"request_id": "0",
+				"options": []any{
+					map[string]any{"optionId": "always_" + runtimeID, "kind": "allow_always"},
+				},
+			},
+		})
+	}
+
+	first, ok := sup.control.BeginPermissionClaim("rt_1", "0")
+	if !ok {
+		t.Fatal("claim for rt_1 was rejected")
+	}
+	second, ok := sup.control.BeginPermissionClaim("rt_2", "0")
+	if !ok {
+		t.Fatal("claim for rt_2 was rejected")
+	}
+	defer sup.control.EndPermissionClaim("rt_1", "0")
+	defer sup.control.EndPermissionClaim("rt_2", "0")
+
+	if err := sup.answerPermission("rt_2", "0", "always_rt_2"); err != nil {
+		t.Fatalf("answer rt_2: %v", err)
+	}
+	select {
+	case answer := <-first:
+		t.Fatalf("rt_2 answer was delivered to rt_1: %+v", answer)
+	default:
+	}
+	select {
+	case answer := <-second:
+		if answer.OptionID != "always_rt_2" {
+			t.Fatalf("rt_2 answer = %+v", answer)
+		}
+	default:
+		t.Fatal("rt_2 claim did not receive its answer")
+	}
+	if _, ok := sup.permOptions["rt_1:0"]; !ok {
+		t.Fatal("answering rt_2 consumed rt_1 options")
+	}
+}
+
+func TestStableWaitersRouteSameRequestIDThroughScopedResolvers(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket:          filepath.Join(t.TempDir(), "control.sock"),
+		MaxRuntimes:            2,
+		PermissionClaimTimeout: time.Second,
+	})
+	if err := sup.control.Start(sup.config.ControlSocket); err != nil {
+		t.Fatalf("start control server: %v", err)
+	}
+	defer sup.control.Stop()
+	conn, err := net.Dial("unix", sup.config.ControlSocket)
+	if err != nil {
+		t.Fatalf("dial control server: %v", err)
+	}
+	defer conn.Close()
+	deadline := time.Now().Add(time.Second)
+	for !sup.control.HasClients() {
+		if time.Now().After(deadline) {
+			t.Fatal("control client was not registered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	type waiter struct {
+		runtimeID string
+		provider  *stablePermissionProvider
+		child     *childRuntime
+		responses chan events.Event
+		result    chan int
+	}
+	waiters := []*waiter{
+		{runtimeID: "rt_1", provider: &stablePermissionProvider{answers: make(chan string, 1)}, responses: make(chan events.Event, 1), result: make(chan int, 1)},
+		{runtimeID: "rt_2", provider: &stablePermissionProvider{answers: make(chan string, 1)}, responses: make(chan events.Event, 1), result: make(chan int, 1)},
+	}
+	for _, w := range waiters {
+		w.child = &childRuntime{
+			id:       w.runtimeID,
+			provider: w.provider,
+			session:  runtime.Session{SessionID: "ses_" + w.runtimeID},
+			done:     make(chan struct{}),
+			promptCh: make(chan struct{}, 1),
+		}
+		sup.runtimes[w.runtimeID] = w.child
+	}
+	for _, w := range waiters {
+		sink := &synchronousStablePermissionSink{
+			responses: w.responses,
+			answer: func() error {
+				return sup.answerPermission(w.runtimeID, "0", "always_"+w.runtimeID)
+			},
+		}
+		writer := &runtimeFanoutWriter{
+			base:            sink,
+			runtimeID:       w.runtimeID,
+			child:           w.child,
+			control:         sup.control,
+			onPermissionReq: sup.cachePermissionOptions,
+		}
+		eventCh := make(chan events.Event, 2)
+		eventCh <- events.Event{
+			Event:     "permission.request",
+			SessionID: "ses_" + w.runtimeID,
+			Fields: map[string]any{
+				"request_id": "0",
+				"options": []any{
+					map[string]any{"optionId": "always_" + w.runtimeID, "kind": "allow_always"},
+				},
+			},
+		}
+		eventCh <- events.Event{
+			Event:     "session.end",
+			SessionID: "ses_" + w.runtimeID,
+			Fields:    map[string]any{"stop_reason": "end_turn"},
+		}
+		close(eventCh)
+		promptDone := make(chan error, 1)
+		promptDone <- nil
+		go func() {
+			result := cli.WaitForSession(context.Background(), w.provider, cli.SessionWaitConfig{
+				EventCh:                eventCh,
+				PromptDone:             promptDone,
+				SessionID:              "ses_" + w.runtimeID,
+				RunID:                  "run_1",
+				PermissionClaimScope:   w.runtimeID,
+				PermissionClaimTimeout: time.Second,
+			}, cli.SessionWaitDeps{
+				Writer:        writer,
+				ControlServer: sup.control,
+				Stderr:        io.Discard,
+			})
+			w.result <- result.ExitCode
+		}()
+	}
+
+	for _, w := range waiters {
+		select {
+		case requestID := <-w.provider.answers:
+			if requestID != "0" {
+				t.Fatalf("%s provider request = %q", w.runtimeID, requestID)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s provider was not answered", w.runtimeID)
+		}
+		select {
+		case response := <-w.responses:
+			if got := response.Fields["runtime_id"]; got != w.runtimeID {
+				t.Fatalf("%s permission.response runtime_id = %v", w.runtimeID, got)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s permission.response was not emitted", w.runtimeID)
+		}
+		select {
+		case exitCode := <-w.result:
+			if exitCode != 0 {
+				t.Fatalf("%s WaitForSession exit code = %d", w.runtimeID, exitCode)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s WaitForSession did not complete", w.runtimeID)
+		}
+		w.child.mu.Lock()
+		pending := w.child.pendingPermission
+		w.child.mu.Unlock()
+		if pending {
+			t.Fatalf("%s pending permission was not cleared", w.runtimeID)
+		}
+	}
+}
+
+func TestAnswerPermissionRejectsLateAnswerOwnedByFileResolver(t *testing.T) {
+	sup := NewSupervisor(Config{ControlSocket: "/tmp/test-file-owned.sock", MaxRuntimes: 1})
+	provider := &permRecordingProvider{}
+	sup.runtimes["rt_file"] = &childRuntime{
+		id:       "rt_file",
+		provider: provider,
+		session:  runtime.Session{SessionID: "ses_file"},
+		done:     make(chan struct{}),
+		promptCh: make(chan struct{}, 1),
+	}
+	cachePermissionOptionsThroughFanout(t, sup, "rt_file", events.Event{
+		Event: "permission.request",
+		Fields: map[string]any{
+			"request_id": "0",
+			"options": []any{
+				map[string]any{"optionId": "always", "kind": "allow_always"},
+			},
+		},
+	})
+	sup.control.PreparePermissionClaim("rt_file", "0", control.PermissionResolverFile)
+
+	if err := sup.answerPermission("rt_file", "0", "always"); err == nil {
+		t.Fatal("late stable answer succeeded while file resolver owned the request")
+	}
+	if provider.called {
+		t.Fatal("stable answer bypassed file resolver and called provider directly")
+	}
+	if _, ok := sup.permOptions["rt_file:0"]; !ok {
+		t.Fatal("blocked late answer consumed cached permission options")
 	}
 }
 
@@ -976,6 +1326,7 @@ func TestAnswerPermissionMapsAllowByKind(t *testing.T) {
 			},
 		},
 	})
+	sup.control.PreparePermissionClaim("rt_kind", "req_kind", control.PermissionResolverNoResolver)
 
 	if err := sup.answerPermission("rt_kind", "req_kind", "yes_please"); err != nil {
 		t.Fatalf("answerPermission allow: %v", err)
@@ -1004,6 +1355,7 @@ func TestAnswerPermissionMapsAllowByKind(t *testing.T) {
 			},
 		},
 	})
+	sup.control.PreparePermissionClaim("rt_kind", "req_kind", control.PermissionResolverNoResolver)
 
 	if err := sup.answerPermission("rt_kind", "req_kind", "nope_please"); err != nil {
 		t.Fatalf("answerPermission reject: %v", err)
@@ -1042,12 +1394,215 @@ func TestAnswerPermissionClearsCacheEntry(t *testing.T) {
 			},
 		},
 	})
+	sup.control.PreparePermissionClaim("rt_clear", "req_clear", control.PermissionResolverNoResolver)
 
 	if err := sup.answerPermission("rt_clear", "req_clear", "ok"); err != nil {
 		t.Fatalf("answerPermission: %v", err)
 	}
 	if _, ok := sup.permOptions["rt_clear:req_clear"]; ok {
 		t.Fatal("cache entry was not cleared after use")
+	}
+}
+
+func TestAnswerPermissionNoResolverAllowsOnlyOneConcurrentProviderCall(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket:          "/tmp/test-answer-direct-concurrent.sock",
+		MaxRuntimes:            1,
+		PermissionClaimTimeout: 5 * time.Second,
+	})
+	provider := &blockingPermissionProvider{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	releaseProvider := func() { releaseOnce.Do(func() { close(provider.release) }) }
+	t.Cleanup(releaseProvider)
+	sup.runtimes["rt_direct"] = &childRuntime{
+		id:       "rt_direct",
+		provider: provider,
+		session:  runtime.Session{SessionID: "ses_direct"},
+		done:     make(chan struct{}),
+		promptCh: make(chan struct{}, 1),
+	}
+	cachePermissionOptionsThroughFanout(t, sup, "rt_direct", events.Event{
+		Event: "permission.request",
+		Fields: map[string]any{
+			"request_id": "req_direct",
+			"options": []any{
+				map[string]any{"optionId": "allow_it", "kind": "allow"},
+			},
+		},
+	})
+	if !sup.control.PreparePermissionClaim("rt_direct", "req_direct", control.PermissionResolverNoResolver) {
+		t.Fatal("PreparePermissionClaim returned false")
+	}
+
+	firstErr := make(chan error, 1)
+	go func() {
+		firstErr <- sup.answerPermission("rt_direct", "req_direct", "allow_it")
+	}()
+	select {
+	case <-provider.started:
+	case <-time.After(time.Second):
+		t.Fatal("provider call did not start")
+	}
+
+	secondErrCh := make(chan error, 1)
+	go func() {
+		secondErrCh <- sup.answerPermission("rt_direct", "req_direct", "allow_it")
+	}()
+	var secondErr error
+	select {
+	case secondErr = <-secondErrCh:
+	case <-time.After(time.Second):
+		t.Fatal("duplicate answerPermission did not complete")
+	}
+	if secondErr == nil {
+		t.Fatal("concurrent duplicate answer unexpectedly succeeded")
+	}
+	if got := provider.callCount(); got != 1 {
+		t.Fatalf("provider calls before release = %d, want 1", got)
+	}
+
+	releaseProvider()
+	select {
+	case err := <-firstErr:
+		if err != nil {
+			t.Fatalf("first answerPermission: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first answerPermission did not complete")
+	}
+	if got := provider.callCount(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+	if state := sup.control.PermissionResolverState("rt_direct", "req_direct"); state != control.PermissionResolverUnknown {
+		t.Fatalf("resolver state after success = %v, want unknown", state)
+	}
+	if _, ok := sup.permOptions["rt_direct:req_direct"]; ok {
+		t.Fatal("cache entry was not cleared after direct delivery")
+	}
+}
+
+func TestAnswerPermissionNoResolverRetriesAfterProviderError(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket:          "/tmp/test-answer-direct-retry.sock",
+		MaxRuntimes:            1,
+		PermissionClaimTimeout: 5 * time.Second,
+	})
+	provider := &retryPermissionProvider{}
+	sup.runtimes["rt_retry"] = &childRuntime{
+		id:       "rt_retry",
+		provider: provider,
+		session:  runtime.Session{SessionID: "ses_retry"},
+		done:     make(chan struct{}),
+		promptCh: make(chan struct{}, 1),
+	}
+	cachePermissionOptionsThroughFanout(t, sup, "rt_retry", events.Event{
+		Event: "permission.request",
+		Fields: map[string]any{
+			"request_id": "req_retry",
+			"options": []any{
+				map[string]any{"optionId": "allow_it", "kind": "allow"},
+			},
+		},
+	})
+	if !sup.control.PreparePermissionClaim("rt_retry", "req_retry", control.PermissionResolverNoResolver) {
+		t.Fatal("PreparePermissionClaim returned false")
+	}
+
+	if err := sup.answerPermission("rt_retry", "req_retry", "allow_it"); err == nil {
+		t.Fatal("first answerPermission unexpectedly succeeded")
+	}
+	if state := sup.control.PermissionResolverState("rt_retry", "req_retry"); state != control.PermissionResolverNoResolver {
+		t.Fatalf("resolver state after failure = %v, want no-resolver", state)
+	}
+	if _, ok := sup.permOptions["rt_retry:req_retry"]; !ok {
+		t.Fatal("cache entry was removed after failed provider delivery")
+	}
+
+	if err := sup.answerPermission("rt_retry", "req_retry", "allow_it"); err != nil {
+		t.Fatalf("retry answerPermission: %v", err)
+	}
+	if state := sup.control.PermissionResolverState("rt_retry", "req_retry"); state != control.PermissionResolverUnknown {
+		t.Fatalf("resolver state after retry = %v, want unknown", state)
+	}
+	if _, ok := sup.permOptions["rt_retry:req_retry"]; ok {
+		t.Fatal("cache entry was not removed after successful retry")
+	}
+}
+
+func TestDirectPermissionCleanupBlocksReuseUntilOldOptionsAreDeleted(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-answer-cleanup-order.sock",
+		MaxRuntimes:   1,
+	})
+	const key = "rt_reuse:req_reuse"
+	sup.permOptions[key] = []any{
+		map[string]any{"optionId": "old", "kind": "allow"},
+	}
+	if !sup.control.PreparePermissionClaim("rt_reuse", "req_reuse", control.PermissionResolverNoResolver) {
+		t.Fatal("PreparePermissionClaim returned false")
+	}
+	if got := sup.control.DeliverPendingPermission("rt_reuse", "req_reuse", "old"); got != control.PermissionAnswerNoResolver {
+		t.Fatalf("direct delivery = %v, want no-resolver", got)
+	}
+
+	cleanupReached := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseCleanup) }) }
+	t.Cleanup(release)
+	cleanupDone := make(chan struct{})
+	go func() {
+		sup.cleanupDirectPermission("rt_reuse", "req_reuse", func() {
+			close(cleanupReached)
+			<-releaseCleanup
+		})
+		close(cleanupDone)
+	}()
+	select {
+	case <-cleanupReached:
+	case <-time.After(time.Second):
+		t.Fatal("production cleanup did not reach claim release")
+	}
+
+	replacementAttempt := make(chan bool, 1)
+	go func() {
+		prepared := sup.control.PreparePermissionClaim("rt_reuse", "req_reuse", control.PermissionResolverNoResolver)
+		if prepared {
+			sup.cachePermissionOptions("rt_reuse", "req_reuse", []any{
+				map[string]any{"optionId": "new", "kind": "reject"},
+			})
+		}
+		replacementAttempt <- prepared
+	}()
+	select {
+	case prepared := <-replacementAttempt:
+		if prepared {
+			t.Fatal("replacement prepared while production cleanup retained the old claim")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement attempt blocked during cleanup")
+	}
+	release()
+	select {
+	case <-cleanupDone:
+	case <-time.After(time.Second):
+		t.Fatal("production cleanup did not complete")
+	}
+
+	if !sup.control.PreparePermissionClaim("rt_reuse", "req_reuse", control.PermissionResolverNoResolver) {
+		t.Fatal("replacement could not prepare after old cleanup")
+	}
+	replacement := []any{
+		map[string]any{"optionId": "new", "kind": "reject"},
+	}
+	sup.cachePermissionOptions("rt_reuse", "req_reuse", replacement)
+	if got := sup.permOptions[key]; len(got) != 1 {
+		t.Fatalf("replacement options = %+v, want one intact entry", got)
+	} else if option, _ := got[0].(map[string]any); option["optionId"] != "new" {
+		t.Fatalf("replacement options were overwritten: %+v", got)
 	}
 }
 

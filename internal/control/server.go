@@ -39,9 +39,8 @@ type ControlServer struct {
 
 	cancelFn func()
 
-	pendingMu      sync.Mutex
-	pendingRequest string
-	pendingAnswer  chan PermissionAnswer
+	pendingMu     sync.Mutex
+	pendingClaims map[permissionClaimKey]*permissionClaim
 
 	promptMu        sync.Mutex
 	promptQueue     []string
@@ -83,7 +82,13 @@ type subscriber struct {
 }
 
 func NewServer(state *ControlState) *ControlServer {
-	return &ControlServer{state: state, conns: map[*connState]struct{}{}, subs: map[*subscriber]struct{}{}, watch: map[chan events.Event]struct{}{}}
+	return &ControlServer{
+		state:         state,
+		conns:         map[*connState]struct{}{},
+		subs:          map[*subscriber]struct{}{},
+		watch:         map[chan events.Event]struct{}{},
+		pendingClaims: map[permissionClaimKey]*permissionClaim{},
+	}
 }
 
 func (s *ControlServer) SetStableHandler(h StableHandler) { s.stableHandler = h }
@@ -261,28 +266,137 @@ func (s *ControlServer) PublishEvent(event events.Event) {
 	}
 }
 
-// BeginPermissionClaim registers a new permission claim for requestID and
-// returns the answer channel plus true. If a claim is already in flight it
-// returns nil, false — the caller must not overwrite an active claim.
-func (s *ControlServer) BeginPermissionClaim(requestID string) (<-chan PermissionAnswer, bool) {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	if s.pendingRequest != "" {
-		// Another claim is still registered; refuse to clobber it.
-		return nil, false
-	}
-	s.pendingRequest = requestID
-	s.pendingAnswer = make(chan PermissionAnswer, 1)
-	return s.pendingAnswer, true
+type permissionClaimKey struct {
+	scope     string
+	requestID string
 }
 
-func (s *ControlServer) EndPermissionClaim(requestID string) {
+type PermissionResolverState uint8
+
+const (
+	PermissionResolverUnknown PermissionResolverState = iota
+	PermissionResolverReserved
+	PermissionResolverControl
+	PermissionResolverAutomatic
+	PermissionResolverFile
+	PermissionResolverNoResolver
+	PermissionResolverDirectDelivery
+	PermissionResolverResolved
+)
+
+type permissionClaim struct {
+	state        PermissionResolverState
+	answerCh     chan PermissionAnswer
+	answerQueued bool
+}
+
+// PreparePermissionClaim records resolver ownership before permission.request
+// is published. Terminal entries may be replaced when an ACP session reuses a
+// request ID for a later request.
+func (s *ControlServer) PreparePermissionClaim(scope, requestID string, state PermissionResolverState) bool {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	if s.pendingRequest == requestID {
-		s.pendingRequest = ""
-		s.pendingAnswer = nil
+	key := permissionClaimKey{scope: scope, requestID: requestID}
+	if existing := s.pendingClaims[key]; existing != nil &&
+		existing.state != PermissionResolverResolved {
+		return false
 	}
+	s.pendingClaims[key] = &permissionClaim{state: state, answerCh: make(chan PermissionAnswer, 1)}
+	return true
+}
+
+func (s *ControlServer) SetPermissionResolverState(scope, requestID string, state PermissionResolverState) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	key := permissionClaimKey{scope: scope, requestID: requestID}
+	if claim := s.pendingClaims[key]; claim != nil {
+		claim.state = state
+	}
+}
+
+// RetryDirectPermissionDelivery returns a failed direct delivery to the
+// unowned state. It only changes the exact in-flight claim, so cleanup or a
+// replacement claim cannot be overwritten by a late failure.
+func (s *ControlServer) RetryDirectPermissionDelivery(scope, requestID string) bool {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	key := permissionClaimKey{scope: scope, requestID: requestID}
+	claim := s.pendingClaims[key]
+	if claim == nil || claim.state != PermissionResolverDirectDelivery {
+		return false
+	}
+	claim.state = PermissionResolverNoResolver
+	return true
+}
+
+// HandoffPermissionClaim atomically consumes an answer already queued for the
+// control resolver or closes control ownership by transitioning to next. Once
+// it returns without an answer, later control deliveries are rejected.
+func (s *ControlServer) HandoffPermissionClaim(scope, requestID string, next PermissionResolverState) (PermissionAnswer, bool) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	key := permissionClaimKey{scope: scope, requestID: requestID}
+	claim := s.pendingClaims[key]
+	if claim == nil {
+		return PermissionAnswer{}, false
+	}
+	if claim.state != PermissionResolverReserved && claim.state != PermissionResolverControl {
+		return PermissionAnswer{}, false
+	}
+	select {
+	case answer := <-claim.answerCh:
+		return answer, true
+	default:
+	}
+	if next == PermissionResolverResolved {
+		delete(s.pendingClaims, key)
+	} else {
+		claim.state = next
+	}
+	return PermissionAnswer{}, false
+}
+
+func (s *ControlServer) ClearPermissionClaims(scope string) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	for key := range s.pendingClaims {
+		if key.scope == scope {
+			delete(s.pendingClaims, key)
+		}
+	}
+}
+
+func (s *ControlServer) PermissionResolverState(scope, requestID string) PermissionResolverState {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if claim := s.pendingClaims[permissionClaimKey{scope: scope, requestID: requestID}]; claim != nil {
+		return claim.state
+	}
+	return PermissionResolverUnknown
+}
+
+// BeginPermissionClaim registers a permission claim within scope and returns
+// its answer channel. Request IDs are only unique within an ACP session, so
+// stable runtimes must use distinct scopes.
+func (s *ControlServer) BeginPermissionClaim(scope, requestID string) (<-chan PermissionAnswer, bool) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	key := permissionClaimKey{scope: scope, requestID: requestID}
+	claim := s.pendingClaims[key]
+	if claim == nil {
+		claim = &permissionClaim{answerCh: make(chan PermissionAnswer, 1)}
+		s.pendingClaims[key] = claim
+	} else if claim.state != PermissionResolverReserved {
+		return nil, false
+	}
+	claim.state = PermissionResolverControl
+	return claim.answerCh, true
+}
+
+func (s *ControlServer) EndPermissionClaim(scope, requestID string) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	delete(s.pendingClaims, permissionClaimKey{scope: scope, requestID: requestID})
 }
 
 // HasPendingPermission reports whether a permission claim is currently
@@ -290,7 +404,58 @@ func (s *ControlServer) EndPermissionClaim(requestID string) {
 func (s *ControlServer) HasPendingPermission() bool {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	return s.pendingRequest != ""
+	for _, claim := range s.pendingClaims {
+		if claim.state == PermissionResolverReserved || claim.state == PermissionResolverControl {
+			return true
+		}
+	}
+	return false
+}
+
+// AnswerPendingPermission delivers an answer to the active permission claim.
+// The bool reports whether the answer was actually delivered.
+func (s *ControlServer) AnswerPendingPermission(scope, requestID, optionID string) bool {
+	return s.DeliverPendingPermission(scope, requestID, optionID) == PermissionAnswerDelivered
+}
+
+type PermissionAnswerDelivery uint8
+
+const (
+	PermissionAnswerNotFound PermissionAnswerDelivery = iota
+	PermissionAnswerDelivered
+	PermissionAnswerChannelFull
+	PermissionAnswerResolverOwned
+	PermissionAnswerNoResolver
+)
+
+// DeliverPendingPermission distinguishes a missing claim from a claim that
+// has already accepted an answer. answerQueued remains set after the resolver
+// drains answerCh, making delivery single-use until the claim is ended.
+func (s *ControlServer) DeliverPendingPermission(scope, requestID, optionID string) PermissionAnswerDelivery {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	claim := s.pendingClaims[permissionClaimKey{scope: scope, requestID: requestID}]
+	if claim == nil {
+		return PermissionAnswerNotFound
+	}
+	switch claim.state {
+	case PermissionResolverReserved, PermissionResolverControl:
+	case PermissionResolverNoResolver:
+		claim.state = PermissionResolverDirectDelivery
+		return PermissionAnswerNoResolver
+	default:
+		return PermissionAnswerResolverOwned
+	}
+	if claim.answerQueued {
+		return PermissionAnswerChannelFull
+	}
+	select {
+	case claim.answerCh <- PermissionAnswer{RequestID: requestID, OptionID: optionID}:
+		claim.answerQueued = true
+		return PermissionAnswerDelivered
+	default:
+		return PermissionAnswerChannelFull
+	}
 }
 
 func (s *ControlServer) QueuePrompt(text string) {
@@ -493,16 +658,8 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 		if p.RequestID == "" || p.OptionID == "" {
 			return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"request_id", "option_id"}})
 		}
-		s.pendingMu.Lock()
-		pendingReq := s.pendingRequest
-		pending := s.pendingAnswer
-		s.pendingMu.Unlock()
-		if pending == nil || pendingReq != p.RequestID {
+		if !s.AnswerPendingPermission("", p.RequestID, p.OptionID) {
 			return failure(req.ID, -32001, "no_pending_permission", nil)
-		}
-		select {
-		case pending <- p:
-		default:
 		}
 		return success(req.ID, map[string]any{"accepted": true})
 	case "prompt":

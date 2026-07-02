@@ -63,6 +63,195 @@ func TestOwnerRejectionForMutatingMethods(t *testing.T) {
 	}
 }
 
+func TestAnswerPendingPermissionDeliversMatchingAnswer(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	answerCh, ok := s.BeginPermissionClaim("", "req_1")
+	if !ok {
+		t.Fatal("BeginPermissionClaim returned false")
+	}
+	defer s.EndPermissionClaim("", "req_1")
+
+	if !s.AnswerPendingPermission("", "req_1", "allow") {
+		t.Fatal("AnswerPendingPermission returned false for matching request")
+	}
+	select {
+	case answer := <-answerCh:
+		if answer.RequestID != "req_1" || answer.OptionID != "allow" {
+			t.Fatalf("answer = %+v", answer)
+		}
+	default:
+		t.Fatal("matching answer was not delivered")
+	}
+}
+
+func TestAnswerPendingPermissionRejectsMismatchedRequest(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	answerCh, ok := s.BeginPermissionClaim("", "req_1")
+	if !ok {
+		t.Fatal("BeginPermissionClaim returned false")
+	}
+	defer s.EndPermissionClaim("", "req_1")
+
+	if s.AnswerPendingPermission("", "req_other", "allow") {
+		t.Fatal("AnswerPendingPermission returned true for mismatched request")
+	}
+	select {
+	case answer := <-answerCh:
+		t.Fatalf("mismatched answer was delivered: %+v", answer)
+	default:
+	}
+}
+
+func TestPermissionClaimsAreScopedAndReportFullChannel(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	first, ok := s.BeginPermissionClaim("rt_1", "0")
+	if !ok {
+		t.Fatal("first BeginPermissionClaim returned false")
+	}
+	second, ok := s.BeginPermissionClaim("rt_2", "0")
+	if !ok {
+		t.Fatal("second BeginPermissionClaim returned false for a distinct scope")
+	}
+	defer s.EndPermissionClaim("rt_1", "0")
+	defer s.EndPermissionClaim("rt_2", "0")
+
+	if !s.AnswerPendingPermission("rt_1", "0", "allow_1") {
+		t.Fatal("answer for rt_1 was not delivered")
+	}
+	if s.AnswerPendingPermission("rt_1", "0", "duplicate") {
+		t.Fatal("answer reported delivery to a full channel")
+	}
+	if !s.AnswerPendingPermission("rt_2", "0", "allow_2") {
+		t.Fatal("answer for rt_2 was not delivered")
+	}
+
+	if got := <-first; got.OptionID != "allow_1" {
+		t.Fatalf("rt_1 answer = %+v", got)
+	}
+	if got := <-second; got.OptionID != "allow_2" {
+		t.Fatalf("rt_2 answer = %+v", got)
+	}
+}
+
+func TestPermissionClaimRejectsDuplicateAfterFirstAnswerIsDrained(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	answerCh, ok := s.BeginPermissionClaim("rt_1", "0")
+	if !ok {
+		t.Fatal("BeginPermissionClaim returned false")
+	}
+	defer s.EndPermissionClaim("rt_1", "0")
+
+	if got := s.DeliverPendingPermission("rt_1", "0", "allow"); got != PermissionAnswerDelivered {
+		t.Fatalf("first delivery = %v, want delivered", got)
+	}
+	if answer := <-answerCh; answer.OptionID != "allow" {
+		t.Fatalf("first answer = %+v", answer)
+	}
+
+	// The resolver has drained the channel but has not yet applied the answer
+	// or called EndPermissionClaim. A duplicate must remain non-deliverable.
+	if got := s.DeliverPendingPermission("rt_1", "0", "duplicate"); got != PermissionAnswerChannelFull {
+		t.Fatalf("duplicate delivery = %v, want channel-full", got)
+	}
+	select {
+	case answer := <-answerCh:
+		t.Fatalf("duplicate answer was delivered: %+v", answer)
+	default:
+	}
+}
+
+func TestBeginPermissionClaimPreservesAnswerQueuedWhileReserved(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	if !s.PreparePermissionClaim("rt_1", "0", PermissionResolverReserved) {
+		t.Fatal("PreparePermissionClaim returned false")
+	}
+	if got := s.DeliverPendingPermission("rt_1", "0", "allow"); got != PermissionAnswerDelivered {
+		t.Fatalf("delivery = %v, want delivered", got)
+	}
+
+	answerCh, ok := s.BeginPermissionClaim("rt_1", "0")
+	if !ok {
+		t.Fatal("BeginPermissionClaim returned false")
+	}
+	defer s.EndPermissionClaim("rt_1", "0")
+	if answer := <-answerCh; answer.OptionID != "allow" {
+		t.Fatalf("queued answer = %+v", answer)
+	}
+	if got := s.DeliverPendingPermission("rt_1", "0", "duplicate"); got != PermissionAnswerChannelFull {
+		t.Fatalf("duplicate delivery = %v, want channel-full", got)
+	}
+}
+
+func TestHandoffPermissionClaimAtomicallyConsumesQueuedAnswerOrTransfersToFile(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	if !s.PreparePermissionClaim("rt_1", "0", PermissionResolverReserved) {
+		t.Fatal("prepare queued-answer claim failed")
+	}
+	if !s.AnswerPendingPermission("rt_1", "0", "allow") {
+		t.Fatal("queue answer failed")
+	}
+	answer, answered := s.HandoffPermissionClaim("rt_1", "0", PermissionResolverFile)
+	if !answered || answer.OptionID != "allow" {
+		t.Fatalf("handoff answer = %+v, %v", answer, answered)
+	}
+	s.EndPermissionClaim("rt_1", "0")
+
+	if !s.PreparePermissionClaim("rt_1", "1", PermissionResolverReserved) {
+		t.Fatal("prepare file-handoff claim failed")
+	}
+	if answer, answered := s.HandoffPermissionClaim("rt_1", "1", PermissionResolverFile); answered {
+		t.Fatalf("unexpected handoff answer: %+v", answer)
+	}
+	if got := s.PermissionResolverState("rt_1", "1"); got != PermissionResolverFile {
+		t.Fatalf("resolver state = %v, want file", got)
+	}
+	if got := s.DeliverPendingPermission("rt_1", "1", "late"); got != PermissionAnswerResolverOwned {
+		t.Fatalf("late delivery = %v, want resolver-owned", got)
+	}
+}
+
+func TestHandoffPermissionClaimAtomicallyClosesCancelledClaim(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	if !s.PreparePermissionClaim("rt_1", "0", PermissionResolverReserved) {
+		t.Fatal("prepare claim failed")
+	}
+	if answer, answered := s.HandoffPermissionClaim("rt_1", "0", PermissionResolverResolved); answered {
+		t.Fatalf("unexpected cancellation answer: %+v", answer)
+	}
+	if got := s.PermissionResolverState("rt_1", "0"); got != PermissionResolverUnknown {
+		t.Fatalf("resolver state = %v, want removed", got)
+	}
+	if got := s.DeliverPendingPermission("rt_1", "0", "late"); got != PermissionAnswerNotFound {
+		t.Fatalf("late cancellation delivery = %v, want not-found", got)
+	}
+}
+
+func TestPreparePermissionClaimRejectsExistingNoResolver(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	if !s.PreparePermissionClaim("rt_1", "0", PermissionResolverNoResolver) {
+		t.Fatal("initial PreparePermissionClaim returned false")
+	}
+	if s.PreparePermissionClaim("rt_1", "0", PermissionResolverAutomatic) {
+		t.Fatal("second PreparePermissionClaim replaced live no-resolver claim")
+	}
+	if state := s.PermissionResolverState("rt_1", "0"); state != PermissionResolverNoResolver {
+		t.Fatalf("resolver state = %v, want no-resolver", state)
+	}
+}
+
+func TestClearPermissionClaimsRemovesOnlyRequestedScope(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	s.PreparePermissionClaim("rt_1", "0", PermissionResolverFile)
+	s.PreparePermissionClaim("rt_2", "0", PermissionResolverFile)
+	s.ClearPermissionClaims("rt_1")
+	if got := s.PermissionResolverState("rt_1", "0"); got != PermissionResolverUnknown {
+		t.Fatalf("rt_1 state = %v, want removed", got)
+	}
+	if got := s.PermissionResolverState("rt_2", "0"); got != PermissionResolverFile {
+		t.Fatalf("rt_2 state = %v, want file", got)
+	}
+}
+
 func TestOwnershipTransferOnDisconnect(t *testing.T) {
 	state := NewState("run_1", "", 0)
 	s := NewServer(state)

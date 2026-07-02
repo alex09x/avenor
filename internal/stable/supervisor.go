@@ -1110,6 +1110,7 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 		SessionID:              session.SessionID,
 		RunID:                  s.runID,
 		RunLabel:               child.label,
+		PermissionClaimScope:   child.id,
 		AutoApprove:            child.autoApprove,
 		PermissionClaimTimeout: child.permClaimTimeout,
 		Timeout:                timer,
@@ -1329,7 +1330,7 @@ func (s *Supervisor) listRuntimes() []map[string]any {
 			"runtime_id":         rt.id,
 			"session_id":         rt.session.SessionID,
 			"label":              rt.label,
-			"dir":                 rt.dir,
+			"dir":                rt.dir,
 			"status":             status,
 			"exit_code":          rt.exitCode,
 			"on_event":           rt.onEvent,
@@ -1406,23 +1407,60 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 		return fmt.Errorf("unsupported option kind %q for option_id %q on request %q", kind, optionID, requestID)
 	}
 
+	// Stable runtimes use the same CLI permission resolver as top-level runs.
+	// If it has an active control claim, feed the answer through that claim so
+	// the resolver can call the provider, emit permission.response, clear the
+	// waiting status, and release its in-flight guard. Calling the provider
+	// directly here leaves the resolver stuck until its timeout and causes the
+	// next backend permission to fail as an overlapping request.
+	switch s.control.DeliverPendingPermission(rtID, requestID, optionID) {
+	case control.PermissionAnswerDelivered:
+		s.controlMu.Lock()
+		delete(s.permOptions, key)
+		s.controlMu.Unlock()
+		return nil
+	case control.PermissionAnswerChannelFull:
+		return fmt.Errorf("permission request %q for runtime %q already has an answer pending delivery", requestID, rtID)
+	case control.PermissionAnswerResolverOwned:
+		return fmt.Errorf("permission request %q for runtime %q is owned by another resolver", requestID, rtID)
+	case control.PermissionAnswerNotFound:
+		return fmt.Errorf("permission request %q for runtime %q has no registered resolver state", requestID, rtID)
+	case control.PermissionAnswerNoResolver:
+		// No control, automatic, or file resolver owns this request. The direct
+		// provider path below is the only remaining way to answer it.
+	}
+
+	// A request emitted without any configured resolver remains backend-owned.
 	rt.mu.Lock()
 	provider := rt.provider
 	sessionID := rt.session.SessionID
 	rt.mu.Unlock()
 	if provider == nil || sessionID == "" {
+		s.control.RetryDirectPermissionDelivery(rtID, requestID)
 		return fmt.Errorf("runtime %q has no active session for permission response", rtID)
 	}
 	if err := provider.AnswerPermission(context.Background(), sessionID, requestID, runtime.PermissionResponse{
 		Allow:    kind == "allow",
 		OptionID: optionID,
 	}); err != nil {
+		s.control.RetryDirectPermissionDelivery(rtID, requestID)
 		return err
 	}
-	s.controlMu.Lock()
-	delete(s.permOptions, key)
-	s.controlMu.Unlock()
+	s.cleanupDirectPermission(rtID, requestID, nil)
 	return nil
+}
+
+// cleanupDirectPermission removes stale option metadata before releasing the
+// claim for reuse. controlMu remains held across EndPermissionClaim so a
+// replacement cannot publish new options between those operations.
+func (s *Supervisor) cleanupDirectPermission(runtimeID, requestID string, beforeRelease func()) {
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	delete(s.permOptions, runtimeID+":"+requestID)
+	if beforeRelease != nil {
+		beforeRelease()
+	}
+	s.control.EndPermissionClaim(runtimeID, requestID)
 }
 
 func (s *Supervisor) cachePermissionOptions(runtimeID, requestID string, options []any) {
@@ -1440,6 +1478,7 @@ func (s *Supervisor) clearRuntimePermissionOptions(runtimeID string) {
 		}
 	}
 	s.controlMu.Unlock()
+	s.control.ClearPermissionClaims(runtimeID)
 }
 
 type runtimeFanoutWriter struct {
@@ -1595,7 +1634,7 @@ func (s *Supervisor) RuntimeStatus(rtID string) (any, error) {
 		"runtime_id":         rt.id,
 		"session_id":         rt.session.SessionID,
 		"label":              rt.label,
-		"dir":                 rt.dir,
+		"dir":                rt.dir,
 		"status":             status,
 		"exit_code":          rt.exitCode,
 		"on_event":           rt.onEvent,
