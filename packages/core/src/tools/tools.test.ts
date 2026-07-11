@@ -43,10 +43,11 @@ describe.skipIf(skipIfNoBinary)('spawnTool + statusTool + shutdownTool integrati
       agent: '',
       prompt: 'exit 0',
       dir: process.cwd(),
+      label: 'custom-label',
     })
     runId = result.run_id
     expect(result.run_id).toBeString()
-    expect(result.label).toBeString()
+    expect(result.label).toBe('custom-label')
     expect(result.supervisor_id).toBeString()
     expect(result.supervisor_id).toBe(sup.supervisorId)
   }, 15_000)
@@ -58,9 +59,12 @@ describe.skipIf(skipIfNoBinary)('spawnTool + statusTool + shutdownTool integrati
     expect(typeof result.status).toBe('string')
   }, 10_000)
 
-  it('statusTool list returns array', async () => {
+  it('statusTool list preserves the stable run ID separately from its label', async () => {
     const list = await statusTool({})
     expect(Array.isArray(list)).toBe(true)
+    const results = Array.isArray(list) ? list : [list]
+    const result = results.find(entry => entry.run_id === runId)
+    expect(result?.label).toBe('custom-label')
   }, 10_000)
 
   it('eventsTool returns events array', async () => {
@@ -276,11 +280,49 @@ describe('translateStatus', () => {
     expect(translateStatus('running', { _status: 'FAILED' })).toBe('failed')
   })
 
+  it('recognizes lowercase terminal phases from the control protocol', () => {
+    expect(translateStatus('done', null)).toBe('done')
+    expect(translateStatus('failed', null)).toBe('failed')
+    expect(translateStatus('timeout', null)).toBe('timeout')
+    expect(translateStatus('killed', null)).toBe('killed')
+  })
+
   it('returns "running" when phase is running and no terminal sentinel exists', () => {
     expect(translateStatus('running', null)).toBe('running')
   })
 
   it('preserves the waiting phase even with a non-terminal sentinel', () => {
     expect(translateStatus('waiting', { _status: 'RUNNING' })).toBe('waiting')
+  })
+
+  // Uppercase sentinel overrides uppercase RUNNING/IDLE phases.
+  it('lets a DONE sentinel override an uppercase "RUNNING" phase', () => {
+    expect(translateStatus('RUNNING', { _status: 'DONE' })).toBe('done')
+  })
+
+  it('lets a FAILED sentinel override an uppercase "IDLE" phase', () => {
+    expect(translateStatus('IDLE', { _status: 'FAILED' })).toBe('failed')
+  })
+
+  it('lets a TIMEOUT sentinel override a mixed-case "Running" phase', () => {
+    expect(translateStatus('Running', { _status: 'TIMEOUT' })).toBe('timeout')
+  })
+
+  // Lowercase terminal phases are recognized directly.
+  it('recognizes lowercase terminal phases without sentinel', () => {
+    expect(translateStatus('done', null)).toBe('done')
+    expect(translateStatus('failed', null)).toBe('failed')
+    expect(translateStatus('timeout', null)).toBe('timeout')
+    expect(translateStatus('killed', null)).toBe('killed')
+    expect(translateStatus('blocked', null)).toBe('failed')
+  })
+
+  // Uppercase terminal phases are also normalized via switch.
+  it('recognizes uppercase terminal phases via normalization', () => {
+    expect(translateStatus('DONE', null)).toBe('done')
+    expect(translateStatus('FAILED', null)).toBe('failed')
+    expect(translateStatus('TIMEOUT', null)).toBe('timeout')
+    expect(translateStatus('KILLED', null)).toBe('killed')
+    expect(translateStatus('BLOCKED', null)).toBe('failed')
   })
 })

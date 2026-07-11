@@ -73,38 +73,94 @@ export default async function (pi: ExtensionAPI) {
 
   const trackedRuns = new Map<string, TrackedRun>()
   let pollingActive = false
+  let pollingGeneration = 0
+  let pollInFlight: Promise<RunStatusEntry[]> | null = null
   // Captured context for polling callbacks (valid during session lifecycle)
   let sessionCtx: ExtensionContext | null = null
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
   async function pollRuns(): Promise<RunStatusEntry[]> {
-    let raw: StatusResult | StatusResult[]
+    // First, gather all live runs from the singleton supervisor so externally
+    // spawned runs (not tracked here) appear with agent "unknown". A list
+    // failure must not stop direct monitoring of tracked runs.
+    const liveMap = new Map<string, StatusResult>()
     try {
-      raw = await statusTool({})
+      const allLive = await statusTool({})
+      const liveList = Array.isArray(allLive) ? allLive : [allLive]
+      for (const result of liveList) {
+        liveMap.set(result.run_id, result)
+      }
     } catch (err) {
-      console.error('avenor pollRuns: statusTool failed', err)
-      return []
+      console.error('avenor pollRuns: failed to list singleton runs', err)
     }
 
-    const results = Array.isArray(raw) ? raw : [raw]
+    // Build entries for tracked runs, preserving metadata and lastStatus.
     const entries: RunStatusEntry[] = []
-
-    for (const r of results) {
-      const run = trackedRuns.get(r.run_id)
-      if (run) {
-        run.lastStatus = r
+    for (const run of trackedRuns.values()) {
+      const live = liveMap.get(run.runId)
+      if (live) {
+        liveMap.delete(live.run_id)
+        run.lastStatus = live
+        entries.push({
+          runId: run.runId,
+          label: run.label,
+          status: live.status,
+          phase: live.phase,
+          phaseLabel: live.phase_label,
+          agent: run.agent,
+          pendingPermission: !!live.pending_permission,
+          permissionDescription: live.pending_permission?.description,
+        })
+        continue
       }
+      // Tracked but not in live list — directly query it (explicit-supervisor
+      // or transient-failure scenario). Preserve previous status on failure.
+      try {
+        const raw = await statusTool({
+          runId: run.runId,
+          supervisorId: run.supervisorId,
+        })
+        const result = Array.isArray(raw) ? raw[0] : raw
+        if (!result) throw new Error('status response was empty')
+        run.lastStatus = result
+        entries.push({
+          runId: run.runId,
+          label: run.label,
+          status: result.status,
+          phase: result.phase,
+          phaseLabel: result.phase_label,
+          agent: run.agent,
+          pendingPermission: !!result.pending_permission,
+          permissionDescription: result.pending_permission?.description,
+        })
+      } catch (err) {
+        console.error(`avenor pollRuns: statusTool failed for ${run.runId}`, err)
+        const previous = run.lastStatus
+        entries.push({
+          runId: run.runId,
+          label: run.label,
+          status: previous?.status ?? 'unavailable',
+          phase: previous?.phase,
+          phaseLabel: previous?.phase_label,
+          agent: run.agent,
+          pendingPermission: !!previous?.pending_permission,
+          permissionDescription: previous?.pending_permission?.description,
+        })
+      }
+    }
 
+    // Append externally spawned singleton runs absent from tracked set.
+    for (const live of liveMap.values()) {
       entries.push({
-        runId: r.run_id,
-        label: r.label,
-        status: r.status,
-        phase: r.phase,
-        phaseLabel: r.phase_label,
-        agent: trackedRuns.get(r.run_id)?.agent ?? 'unknown',
-        pendingPermission: !!r.pending_permission,
-        permissionDescription: r.pending_permission?.description,
+        runId: live.run_id,
+        label: live.label,
+        status: live.status,
+        phase: live.phase,
+        phaseLabel: live.phase_label,
+        agent: 'unknown',
+        pendingPermission: !!live.pending_permission,
+        permissionDescription: live.pending_permission?.description,
       })
     }
 
@@ -140,15 +196,24 @@ export default async function (pi: ExtensionAPI) {
   function startPolling(): void {
     if (pollingActive) return
     pollingActive = true
+    const generation = ++pollingGeneration
 
     const tick = async () => {
+      if (!pollingActive || generation !== pollingGeneration) return
+
       // Snapshot previous statuses before pollRuns mutates run.lastStatus
       const prevStatuses = new Map<string, string | undefined>()
       for (const [id, run] of trackedRuns) {
         prevStatuses.set(id, run.lastStatus?.status)
       }
 
-      const entries = await pollRuns()
+      const currentPoll = pollRuns()
+      pollInFlight = currentPoll
+      const entries = await currentPoll.finally(() => {
+        if (pollInFlight === currentPoll) pollInFlight = null
+      })
+      if (!pollingActive || generation !== pollingGeneration) return
+
       updateWidget(entries)
 
       // Check for completed runs and notify
@@ -159,7 +224,7 @@ export default async function (pi: ExtensionAPI) {
         if (TERMINAL_STATUSES.has(entry.status)) {
           // Status just transitioned to terminal
           const prevStatus = prevStatuses.get(entry.runId)
-          if (prevStatus && !TERMINAL_STATUSES.has(prevStatus)) {
+          if (!prevStatus || !TERMINAL_STATUSES.has(prevStatus)) {
             sessionCtx?.ui.notify(
               `Sub-agent "${entry.label}" finished: ${entry.status}`,
               entry.status === 'done' ? 'info' : 'warning',
@@ -203,8 +268,13 @@ export default async function (pi: ExtensionAPI) {
 
       // Stop polling if no active runs
       const hasActive = entries.some(e => !TERMINAL_STATUSES.has(e.status))
-      if (hasActive) {
-        setTimeout(tick, POLL_INTERVAL_MS)
+      if (hasActive && pollingActive && generation === pollingGeneration) {
+        setTimeout(() => {
+          void tick().catch(err => {
+            pollingActive = false
+            console.error('avenor polling loop failed', err)
+          })
+        }, POLL_INTERVAL_MS)
       } else {
         pollingActive = false
         sessionCtx?.ui.setStatus('avenor', '')
@@ -212,7 +282,18 @@ export default async function (pi: ExtensionAPI) {
       }
     }
 
-    tick()
+    void tick().catch(err => {
+      pollingActive = false
+      console.error('avenor polling loop failed', err)
+    })
+  }
+
+  async function stopPolling(): Promise<void> {
+    pollingActive = false
+    pollingGeneration++
+    await pollInFlight?.catch(() => {})
+    sessionCtx?.ui.setStatus('avenor', '')
+    sessionCtx?.ui.setWidget('avenor-status', undefined)
   }
 
   // ── Session lifecycle ────────────────────────────────────────────────────
@@ -222,7 +303,7 @@ export default async function (pi: ExtensionAPI) {
   })
 
   pi.on('session_shutdown', async (_event, _ctx) => {
-    pollingActive = false
+    await stopPolling()
     sessionCtx = null
   })
 
@@ -321,6 +402,7 @@ export default async function (pi: ExtensionAPI) {
         agent: params.agent,
         label,
         supervisorId: result.supervisor_id,
+        runtimeId: result.runtime_id,
         startTime: Date.now(),
         blocking: wait,
       })
@@ -370,7 +452,7 @@ export default async function (pi: ExtensionAPI) {
           })
         } else {
           let lastAction = ''
-          if (!result.supervisor_id) {
+          if (!params.supervisor_id) {
             try {
               const eventsResult = await eventsTool({ runId: result.run_id, limit: 3 })
               const last = eventsResult.events[eventsResult.events.length - 1]
@@ -553,6 +635,8 @@ export default async function (pi: ExtensionAPI) {
       force: Type.Optional(Type.Boolean({ description: 'Force shutdown instead of graceful' })),
     }),
     async execute(_toolCallId, params) {
+      await stopPolling()
+      trackedRuns.clear()
       const result = await shutdownTool({
         supervisorId: params.supervisor_id,
         force: params.force,
@@ -684,7 +768,7 @@ export default async function (pi: ExtensionAPI) {
         const { Supervisor } = await import('@dougbots/avenor-core')
         const sup = await Supervisor.get()
         const client = sup.getClient()
-        await client.cancel(run?.lastStatus?.runtime_id ?? runId)
+        await client.cancel(run?.lastStatus?.runtime_id ?? run?.runtimeId ?? runId)
         ctx.ui.notify(`Cancelled "${label}"`, 'info')
       } catch (err) {
         ctx.ui.notify(`Failed to cancel: ${err instanceof Error ? err.message : String(err)}`, 'error')
