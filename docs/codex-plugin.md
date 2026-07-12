@@ -7,7 +7,6 @@ This is not another Avenor implementation. The plugin starts `avenor mcp`, so th
 ## Prerequisites
 
 - Install Avenor and make sure `avenor` is on your `PATH`.
-- Check out the Avenor repository locally.
 - Install a Codex CLI version that supports plugins.
 
 You can confirm that Codex will be able to find the binary before installing the plugin:
@@ -18,10 +17,10 @@ avenor --help
 
 ## Setup
 
-1. Register the marketplace from your checkout. Replace `/absolute/path/to/avenor` with the absolute path to the repository:
+1. Register Avenor's marketplace from GitHub:
 
 ```bash
-codex plugin marketplace add /absolute/path/to/avenor/marketplace
+codex plugin marketplace add sdougbrown/avenor
 ```
 
 2. Install Avenor from the registered marketplace:
@@ -32,7 +31,23 @@ codex plugin add avenor@avenor
 
 3. Start a new Codex task. Plugin MCP servers and skills are loaded when the task starts, so an already-open task will not pick up the integration.
 
-The local checkout flow above is the currently verified installation path. Direct installation from a GitHub location is not documented yet; clone or update the repository, then register its `marketplace` directory.
+For GitHub and repository-root installs, Codex and Claude Code both consume `.claude-plugin/marketplace.json`. That manifest points to `marketplace/plugins/avenor`, where Codex loads `.codex-plugin/plugin.json`. The separate `marketplace/.agents/plugins/marketplace.json` supports registering only the `marketplace/` subdirectory.
+
+### Installing from a local checkout or branch
+
+The GitHub source above is the normal installation path. To test local plugin changes, register the repository root instead. Replace `/absolute/path/to/avenor` with the checkout's absolute path:
+
+```bash
+codex plugin marketplace add /absolute/path/to/avenor
+```
+
+To test a Git branch without cloning it, pin that ref when registering the GitHub source:
+
+```bash
+codex plugin marketplace add sdougbrown/avenor --ref feature/my-plugin-change
+```
+
+These are alternative marketplace sources; use one registration method, then run `codex plugin add avenor@avenor` as usual.
 
 ## Verification
 
@@ -52,7 +67,23 @@ The plugin runs `avenor mcp` by command name. Make sure the directory containing
 
 ### Codex cannot find the marketplace
 
-Pass the absolute path to the repository's `marketplace` directory. That directory contains `.agents/plugins/marketplace.json`; passing the repository root will not register it.
+Check whether the marketplace was registered:
+
+```bash
+codex plugin marketplace list
+```
+
+If `avenor` is missing, retry with the exact owner and repository name:
+
+```bash
+codex plugin marketplace add sdougbrown/avenor
+```
+
+This step needs network access to GitHub. If GitHub registration still fails and you have a local checkout, register its absolute repository-root path instead:
+
+```bash
+codex plugin marketplace add /absolute/path/to/avenor
+```
 
 ### The plugin is installed but its tools are missing
 
