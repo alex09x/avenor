@@ -29,7 +29,7 @@ import {
   type WatchRunRef,
 } from './watch.js'
 import type { TrackedRun, RunStatusEntry } from './types.js'
-import { TERMINAL_STATUSES, formatRunLine, statusEmoji } from './types.js'
+import { TERMINAL_STATUSES, findLiveStatusForTrackedRun, formatRunLine, statusEmoji } from './types.js'
 
 const POLL_INTERVAL_MS = 3_000
 const INSPECT_LIMIT = 128
@@ -290,7 +290,7 @@ export function createExtension(deps: ExtensionDeps = defaultDeps) {
 
       const entries: RunStatusEntry[] = []
       for (const run of trackedRuns.values()) {
-        const live = liveMap.get(run.runId)
+        const live = findLiveStatusForTrackedRun(run, liveMap.values())
         if (live) {
           liveMap.delete(live.run_id)
           run.lastStatus = live
@@ -1051,11 +1051,14 @@ export function createExtension(deps: ExtensionDeps = defaultDeps) {
     })
 
     pi.registerCommand('avenor-watch', {
-      description: 'Open a live run inspector for an avenor run',
+      description: 'Open a live run inspector by run ID, label, or agent name',
       getArgumentCompletions: (prefix: string) => {
         const items = Array.from(trackedRuns.values())
-          .filter(run => run.label.startsWith(prefix) || run.runId.startsWith(prefix))
-          .map(run => ({ value: run.runId, label: `${run.label} (${run.runId.slice(0, 8)})` }))
+          .filter(run => run.label.startsWith(prefix) || run.agent.startsWith(prefix) || run.runId.startsWith(prefix))
+          .map(run => ({
+            value: run.runId,
+            label: `${sanitizeText(run.label)} (${sanitizeText(run.agent)}, ${sanitizeText(run.runId).slice(0, 8)})`,
+          }))
         return items.length > 0 ? items : null
       },
       handler: async (args, ctx) => {
@@ -1080,8 +1083,11 @@ export function createExtension(deps: ExtensionDeps = defaultDeps) {
       description: 'Cancel a running avenor sub-agent',
       getArgumentCompletions: (prefix: string) => {
         const items = Array.from(trackedRuns.values())
-          .filter(run => run.label.startsWith(prefix) || run.runId.startsWith(prefix))
-          .map(run => ({ value: run.runId, label: `${run.label} (${run.runId.slice(0, 8)})` }))
+          .filter(run => run.label.startsWith(prefix) || run.agent.startsWith(prefix) || run.runId.startsWith(prefix))
+          .map(run => ({
+            value: run.runId,
+            label: `${sanitizeText(run.label)} (${sanitizeText(run.agent)}, ${sanitizeText(run.runId).slice(0, 8)})`,
+          }))
         return items.length > 0 ? items : null
       },
       handler: async (args, ctx) => {

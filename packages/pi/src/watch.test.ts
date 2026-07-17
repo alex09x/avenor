@@ -368,13 +368,14 @@ describe('openRunInspector', () => {
     expect(custom).not.toHaveBeenCalled()
   })
 
-  it('warns and returns when no tracked runs are available', async () => {
+  it('treats a whitespace selector as empty and warns when no tracked runs are available', async () => {
     const notify = mock(() => {})
     const select = mock(async () => 'unused')
     const custom = mock(async () => {})
 
     await openRunInspector({ hasUI: true, ui: { notify, select, custom } } as any, {
       trackedRuns: [],
+      initialRunId: '   ',
       deps: makeDeps(),
     })
 
@@ -399,7 +400,64 @@ describe('openRunInspector', () => {
     expect(custom).not.toHaveBeenCalled()
   })
 
-  it('treats ctx.ui.select() as returning the selected value string', async () => {
+  it('opens a uniquely matched agent name without showing the selector', async () => {
+    const inspectRun = mock(async () => makeInspectResult(buildSnapshot([]), { status: 'running' }))
+    const select = mock(async () => undefined)
+
+    await openRunInspector({
+      hasUI: true,
+      ui: {
+        notify: mock(() => {}),
+        select,
+        custom: mock(async (factory: any) => {
+          const component = factory(tui, theme, keybindings, mock(() => {})) as RunInspectorOverlay
+          component.dispose()
+        }),
+      },
+    } as any, {
+      trackedRuns: [{ runId: 'run-explore', label: 'test-explore', agent: 'explore' }],
+      initialRunId: 'explore',
+      deps: makeDeps({ inspectRun }),
+    })
+
+    expect(select).not.toHaveBeenCalled()
+    expect(inspectRun).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-explore', agent: 'explore' }))
+  })
+
+  it('uses the picker to disambiguate multiple runs for one agent', async () => {
+    const inspectRun = mock(async () => makeInspectResult(buildSnapshot([]), { status: 'running' }))
+    const select = mock(async (_title: string, choices: string[]) => {
+      expect(choices).toEqual([
+        'first · explore · run-one',
+        'second · explore · run-two',
+      ])
+      return choices[1]
+    })
+
+    await openRunInspector({
+      hasUI: true,
+      ui: {
+        notify: mock(() => {}),
+        select,
+        custom: mock(async (factory: any) => {
+          const component = factory(tui, theme, keybindings, mock(() => {})) as RunInspectorOverlay
+          component.dispose()
+        }),
+      },
+    } as any, {
+      trackedRuns: [
+        { runId: 'run-one', label: '\u001b[31mfirst\u001b[0m', agent: 'explore' },
+        { runId: 'run-two', label: 'second', agent: 'explore' },
+      ],
+      initialRunId: 'explore',
+      deps: makeDeps({ inspectRun }),
+    })
+
+    expect(select).toHaveBeenCalledTimes(1)
+    expect(inspectRun).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-two', label: 'second' }))
+  })
+
+  it('uses the display string returned by ctx.ui.select()', async () => {
     const inspectRun = mock(async (run: WatchRunRef) => makeInspectResult(buildSnapshot([
       { event: 'session.start', runtime_id: 'rt-select', run_id: run.runId, run_label: run.runId, backend: 'pi', agent: 'horse' },
     ]), { status: 'running' }))
@@ -410,7 +468,7 @@ describe('openRunInspector', () => {
       hasUI: true,
       ui: {
         notify: mock(() => {}),
-        select: mock(async () => 'run-selected'),
+        select: mock(async () => 'picked · run-sele'),
         custom: mock(async (factory: any) => {
           component = factory(tui, theme, keybindings, done)
           expect(component).toBeInstanceOf(RunInspectorOverlay)
