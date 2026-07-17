@@ -67,8 +67,8 @@ func TestToolNameParity(t *testing.T) {
 func TestSchemaFieldParity(t *testing.T) {
 	t.Run("avenor_spawn", func(t *testing.T) {
 		// spawnArgs — required: agent, repo_dir
-		// optional: prompt, prompt_file, label, timeout, model, backend, server_url, supervisor_id
-		allowed := []string{"agent", "repo_dir", "prompt", "prompt_file", "label", "timeout", "model", "backend", "server_url", "supervisor_id"}
+		// optional: prompt, prompt_file, label, timeout, model, backend, server_url, supervisor_id, auto_approve
+		allowed := []string{"agent", "repo_dir", "prompt", "prompt_file", "label", "timeout", "model", "backend", "server_url", "supervisor_id", "auto_approve"}
 		required := []string{"agent", "repo_dir"}
 		assertFields(t, "spawnArgs", allowed, required)
 	})
@@ -120,6 +120,10 @@ func assertFields(t *testing.T, structName string, allowed, required []string) {
 	// without error into the struct.
 	obj := make(map[string]any)
 	for _, f := range allowed {
+		if f == "auto_approve" {
+			obj[f] = true
+			continue
+		}
 		obj[f] = "test"
 	}
 	data, err := json.Marshal(obj)
@@ -139,6 +143,9 @@ func assertFields(t *testing.T, structName string, allowed, required []string) {
 		}
 		if a.RepoDir != "test" {
 			t.Errorf("%s: repo_dir not populated", structName)
+		}
+		if !a.AutoApprove {
+			t.Errorf("%s: auto_approve not populated", structName)
 		}
 	case "statusArgs":
 		var a statusArgs

@@ -548,6 +548,14 @@ func TestAvenorSpawn(t *testing.T) {
 	if ri.Dir != "/tmp/test-repo" {
 		t.Errorf("expected dir /tmp/test-repo, got %s", ri.Dir)
 	}
+
+	p := fake.spawnCapturedParams
+	if p == nil {
+		t.Fatal("expected spawn params to be captured")
+	}
+	if _, ok := p["auto_approve"]; ok {
+		t.Error("expected auto_approve key to be absent when not set")
+	}
 }
 
 func TestAvenorSpawnWithLabel(t *testing.T) {
@@ -676,6 +684,42 @@ func TestAvenorSpawnWithOptionalParams(t *testing.T) {
 	}
 	if ri.SessionID != "ses_opt_1" {
 		t.Errorf("expected session_id ses_opt_1, got %s", ri.SessionID)
+	}
+}
+
+func TestAvenorSpawnAutoApproveTrue(t *testing.T) {
+	fake := &fakeClient{
+		spawnFunc: func(params map[string]any) (map[string]any, error) {
+			return map[string]any{
+				"runtime_id": "rt_auto_1",
+				"session_id": "ses_auto_1",
+			}, nil
+		},
+	}
+	s, err := NewServer(Options{
+		Transport:     "stdio",
+		NoAutostart:   true,
+		ControlClient: fake,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = s.handleAvenorSpawn(context.Background(), nil, spawnArgs{
+		Agent:       "codex",
+		RepoDir:     "/tmp/test-repo",
+		AutoApprove: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p := fake.spawnCapturedParams
+	if p == nil {
+		t.Fatal("expected spawn params to be captured")
+	}
+	if got, ok := p["auto_approve"].(bool); !ok || !got {
+		t.Errorf("expected auto_approve bool true, got %T %v", p["auto_approve"], p["auto_approve"])
 	}
 }
 
