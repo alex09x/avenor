@@ -24,6 +24,10 @@ type Provider struct {
 	threads map[string]string // sessionID (=threadID) → threadID
 	turns   map[string]string // sessionID → current turnID
 
+	// startClient constructs a new app-server client. Overridable in tests;
+	// defaults to StartClient when nil.
+	startClient func(context.Context) (*client, error)
+
 	// Broker fields for channel-wrapped prompt injection.
 	broker          *broker.Broker
 	runIDs          map[string]string // sessionID → runID
@@ -305,17 +309,29 @@ func (p *Provider) ensureClient(ctx context.Context) (*client, error) {
 		p.mu.Unlock()
 		return c, nil
 	}
+	// Release p.mu before starting a client. sync.Mutex is not reentrant, so
+	// keeping it held here would make the re-lock below (for the double-checked
+	// store) deadlock this goroutine against itself. Re-check p.client after
+	// re-acquiring.
+	p.mu.Unlock()
 
-	c, err := StartClient(ctx)
+	starter := p.startClient
+	if starter == nil {
+		starter = StartClient
+	}
+	c, err := starter(ctx)
 	if err != nil {
-		p.mu.Unlock()
 		return nil, err
 	}
 
 	p.mu.Lock()
 	if p.client != nil {
+		// Lost the race: another goroutine started a client first. Close ours
+		// to avoid orphaning the codex app-server process it spawned.
+		existing := p.client
 		p.mu.Unlock()
-		return p.client, nil
+		_ = c.Close()
+		return existing, nil
 	}
 	// Store broker reference if provided.
 	if p.opts.Broker != nil {
