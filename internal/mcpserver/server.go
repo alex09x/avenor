@@ -47,10 +47,19 @@ type Server struct {
 	registry              *RunRegistry
 	defaultSupervisorPath string
 	toolNames             []string
+	clock                 func() time.Time
 }
 
 type statusArgs struct {
 	RunID        string `json:"run_id,omitempty" jsonschema:"optional run ID or label to query"`
+	View         string `json:"view,omitempty" jsonschema:"optional response detail: lifecycle or full"`
+	SupervisorID string `json:"supervisor_id,omitempty" jsonschema:"optional supervisor socket path"`
+}
+
+type resultArgs struct {
+	RunID        string `json:"run_id" jsonschema:"required run ID or label"`
+	Wait         *bool  `json:"wait,omitempty" jsonschema:"optional wait for a terminal result (default true)"`
+	Timeout      string `json:"timeout,omitempty" jsonschema:"optional maximum time to wait (for example 30s or 5m)"`
 	SupervisorID string `json:"supervisor_id,omitempty" jsonschema:"optional supervisor socket path"`
 }
 
@@ -118,8 +127,10 @@ func NewServer(opts Options) (*Server, error) {
 		mcpServer:     mcpServer,
 		controlClient: opts.ControlClient,
 		registry:      NewRunRegistry(),
+		clock:         time.Now,
 		toolNames: []string{
 			"avenor_status",
+			"avenor_result",
 			"avenor_spawn",
 			"avenor_shutdown",
 			"avenor_answer_permission",
@@ -149,8 +160,13 @@ func NewServer(opts Options) (*Server, error) {
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name:        "avenor_status",
-		Description: "Get status of avenor runs",
+		Description: "Get lifecycle status of avenor runs; use lifecycle view for compact polling",
 	}, s.handleAvenorStatus)
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "avenor_result",
+		Description: "Wait for a run to finish and return its bounded final output",
+	}, s.handleAvenorResult)
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name:        "avenor_spawn",
@@ -202,6 +218,10 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) handleAvenorStatus(ctx context.Context, req *mcp.CallToolRequest, args statusArgs) (*mcp.CallToolResult, any, error) {
+	if args.View != "" && args.View != "lifecycle" && args.View != "full" {
+		return nil, nil, fmt.Errorf("view must be lifecycle or full")
+	}
+
 	cl, cleanup, err := s.getClientForSupervisor(args.SupervisorID)
 	if err != nil {
 		return nil, nil, err
@@ -227,33 +247,173 @@ func (s *Server) handleAvenorStatus(ctx context.Context, req *mcp.CallToolReques
 					ts["run_id"] = ri.RunID
 					ts["label"] = ri.Label
 				}
-				translated = append(translated, ts)
+				translated = append(translated, shapeStatusForView(ts, args.View))
 			}
 		}
 		return nil, translated, nil
 	}
 
-	ri := s.registry.Lookup(args.RunID)
+	ts, err := s.queryRunStatus(cl, args.RunID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return nil, shapeStatusForView(ts, args.View), nil
+}
+
+func (s *Server) queryRunStatus(cl ControlClient, runID string) (map[string]any, error) {
+	ri := s.registry.Lookup(runID)
 	if ri != nil {
 		result, err := cl.Status(ri.RuntimeID)
 		if err != nil {
-			return nil, nil, fmt.Errorf("status: %w", err)
+			return nil, fmt.Errorf("status: %w", err)
 		}
 		ts := translateStatus(result, ri.SentinelPath)
 		ts["run_id"] = ri.RunID
 		ts["label"] = ri.Label
-		return nil, ts, nil
+		return ts, nil
 	}
 
-	// Registry miss: query the stable runtime ID directly via the
-	// resolved supervisor client (default or explicit supervisor_id).
-	result, err := cl.Status(args.RunID)
+	result, err := cl.Status(runID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("status: %w", err)
+		return nil, fmt.Errorf("status: %w", err)
 	}
 	ts := translateStatus(result, "")
-	ts["run_id"] = args.RunID
-	return nil, ts, nil
+	ts["run_id"] = runID
+	if _, ok := ts["label"]; !ok {
+		ts["label"] = runID
+	}
+	return ts, nil
+}
+
+func shapeStatusForView(status map[string]any, view string) map[string]any {
+	if view == "" || view == "full" {
+		return status
+	}
+
+	result := make(map[string]any)
+	for _, key := range []string{"run_id", "label", "status", "runtime_id", "phase", "phase_label", "pending_permission", "latest_seq"} {
+		if value, ok := status[key]; ok {
+			result[key] = value
+		}
+	}
+	return result
+}
+
+func resultFromStatus(status map[string]any, timedOut bool) map[string]any {
+	state, _ := status["status"].(string)
+	ready := state == "done" || state == "failed" || state == "timeout" || state == "killed"
+	result := map[string]any{
+		"run_id": status["run_id"],
+		"label":  status["label"],
+		"status": state,
+		"ready":  ready,
+	}
+	for _, key := range []string{"runtime_id", "session_id", "stop_reason", "pending_permission"} {
+		if value, ok := status[key]; ok {
+			result[key] = value
+		}
+	}
+	if ready {
+		if output, ok := status["final_output"]; ok {
+			result["output"] = output
+		}
+	}
+	if timedOut {
+		result["timed_out"] = true
+	}
+	return result
+}
+
+// recoverFinalOutput mirrors the TypeScript inspect fallback using durable event history.
+func (s *Server) recoverFinalOutput(runID string) string {
+	ri := s.registry.Lookup(runID)
+	if ri == nil || ri.EventLogPath == "" {
+		return ""
+	}
+	events, err := readEvents(ri.EventLogPath, []string{"session.end"}, 1)
+	if err != nil || len(events) == 0 {
+		return ""
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if output, ok := events[i]["final_output"].(string); ok {
+			return output
+		}
+	}
+	return ""
+}
+
+func (s *Server) handleAvenorResult(ctx context.Context, req *mcp.CallToolRequest, args resultArgs) (*mcp.CallToolResult, any, error) {
+	if args.RunID == "" {
+		return nil, nil, fmt.Errorf("run_id is required")
+	}
+
+	wait := args.Wait == nil || *args.Wait
+	var deadline time.Time
+	if args.Timeout != "" {
+		seconds, err := parseTimeoutSeconds(args.Timeout)
+		if err != nil {
+			return nil, nil, err
+		}
+		deadline = s.clock().Add(time.Duration(seconds) * time.Second)
+	}
+
+	cl, cleanup, err := s.getClientForSupervisor(args.SupervisorID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer cleanup()
+
+	var pollTimer *time.Timer
+	defer func() {
+		if pollTimer != nil && !pollTimer.Stop() {
+			select {
+			case <-pollTimer.C:
+			default:
+			}
+		}
+	}()
+
+	for {
+		status, err := s.queryRunStatus(cl, args.RunID)
+		if err != nil {
+			return nil, nil, err
+		}
+		state, _ := status["status"].(string)
+		terminal := state == "done" || state == "failed" || state == "timeout" || state == "killed"
+		if terminal || state == "waiting" || !wait {
+			if finalOutput, _ := status["final_output"].(string); terminal && finalOutput == "" {
+				if output := s.recoverFinalOutput(args.RunID); output != "" {
+					status["final_output"] = output
+				}
+			}
+			return nil, resultFromStatus(status, false), nil
+		}
+		if !deadline.IsZero() && !s.clock().Before(deadline) {
+			return nil, resultFromStatus(status, true), nil
+		}
+
+		delay := time.Second
+		if !deadline.IsZero() {
+			remaining := deadline.Sub(s.clock())
+			if remaining < delay {
+				delay = remaining
+			}
+		}
+		if delay <= 0 {
+			return nil, resultFromStatus(status, true), nil
+		}
+
+		if pollTimer == nil {
+			pollTimer = time.NewTimer(delay)
+		} else {
+			pollTimer.Reset(delay)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-pollTimer.C:
+		}
+	}
 }
 
 func (s *Server) handleAvenorSpawn(ctx context.Context, req *mcp.CallToolRequest, args spawnArgs) (*mcp.CallToolResult, any, error) {

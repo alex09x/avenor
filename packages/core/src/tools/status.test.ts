@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, mock } from 'bun:test'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import type { StatusResult } from './status.js'
 
 const statusMock = mock(async () => {
   throw new Error('status call failed')
@@ -35,7 +36,75 @@ mock.module('./get-supervisor-client.js', () => ({
   getSupervisorClient: getSupervisorClientMock,
 }))
 
-const { statusTool } = await import('./status.js')
+const { shapeStatusResult, statusTool } = await import('./status.js')
+
+function fullStatus(): StatusResult {
+  return {
+    run_id: 'run-1',
+    label: 'demo',
+    status: 'done',
+    runtime_id: 'rt-1',
+    phase: 'done',
+    phase_label: 'Complete',
+    latest_seq: 42,
+    session_id: 'ses-1',
+    usage: { total_tokens: 12 },
+    event_path: '/tmp/events.log',
+    final_output: 'final answer',
+  }
+}
+
+describe('status result views', () => {
+  it('returns the complete input unchanged when view is omitted', () => {
+    const input = fullStatus()
+    const result = shapeStatusResult(input)
+
+    expect(result).toBe(input)
+    expect(result).toEqual(fullStatus())
+  })
+
+  it('returns the complete input unchanged for the full view', () => {
+    const input = fullStatus()
+    const result = shapeStatusResult(input, 'full')
+
+    expect(result).toBe(input)
+    expect(result).toEqual(fullStatus())
+  })
+
+  it('keeps lifecycle and permission fields while omitting result and diagnostic data', () => {
+    expect(shapeStatusResult({
+      run_id: 'run-1',
+      label: 'demo',
+      status: 'waiting',
+      runtime_id: 'rt-1',
+      phase: 'waiting',
+      phase_label: 'Need approval',
+      latest_seq: 42,
+      pending_permission: {
+        request_id: 'req-1',
+        description: 'Allow edit?',
+        options: [{ option_id: 'allow_once', label: 'Allow', kind: 'allow_once' }],
+      },
+      session_id: 'ses-1',
+      usage: { total_tokens: 12 },
+      event_path: '/tmp/events.log',
+      final_output: 'do not include me',
+    }, 'lifecycle')).toEqual({
+      run_id: 'run-1',
+      label: 'demo',
+      status: 'waiting',
+      runtime_id: 'rt-1',
+      phase: 'waiting',
+      phase_label: 'Need approval',
+      latest_seq: 42,
+      pending_permission: {
+        request_id: 'req-1',
+        description: 'Allow edit?',
+        options: [{ option_id: 'allow_once', label: 'Allow', kind: 'allow_once' }],
+      },
+    })
+  })
+})
 
 describe('statusTool singleton registry', () => {
   let sentinelPath: string
@@ -77,6 +146,7 @@ describe('statusTool singleton registry', () => {
 
   it('maps richer metadata additively from live status', async () => {
     statusMock.mockResolvedValueOnce({
+      run_id: 'parent-run-id-that-must-not-replace-the-tracked-run',
       runtime_id: runInfo.runtimeId,
       session_id: 'ses-live',
       phase: 'waiting',

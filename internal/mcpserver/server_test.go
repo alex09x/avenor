@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/sdougbrown/avenor/client"
@@ -20,6 +21,7 @@ import (
 type fakeClient struct {
 	listResult               []map[string]any
 	statusResult             map[string]any
+	statusFunc               func(runtimeID string) (map[string]any, error)
 	spawnResult              map[string]any
 	listErr                  error
 	statusErr                error
@@ -41,6 +43,9 @@ type permissionCall struct {
 
 func (f *fakeClient) Status(runtimeID string) (map[string]any, error) {
 	f.statusCapturedRuntimeIDs = append(f.statusCapturedRuntimeIDs, runtimeID)
+	if f.statusFunc != nil {
+		return f.statusFunc(runtimeID)
+	}
 	return f.statusResult, f.statusErr
 }
 
@@ -217,6 +222,333 @@ func TestAvenorStatusSingle(t *testing.T) {
 	}
 	if m["status"] != "running" {
 		t.Fatalf("expected status=running, got %v", m["status"])
+	}
+}
+
+func TestAvenorStatusLifecycleViewOmitsFinalOutput(t *testing.T) {
+	fake := &fakeClient{
+		statusResult: map[string]any{
+			"runtime_id":   "rt1",
+			"status":       "done",
+			"final_output": "final answer",
+			"usage":        map[string]any{"total_tokens": 10},
+		},
+	}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, result, err := s.handleAvenorStatus(context.Background(), nil, statusArgs{RunID: "rt1", View: "lifecycle"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := result.(map[string]any)
+	if status["status"] != "done" {
+		t.Fatalf("status = %v, want done", status["status"])
+	}
+	if _, ok := status["final_output"]; ok {
+		t.Fatal("lifecycle status unexpectedly included final_output")
+	}
+	if _, ok := status["usage"]; ok {
+		t.Fatal("lifecycle status unexpectedly included usage")
+	}
+}
+
+func TestAvenorResultReturnsTerminalOutput(t *testing.T) {
+	fake := &fakeClient{
+		statusResult: map[string]any{
+			"runtime_id":   "rt1",
+			"session_id":   "ses1",
+			"status":       "done",
+			"stop_reason":  "end_turn",
+			"final_output": "final answer",
+		},
+	}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, value, err := s.handleAvenorResult(context.Background(), nil, resultArgs{RunID: "rt1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := value.(map[string]any)
+	if result["ready"] != true || result["output"] != "final answer" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if _, ok := result["usage"]; ok {
+		t.Fatal("result unexpectedly included diagnostic fields")
+	}
+}
+
+func TestAvenorResultReturnsRunningWithoutWaiting(t *testing.T) {
+	fake := &fakeClient{statusResult: map[string]any{"runtime_id": "rt1", "status": "running"}}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait := false
+
+	_, value, err := s.handleAvenorResult(context.Background(), nil, resultArgs{RunID: "rt1", Wait: &wait})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := value.(map[string]any)
+	if result["ready"] != false || result["status"] != "running" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if len(fake.statusCapturedRuntimeIDs) != 1 {
+		t.Fatalf("status calls = %d, want 1", len(fake.statusCapturedRuntimeIDs))
+	}
+}
+
+func TestAvenorResultHonorsCancellation(t *testing.T) {
+	fake := &fakeClient{statusResult: map[string]any{"runtime_id": "rt1", "status": "running"}}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err = s.handleAvenorResult(ctx, nil, resultArgs{RunID: "rt1"})
+	if err == nil || !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("expected context cancellation, got %v", err)
+	}
+}
+
+func TestAvenorResultDeadlineTimeout(t *testing.T) {
+	// A running run with a short timeout should return ready:false and timed_out:true.
+	fake := &fakeClient{}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	currentTime := time.Date(2026, 7, 18, 0, 0, 0, 0, time.UTC)
+	fake.statusFunc = func(runtimeID string) (map[string]any, error) {
+		currentTime = currentTime.Add(2 * time.Second)
+		return map[string]any{"runtime_id": runtimeID, "status": "running"}, nil
+	}
+	s.clock = func() time.Time { return currentTime }
+
+	_, value, err := s.handleAvenorResult(context.Background(), nil, resultArgs{
+		RunID:   "run-1",
+		Timeout: "1s",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	result := value.(map[string]any)
+	if result["ready"] != false {
+		t.Errorf("expected ready=false, got %v", result["ready"])
+	}
+	if result["timed_out"] != true {
+		t.Errorf("expected timed_out=true, got %v", result["timed_out"])
+	}
+	if result["status"] != "running" {
+		t.Errorf("expected status=running, got %v", result["status"])
+	}
+}
+
+func TestAvenorResultWaitingBranch(t *testing.T) {
+	// A waiting run with wait=true should return immediately with ready:false,
+	// preserve pending permission data, and perform exactly one status call.
+	fake := &fakeClient{
+		statusResult: map[string]any{
+			"runtime_id":         "rt1",
+			"status":             "waiting",
+			"pending_permission": map[string]any{"request_id": "req-42", "description": "Allow?"},
+		},
+	}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, value, err := s.handleAvenorResult(context.Background(), nil, resultArgs{RunID: "run-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := value.(map[string]any)
+	if result["ready"] != false {
+		t.Errorf("expected ready=false, got %v", result["ready"])
+	}
+	if result["status"] != "waiting" {
+		t.Errorf("expected status=waiting, got %v", result["status"])
+	}
+	pending, ok := result["pending_permission"].(map[string]any)
+	if !ok || pending["request_id"] != "req-42" {
+		t.Errorf("expected pending_permission request req-42, got %v", result["pending_permission"])
+	}
+	if len(fake.statusCapturedRuntimeIDs) != 1 {
+		t.Fatalf("expected 1 status call, got %d", len(fake.statusCapturedRuntimeIDs))
+	}
+}
+
+func TestAvenorResultStatusError(t *testing.T) {
+	// A ControlClient.Status error should propagate with the existing "status:" context.
+	fake := &fakeClient{
+		statusErr: fmt.Errorf("runtime not found"),
+	}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = s.handleAvenorResult(context.Background(), nil, resultArgs{RunID: "rt-broken"})
+	if err == nil {
+		t.Fatal("expected error from status")
+	}
+	if !strings.Contains(err.Error(), "status:") || !strings.Contains(err.Error(), "runtime not found") {
+		t.Fatalf("expected error to contain 'status: runtime not found', got: %v", err)
+	}
+}
+
+func TestAvenorResultInvalidTimeout(t *testing.T) {
+	fake := &fakeClient{}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = s.handleAvenorResult(context.Background(), nil, resultArgs{
+		RunID:   "rt1",
+		Timeout: "not-a-number",
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid timeout") {
+		t.Fatalf("expected invalid timeout error, got %v", err)
+	}
+}
+
+func TestAvenorStatusInvalidView(t *testing.T) {
+	fake := &fakeClient{}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = s.handleAvenorStatus(context.Background(), nil, statusArgs{RunID: "rt1", View: "invalid"})
+	if err == nil || !strings.Contains(err.Error(), "view must be lifecycle or full") {
+		t.Fatalf("expected view validation error, got %v", err)
+	}
+}
+
+func TestAvenorResultTerminalOutputFallbackFromEvents(t *testing.T) {
+	// When a terminal run lacks final_output in live status, recover from
+	// event history (registered run's EventLogPath). Only return the output,
+	// not event details.
+	dir := t.TempDir()
+	eventLogPath := filepath.Join(dir, "fallback-test.log")
+	eventsContent := `{"event":"start","type":"lifecycle"}
+{"event":"session.end","type":"lifecycle","final_output":"recovered answer"}
+`
+	if err := os.WriteFile(eventLogPath, []byte(eventsContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeClient{
+		statusResult: map[string]any{
+			"runtime_id": "rt_fallback",
+			"status":     "done",
+		},
+	}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.registry.Store(&RunInfo{
+		RunID:        "run-fallback-1",
+		RuntimeID:    "rt_fallback",
+		EventLogPath: eventLogPath,
+	})
+
+	_, value, err := s.handleAvenorResult(context.Background(), nil, resultArgs{RunID: "run-fallback-1"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	result := value.(map[string]any)
+	if result["ready"] != true {
+		t.Errorf("expected ready=true, got %v", result["ready"])
+	}
+	if result["output"] != "recovered answer" {
+		t.Errorf("expected output 'recovered answer', got %v", result["output"])
+	}
+	// Should not include event details
+	if _, ok := result["events"]; ok {
+		t.Error("result should not contain events")
+	}
+}
+
+func TestAvenorResultTerminalOutputFallbackMissingEvents(t *testing.T) {
+	// When event log doesn't exist or has no session.end, missing final_output
+	// is non-fatal — return the terminal status without output.
+	dir := t.TempDir()
+	eventLogPath := filepath.Join(dir, "no-session-end.log")
+	eventsContent := `{"event":"start","type":"lifecycle"}
+`
+	if err := os.WriteFile(eventLogPath, []byte(eventsContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeClient{
+		statusResult: map[string]any{
+			"runtime_id": "rt_no_end",
+			"status":     "done",
+		},
+	}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.registry.Store(&RunInfo{
+		RunID:        "run-no-end",
+		RuntimeID:    "rt_no_end",
+		EventLogPath: eventLogPath,
+	})
+
+	_, value, err := s.handleAvenorResult(context.Background(), nil, resultArgs{RunID: "run-no-end"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	result := value.(map[string]any)
+	if result["ready"] != true {
+		t.Errorf("expected ready=true, got %v", result["ready"])
+	}
+	if _, ok := result["output"]; ok {
+		t.Error("expected no output key when no session.end found")
+	}
+}
+
+func TestAvenorStatusForwardsSpecialCharsToControlClient(t *testing.T) {
+	// Direct run IDs with special characters are forwarded to the control client
+	// rather than rejected by regex validation.
+	fake := &fakeClient{
+		statusResult: map[string]any{"status": "running"},
+	}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, result, err := s.handleAvenorStatus(context.Background(), nil, statusArgs{RunID: "../../socket"})
+	if err != nil {
+		t.Fatalf("expected success forwarding special chars to control client, got: %v", err)
+	}
+	m, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map[string]any, got %T", result)
+	}
+	if m["run_id"] != "../../socket" {
+		t.Errorf("expected run_id ../../socket, got %v", m["run_id"])
+	}
+	// Verify the exact run reference was forwarded to the control client.
+	if len(fake.statusCapturedRuntimeIDs) != 1 || fake.statusCapturedRuntimeIDs[0] != "../../socket" {
+		t.Errorf("expected statusCapturedRuntimeIDs [../../socket], got %v", fake.statusCapturedRuntimeIDs)
 	}
 }
 
