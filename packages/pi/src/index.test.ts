@@ -171,27 +171,41 @@ describe('Avenor Pi extension', () => {
 
     const statusToolMock = mock(async () => ({ run_id: 'run-1', label: 'demo', status: 'running', runtime_id: 'rt-1' }))
     const resultToolMock = mock(async () => ({ run_id: 'run-1', label: 'demo', status: 'done', ready: true, output: 'hello world' }))
+    const singletonPrompt = mock(async () => {})
+    const singletonCancel = mock(async () => {})
+    const externalPrompt = mock(async () => {})
+    const externalClose = mock(() => {})
+    const singletonClient = { close() {}, cancel: singletonCancel, prompt: singletonPrompt, events() { throw new Error('unused') } }
+    const externalClient = { close: externalClose, cancel: async () => {}, prompt: externalPrompt, events() { throw new Error('unused') } }
 
     await createExtension({
-      spawnTool: mock(async () => ({ run_id: 'run-1', label: 'demo', supervisor_id: '/tmp/sock', runtime_id: 'rt-1' })),
+      spawnTool: mock(async (args: { supervisorId?: string }) => ({
+        run_id: args.supervisorId === '/tmp/external.sock' ? 'run-external' : 'run-1',
+        label: 'demo',
+        supervisor_id: args.supervisorId ?? '/tmp/sock',
+        runtime_id: 'rt-1',
+      })),
       statusTool: statusToolMock,
       eventsTool: mock(async () => ({ events: [] })),
       answerPermissionTool: mock(async () => ({ ok: true })),
       followUpTool: mock(async () => ({ run_id: 'run-2', label: 'follow-up' })),
-      inspectTool: mock(async () => makeInspectResult()),
+      inspectTool: mock(async () => {
+        const result = makeInspectResult({ status: 'running' })
+        result.snapshot = { ...result.snapshot, ended: false, stop_reason: undefined }
+        result.status = { ...result.status, status: 'running', stop_reason: undefined }
+        return result
+      }),
       resultTool: resultToolMock,
       shutdownTool: mock(async () => ({ ok: true })),
-      observeRun: mock(() => ({
-        closed: false,
-        snapshot: () => buildSnapshot(),
-        subscribe: () => () => {},
-        next: async () => buildSnapshot(),
-        close: async () => {},
-      })),
-      dial: mock(async () => ({ close() {}, cancel: async () => {}, prompt: async () => {}, events() { throw new Error('unused') } })),
+      observeRun: mock(() => null),
+      dial: mock(async () => externalClient),
       Supervisor: class {
+        static isCurrentInstance(supervisorId: string) {
+          return supervisorId === '/tmp/sock'
+        }
+
         static async get() {
-          return { supervisorId: '/tmp/sock' }
+          return { supervisorId: '/tmp/sock', getClient: () => singletonClient }
         }
       } as any,
     })(mockPi as any)
@@ -211,7 +225,7 @@ describe('Avenor Pi extension', () => {
 
     await registeredTools.avenor_spawn.execute(
       'tool-1',
-      { agent: 'explore', label: '\u001b[31mtest-pi-explore\u001b[0m', wait: false },
+      { agent: 'explore', label: '\u001b[31mtest-pi-explore\u001b[0m', supervisor_id: '/tmp/sock', wait: false },
       undefined,
       undefined,
       { cwd: '/tmp' },
@@ -225,6 +239,59 @@ describe('Avenor Pi extension', () => {
 
     await registeredTools.avenor_status.execute('tool-status', { run_id: 'run-1', view: 'lifecycle' })
     expect(statusToolMock).toHaveBeenCalledWith({ runId: 'run-1', supervisorId: undefined, view: 'lifecycle' })
+
+    async function runWatchAction(runId: string, actionSpy: any, action: (overlay: any) => void): Promise<void> {
+      let overlay: any
+      let resolveLoaded!: () => void
+      const loaded = new Promise<void>(resolve => { resolveLoaded = resolve })
+      let renderCount = 0
+      let resolveAction!: () => void
+      const actionCompleted = new Promise<void>(resolve => { resolveAction = resolve })
+      actionSpy.mockImplementation(async () => { resolveAction() })
+
+      await registeredCommands['avenor-watch'].handler(runId, {
+        hasUI: true,
+        ui: {
+          custom: async (factory: any) => {
+            overlay = factory({
+              terminal: { rows: 24 },
+              requestRender() {
+                if (++renderCount === 2) resolveLoaded()
+              },
+            }, {
+              fg: (_color: string, text: string) => text,
+              bg: (_color: string, text: string) => text,
+              bold: (text: string) => text,
+              italic: (text: string) => text,
+            }, {}, () => {})
+          },
+        },
+      })
+      await loaded
+      action(overlay)
+      await actionCompleted
+      overlay.dispose()
+    }
+
+    await runWatchAction('run-1', singletonPrompt, overlay => overlay.submit('continue'))
+    expect(singletonPrompt).toHaveBeenCalledWith('rt-1', 'continue')
+    await runWatchAction('run-1', singletonCancel, overlay => overlay.handleInput('\u0003'))
+    expect(singletonCancel).toHaveBeenCalledWith('rt-1')
+
+    await registeredTools.avenor_spawn.execute(
+      'tool-external',
+      { agent: 'explore', label: 'external', supervisor_id: '/tmp/external.sock', wait: false },
+      undefined,
+      undefined,
+      { cwd: '/tmp' },
+    )
+    let resolveExternalClose!: () => void
+    const externalClosed = new Promise<void>(resolve => { resolveExternalClose = resolve })
+    externalClose.mockImplementation(() => { resolveExternalClose() })
+    await runWatchAction('run-external', externalPrompt, overlay => overlay.submit('continue'))
+    await externalClosed
+    expect(externalPrompt).toHaveBeenCalledWith('rt-1', 'continue')
+    expect(externalClose).toHaveBeenCalledTimes(1)
 
     const result = await registeredTools.avenor_result.execute('tool-result', { run_id: 'run-1', timeout: '5m' })
     expect(result.content[0].text).toContain('"output": "hello world"')
