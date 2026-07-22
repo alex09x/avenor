@@ -27,6 +27,30 @@ func TestInt64AcceptsJSONNumber(t *testing.T) {
 	}
 }
 
+func TestFinalOutputTruncated(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{"empty", "", false},
+		{"short", "hello", false},
+		{"exactly MaxFinalOutputRunes", strings.Repeat("a", MaxFinalOutputRunes), false},
+		{"one over MaxFinalOutputRunes", strings.Repeat("a", MaxFinalOutputRunes+1), true},
+		{"multibyte at limit", strings.Repeat("é", MaxFinalOutputRunes), false},
+		{"multibyte over limit", strings.Repeat("é", MaxFinalOutputRunes+1), true},
+		{"mixed ascii and multibyte at limit", strings.Repeat("abé", MaxFinalOutputRunes/3) + strings.Repeat("a", MaxFinalOutputRunes%3), false},
+		{"emoji over limit", strings.Repeat("🔥", MaxFinalOutputRunes+1), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := FinalOutputTruncated(tt.input); got != tt.want {
+				t.Errorf("FinalOutputTruncated(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBoundFinalOutputUsesRuneLimitWithoutMutatingInput(t *testing.T) {
 	text := strings.Repeat("é", MaxFinalOutputRunes+10)
 	original := Event{Event: "session.end", Fields: map[string]any{"final_output": text}}
@@ -36,7 +60,13 @@ func TestBoundFinalOutputUsesRuneLimitWithoutMutatingInput(t *testing.T) {
 	if count := utf8.RuneCountInString(got); count != MaxFinalOutputRunes {
 		t.Fatalf("bounded rune count = %d, want %d", count, MaxFinalOutputRunes)
 	}
+	if bounded.Fields["final_output_truncated"] != true {
+		t.Fatalf("final_output_truncated = %v, want true", bounded.Fields["final_output_truncated"])
+	}
 	if original.Fields["final_output"] != text {
 		t.Fatal("BoundFinalOutput mutated the input event")
+	}
+	if _, ok := original.Fields["final_output_truncated"]; ok {
+		t.Fatal("BoundFinalOutput mutated the input metadata")
 	}
 }
