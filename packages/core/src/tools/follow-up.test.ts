@@ -73,6 +73,7 @@ describe('followUpTool with an external supervisor', () => {
       agent: 'jockey',
       session_id: 'ses-from-live',
       backend: 'pi',
+      agent_profile: 'cloud',
       dir: '/repo/from-original-run',
     })
 
@@ -88,6 +89,7 @@ describe('followUpTool with an external supervisor', () => {
       prompt: 'continue',
       session_id: 'ses-from-live',
       backend: 'pi',
+      agent_profile: 'cloud',
       dir: '/repo/from-original-run',
     })
     expect(result.run_id).toBe('rt-followup')
@@ -103,6 +105,7 @@ describe('followUpTool with an external supervisor', () => {
         eventLogPath: '/tmp/missing-singleton-events',
         sessionId: 'ses-from-run-map',
         agent: 'explore',
+        agentProfile: 'cloud',
         backend: 'pi',
         dir: '/repo/from-run-map',
       }]]),
@@ -128,6 +131,7 @@ describe('followUpTool with an external supervisor', () => {
     expect(spawnMock.mock.calls[0]?.[0]).toMatchObject({
       agent: 'explore',
       backend: 'pi',
+      agent_profile: 'cloud',
       dir: '/repo/from-run-map',
       session_id: 'ses-from-run-map',
     })
