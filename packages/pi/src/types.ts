@@ -12,6 +12,10 @@ export interface TrackedRun {
   blocking?: boolean
   /** true if we've injected a permission notification via sendUserMessage */
   permissionNotified?: boolean
+  /** true if the run reached terminal status and a completion message is pending.
+   * The message is deferred by one tick cycle so avenor_result can consume
+   * the result first without a duplicate steering message. */
+  completionPending?: boolean
 }
 
 export function findLiveStatusForTrackedRun(
@@ -65,4 +69,30 @@ export function formatRunLine(entry: RunStatusEntry): string {
   const perm = entry.pendingPermission ? ` — blocked: ${entry.permissionDescription ?? 'permission'}` : ''
   const phase = entry.phaseLabel ? ` (${entry.phaseLabel})` : ''
   return `${emoji} ${entry.label} (${entry.agent}) — ${entry.status}${phase}${perm}`
+}
+
+/**
+ * CompletionAction represents the decision for a tracked run that has
+ * reached terminal status during a polling tick.
+ *
+ * - `skip` — the run is blocking (avenor_result is waiting); do nothing.
+ * - `defer` — first tick seeing terminal status; set completionPending and
+ *   wait one cycle so avenor_result can consume the result first.
+ * - `send` — second tick seeing terminal status; deliver the completion
+ *   steering message and remove the run from tracking.
+ */
+export type CompletionAction = 'skip' | 'defer' | 'send'
+
+/**
+ * decideCompletion determines whether to skip, defer, or send the completion
+ * steering message for a tracked run that has reached terminal status.
+ *
+ * The deferral prevents duplication when avenor_result consumes the result
+ * in the same turn: if the agent calls avenor_result between the defer and
+ * the next tick, the run is deleted from tracking and the send never fires.
+ */
+export function decideCompletion(run: Pick<TrackedRun, 'blocking' | 'completionPending'>): CompletionAction {
+  if (run.blocking) return 'skip'
+  if (!run.completionPending) return 'defer'
+  return 'send'
 }
