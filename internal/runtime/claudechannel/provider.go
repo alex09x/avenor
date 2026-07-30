@@ -238,7 +238,7 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	go p.runSession(s.Ctx, s)
 
 	go func() {
-		s.Events <- events.Event{
+		s.Emit(events.Event{
 			Event:     "session.start",
 			SessionID: sessionID,
 			Fields: map[string]any{
@@ -247,7 +247,7 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 				"broker_url":       brokerURL,
 				"dangerously_load": true,
 			},
-		}
+		})
 	}()
 
 	return runtime.Session{
@@ -263,7 +263,15 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 func (p *Provider) runSession(ctx context.Context, s *session) {
 	defer s.CancelFn()
 	defer close(s.Done)
-	defer close(s.Events)
+	// Deliberately do NOT close(s.Events): it has multiple concurrent senders
+	// (the async Prompt goroutine, the session.start emitter, broker-poll
+	// events), and closing a channel while other goroutines may still send to it
+	// panics with "send on closed channel". Shutdown is signalled via
+	// s.CancelFn()/s.Ctx instead. Sends from other goroutines go through s.Emit,
+	// which selects on s.Ctx.Done(). Raw sends in pollBrokerEvents and the
+	// sessionGone branch below stay raw because they run in this goroutine and
+	// cannot race teardown. The Events() reader drains and closes its
+	// downstream channel on s.Ctx.Done().
 	defer func() {
 		p.mu.Lock()
 		delete(p.sessions, s.SessionID)
@@ -309,15 +317,18 @@ func (p *Provider) runSession(ctx context.Context, s *session) {
 			return
 		case <-sessionGone:
 			if s.MarkFinished() {
-				// Claude exited without calling avenor_finish.
-				s.Events <- events.Event{
+				// Claude exited without calling avenor_finish. This runs in the
+				// runSession goroutine, so it cannot race teardown. Using s.Emit
+				// for consistency with the claude backend and for the s.Ctx.Done()
+				// escape hatch if the buffer is full.
+				s.Emit(events.Event{
 					Event:     "session.end",
 					SessionID: s.SessionID,
 					Fields: map[string]any{
 						"status":      "done",
 						"stop_reason": "end_turn",
 					},
-				}
+				})
 			}
 			return
 		case <-pollTick.C:
@@ -351,6 +362,9 @@ func (p *Provider) pollBrokerEvents(s *session) {
 
 	st.Unlock()
 
+	// All sends below run in the runSession goroutine (via its pollTick branch),
+	// the same goroutine whose deferred cleanup used to close s.Events. They
+	// therefore cannot race teardown and remain raw sends.
 	if markChannelReadyEmitted(s, registeredAt) {
 		s.Events <- events.Event{
 			Event:     "agent.channel_ready",
@@ -687,7 +701,28 @@ func (p *Provider) Events(ctx context.Context, sessionID string) (<-chan events.
 				if !ok {
 					return
 				}
-				out <- e
+				select {
+				case out <- e:
+				case <-ctx.Done():
+					return
+				}
+			case <-s.Ctx.Done():
+				// Session ended. runSession never closes s.Events (closing a
+				// channel with multiple senders is unsafe), so drain whatever is
+				// buffered — notably the terminal session.end — before closing
+				// out, so the consumer sees the stop reason. Then stop.
+				for {
+					select {
+					case e := <-s.Events:
+						select {
+						case out <- e:
+						case <-ctx.Done():
+							return
+						}
+					default:
+						return
+					}
+				}
 			case <-ctx.Done():
 				return
 			}
