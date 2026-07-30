@@ -49,6 +49,10 @@ async function sentinelExists(filePath: string): Promise<boolean> {
   }
 }
 
+function rawStatusPhase(source: Record<string, unknown> | null): string {
+  return stringField(source ?? {}, 'phase') || stringField(source ?? {}, 'status') || 'running'
+}
+
 function sentinelStatusToResult(sentinelStatus: string): string {
   switch (sentinelStatus) {
     case 'DONE':
@@ -114,8 +118,9 @@ function normalizePermission(raw: Record<string, unknown> | null | undefined): S
           if (!record) return null
           return {
             option_id: stringField(record, 'option_id', 'optionId') ?? '',
-            label: stringField(record, 'label') ?? '',
+            label: stringField(record, 'label', 'name') ?? '',
             kind: stringField(record, 'kind') ?? '',
+            ...((record.requires_message === true || record.requiresMessage === true) && { requires_message: true }),
           }
         })
         .filter((item): item is NonNullable<typeof item> => item !== null)
@@ -193,7 +198,7 @@ export interface StatusResult {
   pending_permission?: {
     request_id: string
     description: string
-    options: Array<{ option_id: string; label: string; kind: string }>
+    options: Array<{ option_id: string; label: string; kind: string; requires_message?: boolean }>
   }
   session_id?: string
   stop_reason?: string
@@ -236,7 +241,7 @@ async function buildRunStatus(
     sentinel = await parseSentinel(runInfo.sentinelPath)
   }
 
-  const rawPhase = (liveStatus?.phase ?? liveStatus?.status ?? 'running') as string
+  const rawPhase = rawStatusPhase(liveStatus)
   const translated = translateStatus(rawPhase, sentinel)
   return buildBaseStatus(
     liveStatus ?? {},
@@ -325,7 +330,7 @@ export async function statusTool(
               (liveStatus?.session_id as string | undefined),
             stop_reason: sentinel?._status,
           },
-          translateStatus((liveStatus?.phase ?? liveStatus?.status ?? 'running') as string, sentinel),
+          translateStatus(rawStatusPhase(liveStatus), sentinel),
         ), args.view)
       }
 
@@ -338,7 +343,7 @@ export async function statusTool(
           runtime_id: String(entry.runtime_id ?? entry.id ?? ''),
           session_id: entry.session_id as string | undefined,
         },
-        translateStatus((entry.phase ?? entry.status ?? 'running') as string, null),
+        translateStatus(rawStatusPhase(entry), null),
       ), args.view))
     } finally {
       if (!isSingleton) {
@@ -376,7 +381,7 @@ export async function statusTool(
           (liveStatus?.session_id as string | undefined),
         stop_reason: sentinel?._status,
       },
-      translateStatus((liveStatus?.phase ?? liveStatus?.status ?? 'running') as string, sentinel),
+      translateStatus(rawStatusPhase(liveStatus), sentinel),
     ), args.view)
   }
 
@@ -403,7 +408,7 @@ export async function statusTool(
           runtime_id: entryId,
           session_id: entry.session_id as string | undefined,
         },
-        translateStatus((entry.phase ?? entry.status ?? 'running') as string, null),
+        translateStatus(rawStatusPhase(entry), null),
       ), args.view))
     }
   }

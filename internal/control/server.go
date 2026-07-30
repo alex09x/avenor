@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/sdougbrown/avenor/internal/runtime"
 )
 
 const subscriberBuffer = 256
@@ -31,6 +32,24 @@ var beforeControlSocketCleanup = func() {}
 type PermissionAnswer struct {
 	RequestID string `json:"request_id"`
 	OptionID  string `json:"option_id"`
+	Message   string `json:"message,omitempty"`
+}
+
+func (p *PermissionAnswer) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		RequestID string          `json:"request_id"`
+		OptionID  string          `json:"option_id"`
+		Message   json.RawMessage `json:"message"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	message, err := runtime.DecodePermissionMessageJSON(wire.Message)
+	if err != nil {
+		return err
+	}
+	p.RequestID, p.OptionID, p.Message = wire.RequestID, wire.OptionID, message
+	return nil
 }
 
 type ControlServer struct {
@@ -71,7 +90,7 @@ type StableHandler interface {
 	RuntimeStatus(runtimeID string) (any, error)
 	RuntimeCancel(runtimeID string) error
 	RuntimePrompt(runtimeID, text, requestID string) error
-	RuntimeAnswerPermission(runtimeID, requestID, optionID string) error
+	RuntimeAnswerPermission(runtimeID, requestID, optionID, message string) error
 	RuntimeInterruptAndPrompt(runtimeID, text string, keepQueue bool) error
 	RuntimeSendToParent(runtimeID, message string) error
 }
@@ -316,16 +335,17 @@ const (
 )
 
 type permissionClaim struct {
-	state        PermissionResolverState
-	answerCh     chan PermissionAnswer
-	answerQueued bool
-	disconnectCh chan struct{} // closed when all clients disconnect while in Reserved/Control state
+	state           PermissionResolverState
+	answerCh        chan PermissionAnswer
+	answerQueued    bool
+	disconnectCh    chan struct{} // closed when all clients disconnect while in Reserved/Control state
+	requiresMessage map[string]bool
 }
 
 // PreparePermissionClaim records resolver ownership before permission.request
 // is published. Terminal entries may be replaced when an ACP session reuses a
 // request ID for a later request.
-func (s *ControlServer) PreparePermissionClaim(scope, requestID string, state PermissionResolverState) bool {
+func (s *ControlServer) PreparePermissionClaim(scope, requestID string, state PermissionResolverState, options []any) bool {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
 	key := permissionClaimKey{scope: scope, requestID: requestID}
@@ -333,7 +353,27 @@ func (s *ControlServer) PreparePermissionClaim(scope, requestID string, state Pe
 		existing.state != PermissionResolverResolved {
 		return false
 	}
-	s.pendingClaims[key] = &permissionClaim{state: state, answerCh: make(chan PermissionAnswer, 1), disconnectCh: make(chan struct{})}
+	claim := &permissionClaim{
+		state:        state,
+		answerCh:     make(chan PermissionAnswer, 1),
+		disconnectCh: make(chan struct{}),
+	}
+	if options != nil {
+		claim.requiresMessage = make(map[string]bool, len(options))
+		for _, option := range options {
+			m, ok := option.(map[string]any)
+			if !ok {
+				continue
+			}
+			optionID, _ := m["optionId"].(string)
+			if optionID == "" {
+				continue
+			}
+			requiresMessage, _ := m["requiresMessage"].(bool)
+			claim.requiresMessage[optionID] = requiresMessage
+		}
+	}
+	s.pendingClaims[key] = claim
 	return true
 }
 
@@ -486,8 +526,8 @@ func (s *ControlServer) HasPendingPermission() bool {
 
 // AnswerPendingPermission delivers an answer to the active permission claim.
 // The bool reports whether the answer was actually delivered.
-func (s *ControlServer) AnswerPendingPermission(scope, requestID, optionID string) bool {
-	return s.DeliverPendingPermission(scope, requestID, optionID) == PermissionAnswerDelivered
+func (s *ControlServer) AnswerPendingPermission(scope, requestID, optionID, message string) bool {
+	return s.DeliverPendingPermission(scope, requestID, optionID, message) == PermissionAnswerDelivered
 }
 
 type PermissionAnswerDelivery uint8
@@ -498,17 +538,24 @@ const (
 	PermissionAnswerChannelFull
 	PermissionAnswerResolverOwned
 	PermissionAnswerNoResolver
+	PermissionAnswerInvalid
 )
 
 // DeliverPendingPermission distinguishes a missing claim from a claim that
 // has already accepted an answer. answerQueued remains set after the resolver
 // drains answerCh, making delivery single-use until the claim is ended.
-func (s *ControlServer) DeliverPendingPermission(scope, requestID, optionID string) PermissionAnswerDelivery {
+func (s *ControlServer) DeliverPendingPermission(scope, requestID, optionID, message string) PermissionAnswerDelivery {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
 	claim := s.pendingClaims[permissionClaimKey{scope: scope, requestID: requestID}]
 	if claim == nil {
 		return PermissionAnswerNotFound
+	}
+	if claim.requiresMessage != nil {
+		requiresMessage, offered := claim.requiresMessage[optionID]
+		if !offered || (requiresMessage && message == "") {
+			return PermissionAnswerInvalid
+		}
 	}
 	switch claim.state {
 	case PermissionResolverReserved, PermissionResolverControl:
@@ -522,7 +569,7 @@ func (s *ControlServer) DeliverPendingPermission(scope, requestID, optionID stri
 		return PermissionAnswerChannelFull
 	}
 	select {
-	case claim.answerCh <- PermissionAnswer{RequestID: requestID, OptionID: optionID}:
+	case claim.answerCh <- PermissionAnswer{RequestID: requestID, OptionID: optionID, Message: message}:
 		claim.answerQueued = true
 		return PermissionAnswerDelivered
 	default:
@@ -755,10 +802,7 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 			if !s.ensureOwner(c) {
 				return failure(req.ID, -32010, "permission_denied", nil)
 			}
-			var p struct {
-				RequestID string `json:"request_id"`
-				OptionID  string `json:"option_id"`
-			}
+			var p PermissionAnswer
 			if len(req.Params) > 0 {
 				if err := json.Unmarshal(req.Params, &p); err != nil {
 					return failure(req.ID, -32602, "invalid params", map[string]any{"detail": err.Error()})
@@ -767,7 +811,10 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 			if p.RequestID == "" || p.OptionID == "" {
 				return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"request_id", "option_id"}})
 			}
-			if err := s.stableHandler.RuntimeAnswerPermission(rtID, p.RequestID, p.OptionID); err != nil {
+			if err := runtime.ValidatePermissionMessage(p.Message); err != nil {
+				return failure(req.ID, -32602, "invalid params", map[string]any{"detail": err.Error()})
+			}
+			if err := s.stableHandler.RuntimeAnswerPermission(rtID, p.RequestID, p.OptionID, p.Message); err != nil {
 				return failure(req.ID, -32000, err.Error(), nil)
 			}
 			return success(req.ID, map[string]any{"accepted": true})
@@ -784,7 +831,10 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 		if p.RequestID == "" || p.OptionID == "" {
 			return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"request_id", "option_id"}})
 		}
-		if !s.AnswerPendingPermission("", p.RequestID, p.OptionID) {
+		if err := runtime.ValidatePermissionMessage(p.Message); err != nil {
+			return failure(req.ID, -32602, "invalid params", map[string]any{"detail": err.Error()})
+		}
+		if !s.AnswerPendingPermission("", p.RequestID, p.OptionID, p.Message) {
 			return failure(req.ID, -32001, "no_pending_permission", nil)
 		}
 		return success(req.ID, map[string]any{"accepted": true})

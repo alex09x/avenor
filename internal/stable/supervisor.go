@@ -1418,7 +1418,13 @@ func (s *Supervisor) cancelRuntime(rtID string) error {
 	return nil
 }
 
-func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
+func (s *Supervisor) answerPermission(rtID, requestID, optionID, message string) error {
+	// Validate message before consuming the pending claim so oversized
+	// or invalid input does not deplete the resolver.
+	if err := runtime.ValidatePermissionMessage(message); err != nil {
+		return err
+	}
+
 	s.controlMu.Lock()
 	rt := s.runtimes[rtID]
 	s.controlMu.Unlock()
@@ -1435,6 +1441,7 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 	}
 
 	kind := ""
+	requiresMessage := false
 	found := false
 	for _, opt := range options {
 		m, ok := opt.(map[string]any)
@@ -1445,12 +1452,16 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 		if oid == optionID {
 			k, _ := m["kind"].(string)
 			kind = permission.NormalizeOptionKind(k)
+			requiresMessage, _ = m["requiresMessage"].(bool)
 			found = true
 			break
 		}
 	}
 	if !found {
 		return fmt.Errorf("unknown option_id %q for request %q on runtime %q", optionID, requestID, rtID)
+	}
+	if requiresMessage && message == "" {
+		return fmt.Errorf("option_id %q for request %q requires a message", optionID, requestID)
 	}
 	switch kind {
 	case "allow", "reject":
@@ -1462,9 +1473,9 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 	// If it has an active control claim, feed the answer through that claim so
 	// the resolver can call the provider, emit permission.response, clear the
 	// waiting status, and release its in-flight guard. Calling the provider
-	// directly here leaves the resolver stuck until its timeout and causes the
-	// next backend permission to fail as an overlapping request.
-	switch s.control.DeliverPendingPermission(rtID, requestID, optionID) {
+	// directly here leaves the resolver owned until client disconnect or an
+	// explicit claim timeout and makes the next request appear to overlap.
+	switch s.control.DeliverPendingPermission(rtID, requestID, optionID, message) {
 	case control.PermissionAnswerDelivered:
 		s.controlMu.Lock()
 		delete(s.permOptions, key)
@@ -1479,6 +1490,8 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 	case control.PermissionAnswerNoResolver:
 		// No control, automatic, or file resolver owns this request. The direct
 		// provider path below is the only remaining way to answer it.
+	case control.PermissionAnswerInvalid:
+		return fmt.Errorf("permission request %q for runtime %q rejected an invalid answer", requestID, rtID)
 	}
 
 	// A request emitted without any configured resolver remains backend-owned.
@@ -1493,6 +1506,7 @@ func (s *Supervisor) answerPermission(rtID, requestID, optionID string) error {
 	if err := provider.AnswerPermission(context.Background(), sessionID, requestID, runtime.PermissionResponse{
 		Allow:    kind == "allow",
 		OptionID: optionID,
+		Message:  message,
 	}); err != nil {
 		s.control.RetryDirectPermissionDelivery(rtID, requestID)
 		return err
@@ -1830,8 +1844,8 @@ func (s *Supervisor) clearPendingChildQuestion(childID, requestID string) {
 	}
 }
 
-func (s *Supervisor) RuntimeAnswerPermission(rtID, requestID, optionID string) error {
-	return s.answerPermission(rtID, requestID, optionID)
+func (s *Supervisor) RuntimeAnswerPermission(rtID, requestID, optionID, message string) error {
+	return s.answerPermission(rtID, requestID, optionID, message)
 }
 
 func (s *Supervisor) RuntimeInterruptAndPrompt(rtID, text string, keepQueue bool) error {

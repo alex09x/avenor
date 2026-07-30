@@ -12,6 +12,13 @@ const (
 )
 
 // Session represents an interactive terminal session.
+// InterruptSession is the optional exact-process interruption seam. Callers
+// that need graceful shutdown must use this capability rather than deriving a
+// PID and signaling an ambient process.
+type InterruptSession interface {
+	Interrupt(ctx context.Context) error
+}
+
 type Session interface {
 	// Kind identifies the terminal backend (e.g. "tmux", "pty"). Used by
 	// callers to tag events with the actual backend rather than hardcoding.
@@ -23,6 +30,10 @@ type Session interface {
 	SendKeys(ctx context.Context, keys ...Key) error
 	Alive(ctx context.Context) bool
 	Kill(ctx context.Context) error
+	// Wait blocks until the hosted process/session has exited. It is the
+	// synchronous lifecycle seam callers use after Kill to ensure resources are
+	// reaped before they release ownership.
+	Wait(ctx context.Context) error
 }
 
 // StartOptions holds parameters for launching a new terminal session.

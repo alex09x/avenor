@@ -144,6 +144,29 @@ describe('statusTool singleton registry', () => {
     })
   })
 
+  it('uses non-empty status when phase is present but empty', async () => {
+    sentinelPath = path.join(os.tmpdir(), `avenor-run-${runInfo.runId}.done`)
+    fs.writeFileSync(sentinelPath, 'FAILED\nSESSION=ses-failed\n')
+    runInfo.sentinelPath = sentinelPath
+    statusMock.mockResolvedValueOnce({
+      runtime_id: runInfo.runtimeId,
+      session_id: 'ses-failed',
+      phase: '',
+      status: 'ended',
+    })
+
+    const result = await statusTool({
+      runId: runInfo.runId,
+      supervisorId: '/tmp/avenor-mcp-test.sock',
+    })
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      stop_reason: 'FAILED',
+      session_id: 'ses-failed',
+    })
+  })
+
   it('maps richer metadata additively from live status', async () => {
     statusMock.mockResolvedValueOnce({
       run_id: 'parent-run-id-that-must-not-replace-the-tracked-run',
@@ -165,7 +188,10 @@ describe('statusTool singleton registry', () => {
       permission: {
         request_id: 'req-7',
         description: 'Allow edit?',
-        options: [{ optionId: 'allow_once', label: 'Allow', kind: 'allow_once' }],
+        options: [
+          { optionId: 'allow_once', label: 'Allow', kind: 'allow_once' },
+          { optionId: 'write_in', name: 'Other', kind: 'allow', requiresMessage: true },
+        ],
       },
     })
 
@@ -189,7 +215,10 @@ describe('statusTool singleton registry', () => {
       pending_permission: {
         request_id: 'req-7',
         description: 'Allow edit?',
-        options: [{ option_id: 'allow_once', label: 'Allow', kind: 'allow_once' }],
+        options: [
+          { option_id: 'allow_once', label: 'Allow', kind: 'allow_once' },
+          { option_id: 'write_in', label: 'Other', kind: 'allow', requires_message: true },
+        ],
       },
       usage: { total_tokens: 12 },
     })

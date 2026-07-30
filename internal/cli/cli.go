@@ -32,6 +32,7 @@ const (
 	backendOpenCodeHTTP   = "opencode-http"
 	backendCodexAppServer = "codex-app-server"
 	backendGeminiACP      = "gemini-acp"
+	backendAgy            = "agy"
 	backendCursorACP      = "cursor-acp"
 	backendPony           = "pony"
 	backendClaude         = "claude"
@@ -137,6 +138,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	case backendPony:
 	case backendOpenCodeACP:
 	case backendGeminiACP:
+	case backendAgy:
 	case backendCursorACP:
 	case backendOpenCodeHTTP:
 		if discovery.URL == "" {
@@ -789,6 +791,7 @@ type SessionWaitConfig struct {
 	PermissionClaimTimeout time.Duration
 	ProgressTimeout        time.Duration
 	Timeout                <-chan time.Time
+	AdoptSessionID         func(string)
 }
 
 type SessionWaitDeps struct {
@@ -869,7 +872,19 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 					return sessionResult{ExitCode: 1}
 				}
 				return sessionResult{ExitCode: runtime.ExitCodeForStopReason(finalStopReason), LoopDirective: loopDirective, LoopLabel: loopLabel, Output: output.String(), FinalReply: finalReply.String(), Usage: bufferedUsage}
-			} else if progressTimer != nil {
+			} else {
+				if event.Event == "session.start" {
+					externalID, _ := event.Fields["conversation_id"].(string)
+					if externalID != "" && externalID != cfg.SessionID {
+						cfg.SessionID = externalID
+						tracker.sessionID = externalID
+						if cfg.AdoptSessionID != nil {
+							cfg.AdoptSessionID(externalID)
+						}
+					}
+				}
+			}
+			if ok && progressTimer != nil {
 				if !progressTimer.Stop() {
 					select {
 					case <-progressTimer.C:
@@ -939,7 +954,8 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 					case deps.FileHandler != nil:
 						state = control.PermissionResolverFile
 					}
-					claimConflict = !deps.ControlServer.PreparePermissionClaim(cfg.PermissionClaimScope, requestID, state)
+					options, _ := event.Fields["options"].([]any)
+					claimConflict = !deps.ControlServer.PreparePermissionClaim(cfg.PermissionClaimScope, requestID, state, options)
 				}
 				if claimConflict {
 					emitErrorEvent(deps.Writer, cfg.SessionID, cfg.RunID, "permission", "another permission request is already pending", deps.Stderr, cfg.RunLabel)
@@ -1222,7 +1238,7 @@ func resolvePermission(
 			}
 			return permissionResult{err: fmt.Errorf("unknown option_id %q for request %q", ans.OptionID, requestID)}
 		}
-		resp := runtime.PermissionResponse{Allow: kind == "allow", OptionID: ans.OptionID}
+		resp := runtime.PermissionResponse{Allow: kind == "allow", OptionID: ans.OptionID, Message: ans.Message}
 		if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
 			if controlServer != nil {
 				controlServer.EndPermissionClaim(claimScope, requestID)
@@ -1234,7 +1250,8 @@ func resolvePermission(
 		}
 		return permissionResult{requestID: requestID, optionID: ans.OptionID, kind: kind, source: "control"}
 	}
-	if autoApprove {
+	requiresUserInput, _ := event.Fields["requires_user_input"].(bool)
+	if autoApprove && !requiresUserInput {
 		optionID, kind := firstOptionKind(options, "allow")
 		resp := runtime.PermissionResponse{Allow: true, OptionID: optionID}
 		if err := provider.AnswerPermission(ctx, sessionID, requestID, resp); err != nil {
