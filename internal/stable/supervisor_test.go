@@ -1648,6 +1648,110 @@ func (p *stablePermissionProvider) Capabilities(context.Context) (runtime.Capabi
 	return runtime.Capabilities{}, nil
 }
 
+// stableDeferredProvider simulates a headless backend with a provisional
+// session ID. Start returns that provisional ID.
+// The first session.start event carries the real conversation_id.
+// cli.WaitForSession's AdoptSessionID callback adopts that ID.
+// A release gate delays session.start so tests can inspect the provisional
+// identity.
+type stableDeferredProvider struct {
+	provisionalID string
+	realID        string
+	backend       string
+	pid           int
+	startOpts     runtime.StartOptions
+	events        []stableScriptedEvent
+	mu            sync.Mutex
+	channels      map[string]chan events.Event
+	started       chan struct{}
+	promptErr     error
+}
+
+func (p *stableDeferredProvider) Start(_ context.Context, opts runtime.StartOptions) (runtime.Session, error) {
+	p.mu.Lock()
+	if p.channels == nil {
+		p.channels = map[string]chan events.Event{}
+	}
+	p.channels[p.provisionalID] = make(chan events.Event, len(p.events)+1)
+	if p.started != nil {
+		close(p.started)
+	}
+	p.mu.Unlock()
+	return runtime.Session{SessionID: p.provisionalID, Backend: p.backend, Dir: opts.Dir, PID: p.pid}, nil
+}
+
+func (p *stableDeferredProvider) Resume(ctx context.Context, sessionID string) (runtime.Session, error) {
+	return p.Start(ctx, runtime.StartOptions{})
+}
+
+func (p *stableDeferredProvider) Prompt(ctx context.Context, sessionID, _ string) error {
+	p.mu.Lock()
+	ch := p.channels[sessionID]
+	p.mu.Unlock()
+	if ch == nil {
+		return fmt.Errorf("missing deferred channel for %q", sessionID)
+	}
+	defer close(ch)
+	for _, step := range p.events {
+		if step.release != nil {
+			select {
+			case <-step.release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		select {
+		case ch <- step.event:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return p.promptErr
+}
+
+func (p *stableDeferredProvider) Cancel(context.Context, string) error { return nil }
+
+func (p *stableDeferredProvider) Events(_ context.Context, sessionID string) (<-chan events.Event, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if ch := p.channels[sessionID]; ch != nil {
+		return ch, nil
+	}
+	if p.channels == nil {
+		p.channels = map[string]chan events.Event{}
+	}
+	ch := make(chan events.Event, len(p.events)+1)
+	p.channels[sessionID] = ch
+	return ch, nil
+}
+
+func (p *stableDeferredProvider) AnswerPermission(context.Context, string, string, runtime.PermissionResponse) error {
+	return nil
+}
+
+func (p *stableDeferredProvider) Capabilities(context.Context) (runtime.Capabilities, error) {
+	return runtime.Capabilities{}, nil
+}
+
+// checkingSink records forwarded events.
+// It can inspect child state when session.start arrives.
+// Tests use it to verify that the aggregate child SessionID is updated before
+// the authoritative event is forwarded.
+type checkingSink struct {
+	onSessionStart func()
+	events         []events.Event
+}
+
+func (s *checkingSink) Write(ev events.Event) error {
+	if ev.Event == "session.start" && s.onSessionStart != nil {
+		s.onSessionStart()
+	}
+	s.events = append(s.events, ev)
+	return nil
+}
+
+func (s *checkingSink) Close() error { return nil }
+
 type synchronousStablePermissionSink struct {
 	answer    func() error
 	responses chan events.Event

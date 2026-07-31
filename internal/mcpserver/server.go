@@ -751,15 +751,47 @@ func (s *Server) handleAvenorFollowUp(ctx context.Context, req *mcp.CallToolRequ
 		supervisorID = ri.SupervisorID
 	}
 
+	// Resolve the supervisor's control client once and store it in cl.
+	// The status lookup and follow-up Spawn call both use cl.
+	// They therefore reuse one control-client connection.
+	cl, cleanup, err := s.getClientForSupervisor(supervisorID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer cleanup()
+
 	sessionID, err := readSentinelSession(ri.SentinelPath)
 	if err != nil {
-		// A supervisor returns session_id when it creates the runtime, before a
-		// terminal sentinel exists. Preserve failed/non-resumable sentinels as
-		// errors, but allow that durable registry value to cover a missing file.
-		if !errors.Is(err, os.ErrNotExist) || ri.SessionID == "" {
+		// Return errors for failed or non-resumable sentinel files unchanged. A
+		// missing file may mean the run is not terminal. Query supervisor status for
+		// the adopted session ID. If status has no usable ID, re-read the sentinel
+		// before using the spawn-time registry value.
+		if !errors.Is(err, os.ErrNotExist) {
 			return nil, nil, fmt.Errorf("read sentinel session: %w", err)
 		}
-		sessionID = ri.SessionID
+		if ri.RuntimeID != "" {
+			if status, statusErr := cl.Status(ri.RuntimeID); statusErr == nil {
+				if currentID, _ := status["session_id"].(string); currentID != "" {
+					sessionID = currentID
+				}
+			}
+		}
+		if sessionID == "" {
+			// If status yields no session ID, retry the sentinel because the
+			// supervisor may have written it since the initial read.
+			retryID, retryErr := readSentinelSession(ri.SentinelPath)
+			if retryErr == nil {
+				sessionID = retryID
+			} else if !errors.Is(retryErr, os.ErrNotExist) {
+				return nil, nil, fmt.Errorf("read sentinel session: %w", retryErr)
+			}
+		}
+		if sessionID == "" {
+			if ri.SessionID == "" {
+				return nil, nil, fmt.Errorf("read sentinel session: %w", err)
+			}
+			sessionID = ri.SessionID
+		}
 	}
 
 	runID := uuid.New().String()
@@ -786,12 +818,6 @@ func (s *Server) handleAvenorFollowUp(ctx context.Context, req *mcp.CallToolRequ
 	if ri.AutoApprove {
 		params["auto_approve"] = true
 	}
-
-	cl, cleanup, err := s.getClientForSupervisor(supervisorID)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer cleanup()
 
 	result, err := cl.Spawn(params)
 	if err != nil {

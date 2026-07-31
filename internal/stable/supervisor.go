@@ -787,8 +787,11 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 			defer func() {
 				child.mu.Lock()
 				if child.provider == provider {
+					sessionID := child.session.SessionID
 					child.provider = nil
-					child.session = runtime.Session{}
+					// Retain only the authoritative ID. The provider's PID and
+					// other fields become invalid when it closes.
+					child.session = runtime.Session{SessionID: sessionID}
 				}
 				child.active = false
 				child.phase = ""
@@ -804,6 +807,9 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 				return looprunner.PhaseAttemptResult{ExitCode: 1, BrokerRunID: brokerRunID}, fmt.Errorf("subscribe events: %w", err)
 			}
 
+			attemptProvider := provider
+			preAdoptionID := session.SessionID
+
 			promptDone := make(chan error, 1)
 			go func() {
 				promptDone <- provider.Prompt(context.Background(), session.SessionID, phase.Prompt)
@@ -818,6 +824,14 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 				PermissionClaimScope:   child.id,
 				AutoApprove:            child.autoApprove,
 				PermissionClaimTimeout: child.permClaimTimeout,
+				// adoptSessionID propagates the authoritative conversation id onto
+				// the phase-local session, which is authoritative for retries,
+				// resume, and the terminal sentinel. It also updates the aggregate
+				// child record when this phase is still the active one.
+				AdoptSessionID: func(externalID string) {
+					session.SessionID = externalID
+					s.adoptChildSessionID(child, attemptProvider, preAdoptionID, externalID)
+				},
 			}, cli.SessionWaitDeps{
 				Writer:        attemptWriter,
 				FileHandler:   child.fileHandler,
@@ -849,6 +863,13 @@ func (s *Supervisor) runLoopChild(ctx context.Context, child *childRuntime, cfg 
 	child.mu.Lock()
 	child.exitCode = result.ExitCode
 	child.mu.Unlock()
+
+	// When every iteration phase returns end_turn, looprunner stops at
+	// max_iterations with result.SessionID == "". Use the latest adopted child
+	// session ID to populate the terminal sentinel.
+	if result.SessionID == "" {
+		result.SessionID = child.sessionID()
+	}
 
 	if child.sentinelFile != "" {
 		if result.Reason != "" {
@@ -976,8 +997,11 @@ func (s *Supervisor) runTeamChild(ctx context.Context, child *childRuntime, cfg 
 			defer func() {
 				child.mu.Lock()
 				if child.provider == provider {
+					sessionID := child.session.SessionID
 					child.provider = nil
-					child.session = runtime.Session{}
+					// Retain only the authoritative ID. The provider's PID and
+					// other fields become invalid when it closes.
+					child.session = runtime.Session{SessionID: sessionID}
 				}
 				child.active = false
 				child.phase = ""
@@ -993,6 +1017,9 @@ func (s *Supervisor) runTeamChild(ctx context.Context, child *childRuntime, cfg 
 				return teamrunner.PhaseAttemptResult{ExitCode: 1, BrokerRunID: brokerRunID}, fmt.Errorf("subscribe events: %w", err)
 			}
 
+			attemptProvider := provider
+			preAdoptionID := session.SessionID
+
 			promptDone := make(chan error, 1)
 			go func() {
 				promptDone <- provider.Prompt(context.Background(), session.SessionID, phase.Prompt)
@@ -1007,6 +1034,14 @@ func (s *Supervisor) runTeamChild(ctx context.Context, child *childRuntime, cfg 
 				PermissionClaimScope:   child.id,
 				AutoApprove:            child.autoApprove,
 				PermissionClaimTimeout: child.permClaimTimeout,
+				// adoptSessionID propagates the authoritative conversation id onto
+				// the phase-local session, which is authoritative for retries,
+				// resume, and the terminal sentinel. It also updates the aggregate
+				// child record when this phase is still the active one.
+				AdoptSessionID: func(externalID string) {
+					session.SessionID = externalID
+					s.adoptChildSessionID(child, attemptProvider, preAdoptionID, externalID)
+				},
 			}, cli.SessionWaitDeps{
 				Writer:        attemptWriter,
 				FileHandler:   child.fileHandler,
@@ -1041,6 +1076,13 @@ func (s *Supervisor) runTeamChild(ctx context.Context, child *childRuntime, cfg 
 	child.mu.Lock()
 	child.exitCode = result.ExitCode
 	child.mu.Unlock()
+
+	// A successful team can finish all members and post phases with end_turn.
+	// The aggregate RunResult then has no authoritative SessionID. Use the latest
+	// adopted child session ID to populate the terminal sentinel.
+	if result.SessionID == "" {
+		result.SessionID = child.sessionID()
+	}
 
 	if child.sentinelFile != "" {
 		if result.Reason != "" {
@@ -1100,6 +1142,27 @@ func (c *childRuntime) sessionID() string {
 	return c.session.SessionID
 }
 
+// adoptChildSessionID propagates an authoritative conversation id onto the
+// aggregate child record when the adoption arrives from the active attempt.
+// The caller captures the provider and pre-adoption session id before the
+// adoption fires. Both the provider and the pre-adoption id must still
+// match the live child state. This mirrors the cleanup guard, which
+// compares the runtime.Provider interface directly.
+// A stale callback from an older attempt is rejected, as is a same or empty
+// external id. This prevents a late team/loop phase from overwriting a newer
+// active session. Only SessionID changes; Backend, Dir, and PID are preserved.
+func (s *Supervisor) adoptChildSessionID(child *childRuntime, provider runtime.Provider, expectedOldID, externalID string) {
+	if externalID == "" || externalID == expectedOldID {
+		return
+	}
+	child.mu.Lock()
+	defer child.mu.Unlock()
+	if child.provider == nil || child.provider != provider || child.session.SessionID != expectedOldID {
+		return
+	}
+	child.session.SessionID = externalID
+}
+
 func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, resumeID, promptText string, timer <-chan time.Time) childAttemptResult {
 	child.mu.Lock()
 	child.phase = ""
@@ -1139,6 +1202,9 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 		return childAttemptResult{exitCode: 1, sessionID: session.SessionID}
 	}
 
+	attemptProvider := child.provider
+	preAdoptionID := session.SessionID
+
 	promptDone := make(chan error, 1)
 	go func() {
 		defer func() { recover() }()
@@ -1165,6 +1231,16 @@ func (s *Supervisor) runChildAttempt(ctx context.Context, child *childRuntime, r
 		AutoApprove:            child.autoApprove,
 		PermissionClaimTimeout: child.permClaimTimeout,
 		Timeout:                timer,
+		// adoptSessionID fires inside WaitForSession before the session.start
+		// event is forwarded, so the stable status identity cannot lag the
+		// authoritative event. The attempt-local session is always updated.
+		// The aggregate child record is updated only when this attempt is
+		// still the active one, so a late retry cannot overwrite a newer
+		// session.
+		AdoptSessionID: func(externalID string) {
+			session.SessionID = externalID
+			s.adoptChildSessionID(child, attemptProvider, preAdoptionID, externalID)
+		},
 	}, cli.SessionWaitDeps{
 		Writer:        taggedWriter,
 		FileHandler:   child.fileHandler,
