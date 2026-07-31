@@ -799,6 +799,9 @@ type SessionWaitDeps struct {
 	FileHandler   *permission.FileHandler
 	ControlServer *control.ControlServer
 	Stderr        io.Writer
+	// ProgressTimerC overrides the progress timer channel; nil preserves the
+	// normal wall-clock timer behavior.
+	ProgressTimerC <-chan time.Time
 }
 
 func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionWaitConfig, deps SessionWaitDeps) sessionResult {
@@ -810,6 +813,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 	var loopLabel string
 	var output strings.Builder
 	var finalReply strings.Builder
+	var fullReply strings.Builder
 	eventChClosed := false
 	tracker := newStatusTracker(cfg.SessionID, cfg.RunID, cfg.RunLabel)
 
@@ -817,7 +821,9 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 
 	var progressTimerC <-chan time.Time
 	var progressTimer *time.Timer
-	if cfg.ProgressTimeout > 0 {
+	if deps.ProgressTimerC != nil {
+		progressTimerC = deps.ProgressTimerC
+	} else if cfg.ProgressTimeout > 0 {
 		progressTimer = time.NewTimer(cfg.ProgressTimeout)
 		defer progressTimer.Stop()
 		progressTimerC = progressTimer.C
@@ -908,6 +914,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 					if event.Event == "agent.message_chunk" {
 						output.WriteString(text)
 						finalReply.WriteString(text)
+						fullReply.WriteString(text)
 					}
 					if phase, label, ok := chunkBuf.ScanStatusAngle(); ok {
 						if !writeStatus(tracker.ObserveMarker(phase, label)) {
@@ -984,13 +991,11 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 			}
 			if event.Event == "session.end" {
 				finalStopReason, _ = event.Fields["stop_reason"].(string)
-				if finalReply.Len() > 0 {
-					if _, ok := event.Fields["final_output"]; !ok {
-						if event.Fields == nil {
-							event.Fields = map[string]any{}
-						}
-						event.Fields["final_output"] = finalReply.String()
-					}
+				if event.Fields == nil {
+					event.Fields = map[string]any{}
+				}
+				if _, ok := event.Fields["final_output"]; !ok && fullReply.Len() > 0 {
+					event.Fields["final_output"] = fullReply.String()
 				}
 			}
 			if err := deps.Writer.Write(event); err != nil {
@@ -1004,7 +1009,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 			promptReturned = true
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
-					return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "cancelled", deps.Stderr, bufferedUsage, finalReply.String())
+					return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "cancelled", deps.Stderr, bufferedUsage, fullReply.String(), finalReply.String())
 				}
 				emitErrorEvent(deps.Writer, cfg.SessionID, cfg.RunID, "prompt", fmt.Sprintf("prompt: %v", err), deps.Stderr, cfg.RunLabel)
 				return sessionResult{ExitCode: 1}
@@ -1015,7 +1020,7 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 		case res := <-permissionDone:
 			permissionDone = nil
 			if res.cancelled {
-				return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "cancelled", deps.Stderr, bufferedUsage, finalReply.String())
+				return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "cancelled", deps.Stderr, bufferedUsage, fullReply.String(), finalReply.String())
 			}
 			if res.err != nil {
 				emitErrorEvent(deps.Writer, cfg.SessionID, cfg.RunID, "permission", fmt.Sprintf("permission handler: %v", res.err), deps.Stderr, cfg.RunLabel)
@@ -1043,16 +1048,16 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 			cfn()
 			finalStopReason = "cancelled"
 		case <-ctx.Done():
-			return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "cancelled", deps.Stderr, bufferedUsage, finalReply.String())
+			return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "cancelled", deps.Stderr, bufferedUsage, fullReply.String(), finalReply.String())
 		case <-progressTimerC:
-			return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "progress_timeout", deps.Stderr, bufferedUsage, finalReply.String())
+			return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "progress_timeout", deps.Stderr, bufferedUsage, fullReply.String(), finalReply.String())
 		case <-cfg.Timeout:
-			return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "timeout", deps.Stderr, bufferedUsage, finalReply.String())
+			return cancelAndEnd(provider, deps.Writer, cfg.SessionID, cfg.RunID, cfg.RunLabel, "timeout", deps.Stderr, bufferedUsage, fullReply.String(), finalReply.String())
 		}
 	}
 }
 
-func cancelAndEnd(provider runtime.Provider, writer EventSink, sessionID, runID, runLabel, stopReason string, stderr io.Writer, usage map[string]any, finalOutput string) sessionResult {
+func cancelAndEnd(provider runtime.Provider, writer EventSink, sessionID, runID, runLabel, stopReason string, stderr io.Writer, usage map[string]any, fullFinalOutput, lastBlockFinalReply string) sessionResult {
 	cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := provider.Cancel(cancelCtx, sessionID); err != nil {
@@ -1064,8 +1069,8 @@ func cancelAndEnd(provider runtime.Provider, writer EventSink, sessionID, runID,
 	if usage != nil {
 		fields["usage"] = usage
 	}
-	if finalOutput != "" {
-		fields["final_output"] = finalOutput
+	if fullFinalOutput != "" {
+		fields["final_output"] = fullFinalOutput
 	}
 	if err := writer.Write(events.Event{
 		Event:     "session.end",
@@ -1075,7 +1080,7 @@ func cancelAndEnd(provider runtime.Provider, writer EventSink, sessionID, runID,
 		fmt.Fprintf(stderr, "avenor: write terminal event: %v\n", err)
 		return sessionResult{ExitCode: 1}
 	}
-	return sessionResult{ExitCode: runtime.ExitCodeForStopReason(stopReason), StopReason: stopReason, FinalReply: finalOutput, Usage: usage}
+	return sessionResult{ExitCode: runtime.ExitCodeForStopReason(stopReason), StopReason: stopReason, Output: fullFinalOutput, FinalReply: lastBlockFinalReply, Usage: usage}
 }
 
 type eventWriter struct {
