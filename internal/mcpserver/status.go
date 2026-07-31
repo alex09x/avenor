@@ -48,9 +48,36 @@ func translateStatus(raw map[string]any, sentinelPath string) map[string]any {
 
 	rawStatus, _ := raw["status"].(string)
 	rawSession, _ := raw["session_id"].(string)
+	rawPhase, _ := raw["phase"].(string)
 
 	switch rawStatus {
-	case "idle", "running":
+	case "running":
+		// Keep this status running while active. session.end publishes a terminal
+		// phase before the attempt defer clears child.active; retry selection can
+		// still be pending. Team members share child.active, so this also covers
+		// concurrent work.
+		result["status"] = "running"
+		if isTerminalPhase(rawPhase) {
+			// Keep phase empty until deferred cleanup sets child.active false.
+			result["phase"] = ""
+			result["phase_label"] = ""
+		}
+		if rawSession != "" {
+			result["session_id"] = rawSession
+		}
+
+	case "idle":
+		if isTerminalPhase(rawPhase) {
+			// Use raw metadata because a failed sentinel write can leave an earlier turn's file.
+			result["status"] = rawPhase
+			if rawSession != "" {
+				result["session_id"] = rawSession
+			}
+			if stopReason, ok := raw["stop_reason"]; ok {
+				result["stop_reason"] = stopReason
+			}
+			return result
+		}
 		result["status"] = "running"
 		if rawSession != "" {
 			result["session_id"] = rawSession
@@ -92,6 +119,15 @@ func translateStatus(raw map[string]any, sentinelPath string) map[string]any {
 	}
 
 	return result
+}
+
+func isTerminalPhase(phase string) bool {
+	switch phase {
+	case "done", "failed", "timeout", "killed":
+		return true
+	default:
+		return false
+	}
 }
 
 func readSentinelSession(path string) (string, error) {

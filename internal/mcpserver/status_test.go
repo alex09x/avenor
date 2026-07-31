@@ -146,6 +146,163 @@ func TestTranslateStatusBlockedSentinel(t *testing.T) {
 	}
 }
 
+func TestTranslateStatusIdleTerminalPhases(t *testing.T) {
+	// Terminal phase metadata determines an idle runtime's public state.
+	for _, phase := range []string{"done", "failed", "timeout", "killed"} {
+		raw := map[string]any{
+			"status":      "idle",
+			"session_id":  "ses_raw",
+			"phase":       phase,
+			"stop_reason": "raw_reason",
+		}
+		result := translateStatus(raw, "")
+		if result["status"] == "running" {
+			t.Errorf("idle phase %s returned running: %#v", phase, result)
+		}
+		if result["phase"] != phase {
+			t.Errorf("idle phase = %v, want %s", result["phase"], phase)
+		}
+		if result["session_id"] != "ses_raw" {
+			t.Errorf("idle phase %s session_id = %v, want ses_raw", phase, result["session_id"])
+		}
+		if result["stop_reason"] != "raw_reason" {
+			t.Errorf("idle phase %s stop_reason = %v, want raw_reason", phase, result["stop_reason"])
+		}
+	}
+}
+
+func TestTranslateStatusRunningTerminalPhaseStaysRunning(t *testing.T) {
+	for _, phase := range []string{"done", "failed", "timeout", "killed"} {
+		raw := map[string]any{
+			"status":      "running",
+			"session_id":  "ses_active",
+			"phase":       phase,
+			"stop_reason": "active_failure",
+		}
+		result := translateStatus(raw, "")
+		if result["status"] != "running" {
+			t.Errorf("running phase %s status = %v, want running (transient race must not promote)", phase, result["status"])
+		}
+		if result["phase"] != "" || result["phase_label"] != "" {
+			t.Errorf("running phase %s public phase = %q/%q, want empty", phase, result["phase"], result["phase_label"])
+		}
+		if result["session_id"] != "ses_active" {
+			t.Errorf("running phase %s session_id = %v, want ses_active", phase, result["session_id"])
+		}
+	}
+}
+
+func TestTranslateStatusParkedSuccessUsesCurrentMetadata(t *testing.T) {
+	path := writeSentinel(t, t.TempDir(), "parked.sentinel", "DONE\nSESSION=ses_stale\nSTOP_REASON=stale\n")
+
+	result := translateStatus(map[string]any{
+		"status":      "idle",
+		"session_id":  "ses_live",
+		"phase":       "done",
+		"stop_reason": "end_turn",
+	}, path)
+	if result["status"] != "done" || result["session_id"] != "ses_live" || result["stop_reason"] != "end_turn" {
+		t.Fatalf("parked success = %#v, want current raw metadata", result)
+	}
+}
+
+func TestTranslateStatusIdleTerminalPhaseWithoutSentinel(t *testing.T) {
+	result := translateStatus(map[string]any{
+		"status":      "idle",
+		"session_id":  "ses_raw",
+		"phase":       "timeout",
+		"stop_reason": "raw_timeout",
+	}, filepath.Join(t.TempDir(), "missing.sentinel"))
+	if result["status"] != "timeout" {
+		t.Fatalf("status = %v, want timeout", result["status"])
+	}
+	if result["session_id"] != "ses_raw" || result["stop_reason"] != "raw_timeout" {
+		t.Fatalf("terminal phase metadata = %#v, want raw session and stop reason", result)
+	}
+}
+
+func TestTranslateStatusRunningTerminalPhaseIgnoresStaleSentinel(t *testing.T) {
+	dir := t.TempDir()
+	path := writeSentinel(t, dir, "stale.sentinel", "DONE\nSESSION=ses_stale\nSTOP_REASON=stale\n")
+
+	result := translateStatus(map[string]any{
+		"status":      "running",
+		"session_id":  "ses_active",
+		"phase":       "failed",
+		"stop_reason": "active_failure",
+	}, path)
+	// An active runtime remains public "running" when its raw phase is terminal; retries are not complete.
+	if result["status"] != "running" {
+		t.Fatalf("status = %v, want running (running runtime must not promote terminal phase)", result["status"])
+	}
+	if result["session_id"] != "ses_active" {
+		t.Fatalf("session_id = %v, want ses_active", result["session_id"])
+	}
+}
+
+func TestTranslateStatusIdleTerminalPhaseIgnoresStaleSentinel(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status string
+	}{
+		{name: "done", status: "DONE"},
+		{name: "failed", status: "FAILED"},
+		{name: "timeout", status: "TIMEOUT"},
+		{name: "killed", status: "KILLED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeSentinel(t, t.TempDir(), tc.name+".sentinel", tc.status+"\nSESSION=ses_stale\nSTOP_REASON=stale_reason\n")
+			result := translateStatus(map[string]any{
+				"status":      "idle",
+				"session_id":  "ses_current",
+				"phase":       tc.name,
+				"stop_reason": "current_reason",
+			}, path)
+			if result["status"] != tc.name || result["session_id"] != "ses_current" || result["stop_reason"] != "current_reason" {
+				t.Fatalf("translated status = %#v, want current phase metadata", result)
+			}
+		})
+	}
+}
+
+func TestTranslateStatusLiveNonTerminalPhaseIgnoresSentinel(t *testing.T) {
+	dir := t.TempDir()
+	stalePath := writeSentinel(t, dir, "stale.sentinel", "DONE\nSESSION=ses_stale\nSTOP_REASON=stale\n")
+
+	for _, rawStatus := range []string{"idle", "running"} {
+		for _, phase := range []string{"", "working", "waiting", "unknown"} {
+			for _, sentinel := range []struct {
+				name string
+				path string
+			}{
+				{name: "absent", path: ""},
+				{name: "stale", path: stalePath},
+			} {
+				t.Run(rawStatus+"/phase="+phase+"/sentinel="+sentinel.name, func(t *testing.T) {
+					result := translateStatus(map[string]any{
+						"status":      rawStatus,
+						"session_id":  "ses_live",
+						"phase":       phase,
+						"phase_label": "live label",
+					}, sentinel.path)
+					if result["status"] != "running" {
+						t.Fatalf("raw status %s phase %q status = %v, want running", rawStatus, phase, result["status"])
+					}
+					if result["session_id"] != "ses_live" {
+						t.Fatalf("raw status %s phase %q session_id = %v, want ses_live", rawStatus, phase, result["session_id"])
+					}
+					if result["phase"] != phase {
+						t.Fatalf("raw status %s phase = %v, want %q", rawStatus, result["phase"], phase)
+					}
+					if result["phase_label"] != "live label" {
+						t.Fatalf("raw status %s phase_label = %v, want live label", rawStatus, result["phase_label"])
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestReadSentinelError(t *testing.T) {
 	_, err := readSentinel("/nonexistent/path")
 	if err == nil {
