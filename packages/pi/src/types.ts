@@ -37,6 +37,10 @@ export function findLiveStatusForTrackedRun(
 
 export interface RunStatusEntry {
   runId: string
+  /** Supervisor socket provided at spawn time for namespace scoping. */
+  supervisorId?: string
+  /** Runtime ID scoped to the explicit or singleton supervisor. */
+  runtimeId?: string
   label: string
   status: string
   phase?: string
