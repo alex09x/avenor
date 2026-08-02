@@ -233,6 +233,19 @@ describe('Avenor Pi extension', () => {
     expect(Object.keys(registeredTools)).toContain('avenor_follow_up')
     expect(Object.keys(registeredTools)).toContain('avenor_events')
     expect(Object.keys(registeredTools)).toContain('avenor_shutdown')
+    for (const name of [
+      'avenor_status',
+      'avenor_result',
+      'avenor_inspect',
+      'avenor_answer_permission',
+      'avenor_follow_up',
+      'avenor_events',
+      'avenor_shutdown',
+    ]) {
+      expect(typeof registeredTools[name]?.renderCall).toBe('function')
+      expect(typeof registeredTools[name]?.renderResult).toBe('function')
+    }
+    expect(typeof registeredTools.avenor_spawn.renderResult).toBe('function')
 
     expect(Object.keys(registeredCommands)).toContain('avenor-status')
     expect(Object.keys(registeredCommands)).toContain('avenor-watch')
@@ -348,6 +361,15 @@ describe('Avenor Pi extension', () => {
 
     const result = await registeredTools.avenor_result.execute('tool-result', { run_id: 'run-1', timeout: '5m' })
     expect(result.content[0].text).toContain('"output": "hello world"')
+    expect(result.details).toEqual({ run_id: 'run-1', label: 'demo', status: 'done', ready: true, output: 'hello world' })
+    const renderedResult = registeredTools.avenor_result.renderResult(
+      result,
+      { expanded: false, isPartial: false },
+      { fg: (_color: string, value: string) => value, bold: (value: string) => value },
+      { args: { run_id: 'run-1' } },
+    ).render(2_000).join('\n').trimEnd()
+    expect(renderedResult).toContain('Result: demo — done')
+    expect(renderedResult).not.toContain('"output"')
     expect(resultToolMock).toHaveBeenCalledWith({
       runId: 'run-1',
       supervisorId: undefined,
@@ -376,6 +398,81 @@ describe('Avenor Pi extension', () => {
     expect(eventHandlers.has('session_start')).toBe(true)
     expect(eventHandlers.has('session_shutdown')).toBe(true)
     expect(eventHandlers.has('before_agent_start')).toBe(true)
+  })
+
+  it('keeps exact raw JSON payloads and details for every non-spawn tool callback', async () => {
+    const registeredTools: Record<string, any> = {}
+    const statusPayload = {
+      run_id: 'status-run', label: 'status worker', status: 'done', runtime_id: 'rt-status', latest_seq: 1,
+    }
+    const resultPayload = {
+      run_id: 'result-run', label: 'result worker', status: 'done', ready: true, output: 'result output',
+    }
+    const inspectResult = makeInspectResult({ run_id: 'inspect-run', label: 'inspect worker' })
+    const permissionPayload = { ok: true }
+    const followUpPayload = { run_id: 'follow-up-run', label: 'follow-up worker' }
+    const eventsPayload = { events: [{ event: 'agent.message', seq: 1, delta: 'hello' }] }
+    const shutdownPayload = { ok: true, cleaned_up: ['/tmp/one'] }
+
+    const mockPi = {
+      on: () => {},
+      registerTool: (def: { name: string }) => {
+        registeredTools[def.name] = def
+      },
+      registerCommand: () => {},
+      registerMessageRenderer: () => {},
+      sendUserMessage: () => {},
+      events: { emit: mock(() => {}), on: mock(() => () => {}) },
+    }
+
+    await createExtension({
+      spawnTool: mock(async () => ({ run_id: 'spawn-run', label: 'spawn worker', supervisor_id: '/tmp/sock', runtime_id: 'rt-spawn' })),
+      statusTool: mock(async () => statusPayload),
+      resultTool: mock(async () => resultPayload),
+      inspectTool: mock(async () => inspectResult),
+      answerPermissionTool: mock(async () => permissionPayload),
+      followUpTool: mock(async () => followUpPayload),
+      eventsTool: mock(async () => eventsPayload),
+      shutdownTool: mock(async () => shutdownPayload),
+      observeRun: mock(() => null),
+      dial: mock(async () => ({ close() {}, cancel: async () => {}, interruptAndPrompt: async () => {}, events() { throw new Error('unused') } })),
+      Supervisor: class {} as any,
+    })(mockPi as any)
+
+    const status = await registeredTools.avenor_status.execute('tool-status', { run_id: 'status-run' })
+    expect(status.content[0]?.text).toBe(JSON.stringify(statusPayload, null, 2))
+    expect(status.details).toEqual(statusPayload)
+
+    const runResult = await registeredTools.avenor_result.execute('tool-result', { run_id: 'result-run' })
+    expect(runResult.content[0]?.text).toBe(JSON.stringify(resultPayload, null, 2))
+    expect(runResult.details).toEqual(resultPayload)
+
+    const inspectPayload = buildInspectPayload(inspectResult)
+    const inspect = await registeredTools.avenor_inspect.execute('tool-inspect', { run_id: 'inspect-run' })
+    expect(inspect.content[0]?.text).toBe(JSON.stringify(inspectPayload, null, 2))
+    expect(inspect.details).toEqual(inspectPayload)
+
+    const permission = await registeredTools.avenor_answer_permission.execute('tool-permission', {
+      run_id: 'status-run', option_id: 'allow_once', request_id: 'request-1', message: 'approved',
+    })
+    expect(permission.content[0]?.text).toBe(JSON.stringify(permissionPayload, null, 2))
+    expect(permission.details).toEqual(permissionPayload)
+
+    const followUp = await registeredTools.avenor_follow_up.execute('tool-follow-up', {
+      run_id: 'status-run', message: 'continue', label: 'follow-up worker',
+    })
+    expect(followUp.content[0]?.text).toBe(JSON.stringify(followUpPayload, null, 2))
+    expect(followUp.details).toEqual(followUpPayload)
+
+    const events = await registeredTools.avenor_events.execute('tool-events', {
+      run_id: 'status-run', types: ['agent.message'], limit: 10,
+    })
+    expect(events.content[0]?.text).toBe(JSON.stringify(eventsPayload, null, 2))
+    expect(events.details).toEqual(eventsPayload)
+
+    const shutdown = await registeredTools.avenor_shutdown.execute('tool-shutdown', { supervisor_id: '/tmp/sock', force: true })
+    expect(shutdown.content[0]?.text).toBe(JSON.stringify(shutdownPayload, null, 2))
+    expect(shutdown.details).toEqual(shutdownPayload)
   })
 
   it('registers avenor_inspect with bounded JSON output', async () => {
@@ -413,6 +510,15 @@ describe('Avenor Pi extension', () => {
 
     const result = await inspectToolDef.execute('tool-1', { run_id: 'run-1' })
     expect(result.content[0].text).toContain('"final_output": "hello world"')
+    expect(result.details).toEqual(buildInspectPayload(makeInspectResult()))
     expect(result.details.snapshot.identity.run_id).toBe('run-1')
+    const rendered = inspectToolDef.renderResult(
+      result,
+      { expanded: false, isPartial: false },
+      { fg: (_color: string, value: string) => value, bold: (value: string) => value },
+      { args: { run_id: 'run-1' } },
+    ).render(2_000).join('\n').trimEnd()
+    expect(rendered).toContain('Inspect: demo — done')
+    expect(rendered).not.toContain('"snapshot"')
   })
 })
