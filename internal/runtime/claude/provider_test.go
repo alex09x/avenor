@@ -11,7 +11,20 @@ import (
 	"github.com/sdougbrown/avenor/internal/runtime"
 	"github.com/sdougbrown/avenor/internal/runtime/claudecore"
 	"github.com/sdougbrown/avenor/internal/runtime/claudecore/terminal"
+	"github.com/sdougbrown/avenor/internal/runtime/claudeutil"
 )
+
+func TestThinkingEffortArguments(t *testing.T) {
+	for _, level := range []string{"low", "medium", "high", "xhigh", "max"} {
+		args := claudeutil.BuildArgs("session", "", runtime.StartOptions{Thinking: level})
+		if got := strings.Join(args, " "); !strings.Contains(got, "--effort "+level) {
+			t.Fatalf("args for %s = %q", level, got)
+		}
+	}
+	if got := strings.Join(claudeutil.BuildArgs("session", "", runtime.StartOptions{}), " "); strings.Contains(got, "--effort") {
+		t.Fatalf("empty thinking args = %q", got)
+	}
+}
 
 func TestNewWithOptions(t *testing.T) {
 	p := NewWithOptions(runtime.StartOptions{

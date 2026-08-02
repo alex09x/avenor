@@ -15,6 +15,7 @@ import (
 	"github.com/sdougbrown/avenor/internal/runtime"
 	"github.com/sdougbrown/avenor/internal/runtime/claudecore"
 	"github.com/sdougbrown/avenor/internal/runtime/claudecore/terminal"
+	"github.com/sdougbrown/avenor/internal/runtime/claudeutil"
 )
 
 const backendID = "claude"
@@ -62,6 +63,9 @@ func New() runtime.Provider {
 
 func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtime.Session, error) {
 	merged := runtime.MergeStartOptions(p.opts, opts)
+	if err := runtime.ValidateThinkingForBackend(backendID, merged.Thinking); err != nil {
+		return runtime.Session{}, err
+	}
 	if merged.Dir == "" || merged.Dir == "." {
 		var err error
 		merged.Dir, err = os.Getwd()
@@ -87,22 +91,13 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	if !strings.Contains(strings.TrimSpace(string(out)), "Claude Code") {
 		return runtime.Session{}, fmt.Errorf("unexpected claude version output: %s", strings.TrimSpace(string(out)))
 	}
+	if err := claudeutil.CheckEffortCapability(ctx, backendID, merged.Thinking); err != nil {
+		return runtime.Session{}, err
+	}
 
 	sessionID := uuid.New().String()
 
-	claudeArgs := []string{
-		"--session-id", sessionID,
-		"--permission-mode", "default",
-	}
-	if merged.Agent != "" {
-		claudeArgs = append(claudeArgs, "--agent", merged.Agent)
-	}
-	if merged.Label != "" {
-		claudeArgs = append(claudeArgs, "--name", merged.Label)
-	}
-	if merged.Model != "" {
-		claudeArgs = append(claudeArgs, "--model", merged.Model)
-	}
+	claudeArgs := claudeutil.BuildArgs(sessionID, "", merged)
 
 	parts := make([]string, 0, len(claudeArgs)+2)
 	parts = append(parts, "exec", "claude")

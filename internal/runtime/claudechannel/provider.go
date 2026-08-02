@@ -18,6 +18,7 @@ import (
 	"github.com/sdougbrown/avenor/internal/runtime/broker"
 	"github.com/sdougbrown/avenor/internal/runtime/claudecore"
 	"github.com/sdougbrown/avenor/internal/runtime/claudecore/terminal"
+	"github.com/sdougbrown/avenor/internal/runtime/claudeutil"
 )
 
 const backendID = "claude-channel"
@@ -73,6 +74,9 @@ func New() runtime.Provider {
 
 func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtime.Session, error) {
 	merged := runtime.MergeStartOptions(p.opts, opts)
+	if err := runtime.ValidateThinkingForBackend(backendID, merged.Thinking); err != nil {
+		return runtime.Session{}, err
+	}
 	if merged.Dir == "" {
 		var err error
 		merged.Dir, err = os.Getwd()
@@ -99,6 +103,9 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	vStr := strings.TrimSpace(string(out))
 	if !strings.Contains(vStr, "Claude Code") {
 		return runtime.Session{}, fmt.Errorf("unexpected claude version output: %s", vStr)
+	}
+	if err := claudeutil.CheckEffortCapability(ctx, backendID, merged.Thinking); err != nil {
+		return runtime.Session{}, err
 	}
 
 	p.mu.Lock()
@@ -164,20 +171,7 @@ func (p *Provider) Start(ctx context.Context, opts runtime.StartOptions) (runtim
 	}
 
 	// Build claude args.
-	claudeArgs := []string{
-		"--dangerously-load-development-channels", "server:" + serverName,
-		"--session-id", sessionID,
-	}
-	if merged.Agent != "" {
-		claudeArgs = append(claudeArgs, "--agent", merged.Agent)
-	}
-	if merged.Label != "" {
-		claudeArgs = append(claudeArgs, "--name", merged.Label)
-	}
-	if merged.Model != "" {
-		claudeArgs = append(claudeArgs, "--model", merged.Model)
-	}
-	claudeArgs = append(claudeArgs, "--permission-mode", "default")
+	claudeArgs := claudeutil.BuildArgs(sessionID, serverName, merged)
 
 	// Build the shell command for the tmux session. Using `exec` replaces the
 	// shell with claude so that #{pane_pid} reports claude's actual PID and the
