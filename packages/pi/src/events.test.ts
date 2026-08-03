@@ -2,13 +2,15 @@ import { describe, expect, it, mock } from 'bun:test'
 import type { EventBus } from '@earendil-works/pi-coding-agent'
 import {
   CHANNEL_POLL_COMPLETED,
+  CHANNEL_POLL_ERROR,
   CHANNEL_RUN_TERMINAL,
   createPollCompletedPayload,
+  createPollErrorPayload,
   createRunTerminalPayload,
   emitAvenorEvent,
   onAvenorEvent,
 } from './events.js'
-import type { PollCompletedPayload, RunTerminalPayload } from './events.js'
+import type { PollCompletedPayload, PollErrorPayload, RunTerminalPayload } from './events.js'
 
 function createMockBus(): EventBus {
   const handlers = new Map<string, Set<(data: unknown) => void>>()
@@ -40,6 +42,7 @@ function createMockBus(): EventBus {
 describe('Avenor telemetry event bridge', () => {
   it('uses namespaced channels', () => {
     expect(CHANNEL_POLL_COMPLETED).toBe('avenor:poll:completed')
+    expect(CHANNEL_POLL_ERROR).toBe('avenor:poll:error')
     expect(CHANNEL_RUN_TERMINAL).toBe('avenor:run:terminal')
   })
 
@@ -69,6 +72,37 @@ describe('Avenor telemetry event bridge', () => {
     expect(received[0]?.entries[0]?.runId).toBe('run-1')
     expect(received[0]?.entries[0]?.phaseLabel).toBe('reading')
     expect(received[0]?.generation).toBe(7)
+    unsubscribe()
+  })
+
+  it('delivers bounded polling errors through the injected Pi event bus', () => {
+    const bus = createMockBus()
+    const received: PollErrorPayload[] = []
+    const unsubscribe = onAvenorEvent(bus, CHANNEL_POLL_ERROR, payload => {
+      received.push(payload)
+    })
+
+    const payload = createPollErrorPayload({
+      source: 'run-status',
+      runId: 'run-1',
+      message: 'statusTool failed',
+      error: `\u001b[31m${'x'.repeat(700)}\u001b[0m`,
+      count: 3,
+      timestamp: 1_700_000_000_000,
+    })
+    emitAvenorEvent(bus, CHANNEL_POLL_ERROR, payload)
+
+    expect(received).toEqual([payload])
+    expect(received[0]).toMatchObject({
+      source: 'run-status',
+      runId: 'run-1',
+      message: 'statusTool failed',
+      count: 3,
+      timestamp: 1_700_000_000_000,
+    })
+    expect(received[0]?.error).toHaveLength(600)
+    expect(received[0]?.error).toEndWith('…')
+    expect(Object.isFrozen(payload)).toBe(true)
     unsubscribe()
   })
 
@@ -208,6 +242,52 @@ describe('Avenor telemetry event bridge', () => {
     })
     expect(payload.supervisorKey).toBe('singleton')
     expect(Object.isFrozen(payload)).toBe(true)
+  })
+
+  it('uses unknown error for empty text after sanitizing', () => {
+    const payload = createPollErrorPayload({
+      source: 'run-status',
+      message: '\u001b[31m\n\t  \n',
+      error: '\u001b[31m\u001b[0m',
+      count: 1,
+      timestamp: 1_700_000_000_000,
+    })
+
+    expect(payload.message).toBe('unknown error')
+    expect(payload.error).toBe('unknown error')
+    expect(Object.isFrozen(payload)).toBe(true)
+  })
+
+  it('sanitizes message while bounding error independently', () => {
+    const longMessage = 'a'.repeat(700)
+    const longError = 'b'.repeat(800)
+    const payload = createPollErrorPayload({
+      source: 'singleton-list',
+      message: longMessage,
+      error: longError,
+      count: 2,
+      timestamp: 1_700_000_000_000,
+    })
+
+    expect(payload.message).toHaveLength(600)
+    expect(payload.message).toEndWith('…')
+    expect(payload.error).toHaveLength(600)
+    expect(payload.error).toEndWith('…')
+    expect(payload.source).toBe('singleton-list')
+    expect(payload.count).toBe(2)
+  })
+
+  it('preserves clean text under the bound limit', () => {
+    const payload = createPollErrorPayload({
+      source: 'spawn-status',
+      message: 'short msg',
+      error: 'short err',
+      count: 1,
+      timestamp: 1_700_000_000_000,
+    })
+
+    expect(payload.message).toBe('short msg')
+    expect(payload.error).toBe('short err')
   })
 
   it('forwards handlers to the shared bus without owning global state', () => {
