@@ -120,6 +120,33 @@ type permissionLifecycleSink struct {
 	onRequest func()
 }
 
+type permissionRequestCaptureSink struct {
+	mu           sync.Mutex
+	request      events.Event
+	claimState   control.PermissionResolverState
+	onRequest    func()
+	captured     bool
+	requestCount int
+}
+
+func (s *permissionRequestCaptureSink) Write(event events.Event) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if event.Event == "permission.request" {
+		s.requestCount++
+		if !s.captured {
+			s.request = event
+			s.captured = true
+			if s.onRequest != nil {
+				s.onRequest()
+			}
+		}
+	}
+	return nil
+}
+
+func (s *permissionRequestCaptureSink) Close() error { return nil }
+
 func (s *permissionLifecycleSink) Write(event events.Event) error {
 	if event.Event == "permission.request" && s.onRequest != nil {
 		s.onRequest()
@@ -152,6 +179,24 @@ func (s *signalEventSink) Write(event events.Event) error {
 		}
 	}
 	return nil
+}
+
+type callbackEventSink struct {
+	EventSink
+	eventName string
+	field     string
+	value     string
+	callback  func()
+	once      sync.Once
+}
+
+func (s *callbackEventSink) Write(event events.Event) error {
+	if event.Event == s.eventName {
+		if value, _ := event.Fields[s.field].(string); value == s.value {
+			s.once.Do(s.callback)
+		}
+	}
+	return s.EventSink.Write(event)
 }
 
 func (f *cliFakeProvider) Start(ctx context.Context, opts runtime.StartOptions) (runtime.Session, error) {
@@ -421,6 +466,9 @@ func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) 
 	for i, ev := range got {
 		if ev.Event == "permission.request" {
 			requestIndex = i
+			if gotResolver := ev.Fields["resolver"]; gotResolver != "automatic" {
+				t.Fatalf("permission.request resolver = %v, want automatic", gotResolver)
+			}
 		}
 		// With the goroutine-based auto-answer, AnswerPermission runs concurrently
 		// with event draining, so session.end may arrive before the permissionDone
@@ -441,6 +489,308 @@ func TestWaitForSessionAutoApproveAnswersAllowKindAndOrdersEvents(t *testing.T) 
 	}
 }
 
+func TestEffectivePermissionResolverState(t *testing.T) {
+	tests := []struct {
+		name              string
+		autoApprove       bool
+		requiresUserInput bool
+		hasControlClient  bool
+		hasFileHandler    bool
+		want              control.PermissionResolverState
+	}{
+		{name: "automatic", autoApprove: true, want: control.PermissionResolverAutomatic},
+		{name: "write-in with control", autoApprove: true, requiresUserInput: true, hasControlClient: true, hasFileHandler: true, want: control.PermissionResolverReserved},
+		{name: "write-in with file", autoApprove: true, requiresUserInput: true, hasFileHandler: true, want: control.PermissionResolverFile},
+		{name: "file fallback", hasFileHandler: true, want: control.PermissionResolverFile},
+		{name: "write-in with none", autoApprove: true, requiresUserInput: true, want: control.PermissionResolverNoResolver},
+		{name: "none", want: control.PermissionResolverNoResolver},
+		{name: "reserved no-auto", autoApprove: false, hasControlClient: true, requiresUserInput: false, want: control.PermissionResolverReserved},
+		{name: "automatic takes precedence", autoApprove: true, hasControlClient: true, hasFileHandler: true, want: control.PermissionResolverAutomatic},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := effectivePermissionResolverState(tt.autoApprove, tt.requiresUserInput, tt.hasControlClient, tt.hasFileHandler); got != tt.want {
+				t.Fatalf("effectivePermissionResolverState() = %v, want %v", got, tt.want)
+			}
+			if got := effectivePermissionResolverState(tt.autoApprove, tt.requiresUserInput, tt.hasControlClient, tt.hasFileHandler).String(); got != tt.want.String() {
+				t.Fatalf("serialized resolver = %q, want %q", got, tt.want.String())
+			}
+		})
+	}
+}
+
+func TestPermissionRequestEmitsEffectiveResolverAndClaimState(t *testing.T) {
+	tests := []struct {
+		name              string
+		autoApprove       bool
+		hasFileHandler    bool
+		requiresUserInput bool
+		want              control.PermissionResolverState
+		connectControl    bool
+	}{
+		{name: "automatic", autoApprove: true, want: control.PermissionResolverAutomatic},
+		{name: "reserved", want: control.PermissionResolverReserved, connectControl: true},
+		{name: "file", hasFileHandler: true, want: control.PermissionResolverFile},
+		{name: "none", want: control.PermissionResolverNoResolver},
+		{name: "write-in none", autoApprove: true, requiresUserInput: true, want: control.PermissionResolverNoResolver},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cs := control.NewServer(control.NewState("run_1", "", 0))
+			var conn net.Conn
+			if tt.connectControl {
+				socketPath := shortControlSocketPath(t)
+				if err := cs.Start(socketPath); err != nil {
+					t.Fatalf("start control server: %v", err)
+				}
+				defer cs.Stop()
+				var err error
+				conn, err = net.Dial("unix", socketPath)
+				if err != nil {
+					t.Fatalf("dial control server: %v", err)
+				}
+				defer conn.Close()
+				waitForControlClientForTest(t, cs)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			eventCh := make(chan events.Event, 1)
+			eventCh <- events.Event{
+				Event:     "permission.request",
+				SessionID: "ses_resolver",
+				Fields: map[string]any{
+					"request_id":          "req_resolver",
+					"requires_user_input": tt.requiresUserInput,
+					"options": []any{
+						map[string]any{"optionId": "allow", "kind": "allow"},
+					},
+				},
+			}
+			close(eventCh)
+			promptDone := make(chan error, 1)
+			promptDone <- nil
+			sink := &permissionRequestCaptureSink{}
+			sink.onRequest = func() {
+				sink.claimState = cs.PermissionResolverState("", "req_resolver")
+				cancel()
+			}
+			fileHandler := (*permission.FileHandler)(nil)
+			if tt.hasFileHandler {
+				fileHandler = permission.NewFileHandler(filepath.Join(t.TempDir(), "permission"))
+			}
+
+			result := waitForSessionForTest(ctx, &cliFakeProvider{}, sink, fileHandler, cs, eventCh, promptDone, nil, "ses_resolver", "run_1", "", tt.autoApprove, time.Millisecond, nil, io.Discard)
+			if result.ExitCode == 0 && tt.want == control.PermissionResolverReserved {
+				t.Fatal("reserved permission unexpectedly completed")
+			}
+			if got := sink.request.Fields["resolver"]; got != tt.want.String() {
+				t.Fatalf("permission.request resolver = %v, want %q", got, tt.want.String())
+			}
+			if got := sink.claimState; got != tt.want {
+				t.Fatalf("claim state before resolution = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPermissionRequestResolverInjectionDoesNotMutateSourceEvent(t *testing.T) {
+	source := events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_source_event",
+		Fields: map[string]any{
+			"request_id": "req_source_event",
+			"options": []any{
+				map[string]any{"optionId": "allow", "kind": "allow"},
+			},
+		},
+	}
+	sourceBefore, err := json.Marshal(source)
+	if err != nil {
+		t.Fatalf("marshal source permission event: %v", err)
+	}
+	eventCh := make(chan events.Event, 2)
+	eventCh <- source
+	eventCh <- events.Event{Event: "session.end", SessionID: source.SessionID, Fields: map[string]any{"stop_reason": "end_turn"}}
+	close(eventCh)
+	promptDone := make(chan error, 1)
+	promptDone <- nil
+	sink := &permissionRequestCaptureSink{}
+
+	result := waitForSessionForTest(context.Background(), &cliFakeProvider{}, sink, nil, nil, eventCh, promptDone, nil, source.SessionID, "run_source_event", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
+	if result.ExitCode != 0 {
+		t.Fatalf("WaitForSession exit code = %d, want 0", result.ExitCode)
+	}
+	sourceAfter, err := json.Marshal(source)
+	if err != nil {
+		t.Fatalf("marshal source permission event after wait: %v", err)
+	}
+	if string(sourceAfter) != string(sourceBefore) {
+		t.Fatalf("source permission event mutated: got %s, want %s", sourceAfter, sourceBefore)
+	}
+	sink.mu.Lock()
+	resolver := sink.request.Fields["resolver"]
+	sink.mu.Unlock()
+	if resolver != "automatic" {
+		t.Fatalf("written permission.request resolver = %v, want automatic", resolver)
+	}
+}
+
+func TestWaitForSessionFilePermissionEmitsOneEffectiveRequestAndCleansUp(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "permission")
+	handler := permission.NewFileHandler(base)
+	handler.PollInterval = time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eventCh := make(chan events.Event, 1)
+	eventCh <- events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_file_once",
+		Fields: map[string]any{
+			"request_id": "req_file_once",
+			"options": []any{
+				map[string]any{"optionId": "allow", "kind": "allow"},
+			},
+		},
+	}
+	close(eventCh)
+	promptDone := make(chan error, 1)
+	promptDone <- nil
+	sink := &permissionRequestCaptureSink{onRequest: cancel}
+
+	result := waitForSessionForTest(ctx, &cliFakeProvider{}, sink, handler, nil, eventCh, promptDone, nil, "ses_file_once", "run_1", "", false, time.Second, nil, io.Discard)
+	if result.ExitCode != 130 {
+		t.Fatalf("WaitForSession exit code = %d, want 130", result.ExitCode)
+	}
+	if sink.requestCount != 1 {
+		t.Fatalf("permission.request count = %d, want 1", sink.requestCount)
+	}
+	if got := sink.request.Fields["resolver"]; got != "file" {
+		t.Fatalf("permission.request resolver = %v, want file", got)
+	}
+	if _, err := os.Stat(base + ".req"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("permission request file still exists after synchronized cancellation: %v", err)
+	}
+}
+
+func TestWaitForSessionSynchronizesFileCleanupForEveryTerminationSource(t *testing.T) {
+	tests := []struct {
+		name             string
+		stopReason       string
+		expectedExitCode int
+		trigger          func(chan<- error, chan<- time.Time, chan<- time.Time, chan<- struct{})
+	}{
+		{
+			name:             "prompt cancellation",
+			stopReason:       "cancelled",
+			expectedExitCode: 130,
+			trigger: func(promptDone chan<- error, _ chan<- time.Time, _ chan<- time.Time, _ chan<- struct{}) {
+				promptDone <- context.Canceled
+			},
+		},
+		{
+			name:             "progress timeout",
+			stopReason:       "progress_timeout",
+			expectedExitCode: 124,
+			trigger: func(_ chan<- error, progressTimer chan<- time.Time, _ chan<- time.Time, _ chan<- struct{}) {
+				progressTimer <- time.Time{}
+			},
+		},
+		{
+			name:             "configured timeout",
+			stopReason:       "timeout",
+			expectedExitCode: 124,
+			trigger: func(_ chan<- error, _ chan<- time.Time, timeout chan<- time.Time, _ chan<- struct{}) {
+				timeout <- time.Time{}
+			},
+		},
+		{
+			name:             "interrupt",
+			stopReason:       "cancelled",
+			expectedExitCode: 130,
+			trigger: func(_ chan<- error, _ chan<- time.Time, _ chan<- time.Time, interruptCh chan<- struct{}) {
+				interruptCh <- struct{}{}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			base := filepath.Join(dir, "permission")
+			handler := permission.NewFileHandler(base)
+			handler.PollInterval = time.Millisecond
+			promptDone := make(chan error)
+			progressTimer := make(chan time.Time, 1)
+			timeout := make(chan time.Time, 1)
+			interruptCh := make(chan struct{}, 1)
+			eventCh := make(chan events.Event, 1)
+			eventCh <- events.Event{Event: "permission.request", SessionID: "ses_cleanup", Fields: map[string]any{
+				"request_id": "req_cleanup",
+				"options":    []any{map[string]any{"optionId": "allow", "kind": "allow"}},
+			}}
+			sink := &permissionRequestCaptureSink{}
+			requestWritten := make(chan struct{})
+			var requestOnce sync.Once
+			sink.onRequest = func() { requestOnce.Do(func() { close(requestWritten) }) }
+			resultCh := make(chan sessionResult, 1)
+			go func() {
+				resultCh <- WaitForSession(context.Background(), &cliFakeProvider{}, SessionWaitConfig{
+					EventCh:                eventCh,
+					PromptDone:             promptDone,
+					InterruptCh:            interruptCh,
+					SessionID:              "ses_cleanup",
+					RunID:                  "run_cleanup",
+					PermissionClaimTimeout: time.Second,
+					ProgressTimeout:        time.Second,
+					Timeout:                timeout,
+				}, SessionWaitDeps{
+					Writer:         sink,
+					FileHandler:    handler,
+					ProgressTimerC: progressTimer,
+					Stderr:         io.Discard,
+				})
+			}()
+			select {
+			case <-requestWritten:
+			case <-time.After(time.Second):
+				t.Fatal("permission.request was not written")
+			}
+			deadline := time.Now().Add(time.Second)
+			for {
+				if _, err := os.Stat(base + ".req"); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("file handler did not create .req before termination")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			triggerDone := make(chan struct{})
+			go func() {
+				defer close(triggerDone)
+				tt.trigger(promptDone, progressTimer, timeout, interruptCh)
+			}()
+			select {
+			case result := <-resultCh:
+				<-triggerDone
+				if result.StopReason != tt.stopReason {
+					t.Fatalf("StopReason = %q, want %q", result.StopReason, tt.stopReason)
+				}
+				if result.ExitCode != tt.expectedExitCode {
+					t.Fatalf("ExitCode = %d, want %d", result.ExitCode, tt.expectedExitCode)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("WaitForSession did not synchronize and return")
+			}
+			if _, err := os.Stat(base + ".req"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf(".req remained after %s termination: %v", tt.name, err)
+			}
+		})
+	}
+}
+
 func TestResolvePermissionAutoApproveDoesNotAnswerQuestion(t *testing.T) {
 	provider := &cliFakeProvider{}
 	event := events.Event{Event: "permission.request", Fields: map[string]any{
@@ -450,9 +800,12 @@ func TestResolvePermissionAutoApproveDoesNotAnswerQuestion(t *testing.T) {
 			map[string]any{"optionId": "choice", "kind": "allow"},
 		},
 	}}
-	result := resolvePermission(context.Background(), provider, nil, nil, event, "ses_1", "", "req_question", true, DefaultPermissionClaimTimeout, nil)
+	result := resolvePermission(context.Background(), provider, nil, nil, event, "ses_1", "", "req_question", true, DefaultPermissionClaimTimeout)
 	if provider.answerRequestID != "" {
 		t.Fatalf("question was auto-answered: %q", provider.answerRequestID)
+	}
+	if result.err != nil {
+		t.Fatalf("auto-approve result error = %v, want nil", result.err)
 	}
 	if result.source != "none" {
 		t.Fatalf("result source = %q, want none", result.source)
@@ -1188,6 +1541,1294 @@ func (f *blockingFakeProvider) AnswerPermission(ctx context.Context, sessionID, 
 	return nil
 }
 
+// cancelUnblocksPermissionProvider models providers whose AnswerPermission
+// ignores its context but is released by the session-level Cancel operation.
+type cancelUnblocksPermissionProvider struct {
+	cliFakeProvider
+	answerStarted  chan struct{}
+	cancelStarted  chan struct{}
+	answerReturned chan struct{}
+	cancelOnce     sync.Once
+}
+
+func newCancelUnblocksPermissionProvider() *cancelUnblocksPermissionProvider {
+	return &cancelUnblocksPermissionProvider{
+		answerStarted:  make(chan struct{}),
+		cancelStarted:  make(chan struct{}),
+		answerReturned: make(chan struct{}),
+	}
+}
+
+func (p *cancelUnblocksPermissionProvider) AnswerPermission(context.Context, string, string, runtime.PermissionResponse) error {
+	close(p.answerStarted)
+	<-p.cancelStarted
+	close(p.answerReturned)
+	return nil
+}
+
+func (p *cancelUnblocksPermissionProvider) Cancel(context.Context, string) error {
+	p.cancelOnce.Do(func() { close(p.cancelStarted) })
+	return nil
+}
+
+type nonCooperativePermissionProvider struct {
+	cliFakeProvider
+	answerStarted  chan struct{}
+	answerRelease  chan struct{}
+	answerReturned chan struct{}
+	cancelStarted  chan struct{}
+	cancelRelease  chan struct{}
+	cancelReturned chan struct{}
+	releaseOnce    sync.Once
+}
+
+func newNonCooperativePermissionProvider() *nonCooperativePermissionProvider {
+	return &nonCooperativePermissionProvider{
+		answerStarted:  make(chan struct{}),
+		answerRelease:  make(chan struct{}),
+		answerReturned: make(chan struct{}),
+		cancelStarted:  make(chan struct{}),
+		cancelRelease:  make(chan struct{}),
+		cancelReturned: make(chan struct{}),
+	}
+}
+
+func (p *nonCooperativePermissionProvider) AnswerPermission(context.Context, string, string, runtime.PermissionResponse) error {
+	close(p.answerStarted)
+	<-p.answerRelease
+	close(p.answerReturned)
+	return nil
+}
+
+func (p *nonCooperativePermissionProvider) Cancel(context.Context, string) error {
+	close(p.cancelStarted)
+	<-p.cancelRelease
+	close(p.cancelReturned)
+	return nil
+}
+
+func (p *nonCooperativePermissionProvider) release() {
+	p.releaseOnce.Do(func() {
+		close(p.answerRelease)
+		close(p.cancelRelease)
+	})
+}
+
+type coordinatedLifecycleProvider struct {
+	cliFakeProvider
+	answerStarted         chan struct{}
+	answerRelease         chan struct{}
+	answerReturned        chan struct{}
+	cancelStarted         chan struct{}
+	cancelRelease         chan struct{}
+	cancelReturned        chan struct{}
+	closeCalled           chan struct{}
+	completionReady       chan struct{}
+	completionRelease     chan struct{}
+	answerStartOnce       sync.Once
+	answerDoneOnce        sync.Once
+	cancelStartOnce       sync.Once
+	cancelDoneOnce        sync.Once
+	closeOnce             sync.Once
+	answerReleaseOnce     sync.Once
+	cancelReleaseOnce     sync.Once
+	completionReleaseOnce sync.Once
+	mu                    sync.Mutex
+	cancelCalls           int
+	closeCalls            int
+	answerInFlight        bool
+	cancelInFlight        bool
+	closeRaced            bool
+}
+
+func newCoordinatedLifecycleProvider() *coordinatedLifecycleProvider {
+	return &coordinatedLifecycleProvider{
+		answerStarted:  make(chan struct{}),
+		answerRelease:  make(chan struct{}),
+		answerReturned: make(chan struct{}),
+		cancelStarted:  make(chan struct{}),
+		cancelRelease:  make(chan struct{}),
+		cancelReturned: make(chan struct{}),
+		closeCalled:    make(chan struct{}),
+	}
+}
+
+func (p *coordinatedLifecycleProvider) AnswerPermission(context.Context, string, string, runtime.PermissionResponse) error {
+	p.mu.Lock()
+	p.answerInFlight = true
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.answerInFlight = false
+		p.mu.Unlock()
+		p.answerDoneOnce.Do(func() { close(p.answerReturned) })
+	}()
+	p.answerStartOnce.Do(func() { close(p.answerStarted) })
+	<-p.answerRelease
+	p.waitForConcurrentCompletion()
+	return nil
+}
+
+func (p *coordinatedLifecycleProvider) Cancel(context.Context, string) error {
+	p.mu.Lock()
+	p.cancelCalls++
+	p.cancelInFlight = true
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.cancelInFlight = false
+		p.mu.Unlock()
+		p.cancelDoneOnce.Do(func() { close(p.cancelReturned) })
+	}()
+	p.cancelStartOnce.Do(func() { close(p.cancelStarted) })
+	<-p.cancelRelease
+	p.waitForConcurrentCompletion()
+	return nil
+}
+
+func (p *coordinatedLifecycleProvider) Close() error {
+	p.mu.Lock()
+	p.closeCalls++
+	if p.answerInFlight || p.cancelInFlight {
+		p.closeRaced = true
+	}
+	p.mu.Unlock()
+	p.closeOnce.Do(func() { close(p.closeCalled) })
+	return nil
+}
+
+func (p *coordinatedLifecycleProvider) releaseAnswer() {
+	p.answerReleaseOnce.Do(func() { close(p.answerRelease) })
+}
+
+func (p *coordinatedLifecycleProvider) releaseCancel() {
+	p.cancelReleaseOnce.Do(func() { close(p.cancelRelease) })
+}
+
+func (p *coordinatedLifecycleProvider) release() {
+	p.releaseAnswer()
+	p.releaseCancel()
+}
+
+func (p *coordinatedLifecycleProvider) enableConcurrentCompletion() {
+	p.completionReady = make(chan struct{}, 2)
+	p.completionRelease = make(chan struct{})
+}
+
+func (p *coordinatedLifecycleProvider) waitForConcurrentCompletion() {
+	if p.completionReady == nil {
+		return
+	}
+	p.completionReady <- struct{}{}
+	<-p.completionRelease
+}
+
+func (p *coordinatedLifecycleProvider) releaseConcurrentCompletion() {
+	if p.completionRelease != nil {
+		p.completionReleaseOnce.Do(func() { close(p.completionRelease) })
+	}
+}
+
+func (p *coordinatedLifecycleProvider) lifecycleCounts() (int, int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cancelCalls, p.closeCalls, p.closeRaced
+}
+
+type blockingPromptLifecycleProvider struct {
+	cliFakeProvider
+	started     chan struct{}
+	release     chan struct{}
+	returned    chan struct{}
+	closed      chan struct{}
+	releaseOnce sync.Once
+	closeOnce   sync.Once
+	mu          sync.Mutex
+	inFlight    bool
+	closeCalls  int
+	closeRaced  bool
+}
+
+func newBlockingPromptLifecycleProvider() *blockingPromptLifecycleProvider {
+	return &blockingPromptLifecycleProvider{
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+		returned: make(chan struct{}),
+		closed:   make(chan struct{}),
+	}
+}
+
+func (p *blockingPromptLifecycleProvider) Prompt(context.Context, string, string) error {
+	p.mu.Lock()
+	p.inFlight = true
+	p.mu.Unlock()
+	close(p.started)
+	defer func() {
+		p.mu.Lock()
+		p.inFlight = false
+		p.mu.Unlock()
+		close(p.returned)
+	}()
+	<-p.release
+	return nil
+}
+
+func (p *blockingPromptLifecycleProvider) Close() error {
+	p.mu.Lock()
+	p.closeCalls++
+	if p.inFlight {
+		p.closeRaced = true
+	}
+	p.mu.Unlock()
+	p.closeOnce.Do(func() { close(p.closed) })
+	return nil
+}
+
+func (p *blockingPromptLifecycleProvider) unblock() {
+	p.releaseOnce.Do(func() { close(p.release) })
+}
+
+type multiSessionCancelProvider struct {
+	cliFakeProvider
+	started     chan string
+	release     chan struct{}
+	releaseOnce sync.Once
+	mu          sync.Mutex
+	sessionIDs  []string
+}
+
+func newMultiSessionCancelProvider() *multiSessionCancelProvider {
+	return &multiSessionCancelProvider{
+		started: make(chan string, 2),
+		release: make(chan struct{}),
+	}
+}
+
+func (p *multiSessionCancelProvider) Cancel(_ context.Context, sessionID string) error {
+	p.mu.Lock()
+	p.sessionIDs = append(p.sessionIDs, sessionID)
+	p.mu.Unlock()
+	p.started <- sessionID
+	<-p.release
+	return nil
+}
+
+func (p *multiSessionCancelProvider) unblock() {
+	p.releaseOnce.Do(func() { close(p.release) })
+}
+
+func (p *multiSessionCancelProvider) sessions() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.sessionIDs...)
+}
+
+type reusableLifecycleCancelProvider struct {
+	cliFakeProvider
+	started chan int
+	gates   []chan struct{}
+	mu      sync.Mutex
+	calls   int
+}
+
+func newReusableLifecycleCancelProvider(callCount int) *reusableLifecycleCancelProvider {
+	gates := make([]chan struct{}, callCount)
+	for i := range gates {
+		gates[i] = make(chan struct{})
+	}
+	return &reusableLifecycleCancelProvider{
+		started: make(chan int, callCount),
+		gates:   gates,
+	}
+}
+
+func (p *reusableLifecycleCancelProvider) Cancel(ctx context.Context, _ string) error {
+	p.mu.Lock()
+	p.calls++
+	call := p.calls
+	gate := p.gates[call-1]
+	p.mu.Unlock()
+	p.started <- call
+	select {
+	case <-gate:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *reusableLifecycleCancelProvider) release(call int) {
+	select {
+	case <-p.gates[call-1]:
+	default:
+		close(p.gates[call-1])
+	}
+}
+
+func (p *reusableLifecycleCancelProvider) releaseAll() {
+	for call := range p.gates {
+		p.release(call + 1)
+	}
+}
+
+type waitExitMatrixProvider struct {
+	cliFakeProvider
+	mu                sync.Mutex
+	cancels           int
+	sessions          []string
+	permissionRelease <-chan struct{}
+	permissionErr     error
+}
+
+func (p *waitExitMatrixProvider) AnswerPermission(ctx context.Context, _, _ string, _ runtime.PermissionResponse) error {
+	if p.permissionRelease == nil {
+		return nil
+	}
+	select {
+	case <-p.permissionRelease:
+		return p.permissionErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *waitExitMatrixProvider) Cancel(_ context.Context, sessionID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cancels++
+	p.sessions = append(p.sessions, sessionID)
+	return nil
+}
+
+func (p *waitExitMatrixProvider) cancelSnapshot() (int, []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cancels, append([]string(nil), p.sessions...)
+}
+
+type waitExitMatrixSink struct {
+	mu           sync.Mutex
+	events       []events.Event
+	onSessionEnd func()
+}
+
+func (s *waitExitMatrixSink) Write(event events.Event) error {
+	s.mu.Lock()
+	s.events = append(s.events, event)
+	onSessionEnd := s.onSessionEnd
+	s.mu.Unlock()
+	if event.Event == "session.end" && onSessionEnd != nil {
+		onSessionEnd()
+	}
+	return nil
+}
+
+func (*waitExitMatrixSink) Close() error { return nil }
+
+func (s *waitExitMatrixSink) counts() (sessionEnds, errors int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, event := range s.events {
+		switch event.Event {
+		case "session.end":
+			sessionEnds++
+		case "avenor.error":
+			errors++
+		}
+	}
+	return sessionEnds, errors
+}
+
+func (s *waitExitMatrixSink) terminalStopReasons() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var stopReasons []string
+	for _, event := range s.events {
+		if event.Event == "session.end" {
+			stopReason, _ := event.Fields["stop_reason"].(string)
+			stopReasons = append(stopReasons, stopReason)
+		}
+	}
+	return stopReasons
+}
+
+type sequentialPermissionProvider struct {
+	cliFakeProvider
+	mu             sync.Mutex
+	answerIDs      []string
+	firstStarted   chan struct{}
+	releaseFirst   chan struct{}
+	secondAnswered chan struct{}
+}
+
+func newSequentialPermissionProvider() *sequentialPermissionProvider {
+	return &sequentialPermissionProvider{
+		firstStarted:   make(chan struct{}),
+		releaseFirst:   make(chan struct{}),
+		secondAnswered: make(chan struct{}),
+	}
+}
+
+func (f *sequentialPermissionProvider) AnswerPermission(_ context.Context, _ string, requestID string, _ runtime.PermissionResponse) error {
+	f.mu.Lock()
+	f.answerIDs = append(f.answerIDs, requestID)
+	answerNumber := len(f.answerIDs)
+	f.mu.Unlock()
+
+	switch answerNumber {
+	case 1:
+		close(f.firstStarted)
+		<-f.releaseFirst
+	case 2:
+		close(f.secondAnswered)
+	}
+	return nil
+}
+
+func (f *sequentialPermissionProvider) answers() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.answerIDs...)
+}
+
+func TestWaitForSessionExitMatrixStopsEveryNonCleanReturn(t *testing.T) {
+	tests := []struct {
+		name            string
+		setup           func(*SessionWaitConfig)
+		wantExitCode    int
+		wantStopReason  string
+		wantCancels     int
+		wantSessionEnds int
+		wantErrors      int
+	}{
+		{
+			name: "clean authoritative completion",
+			setup: func(cfg *SessionWaitConfig) {
+				eventCh := make(chan events.Event, 1)
+				eventCh <- events.Event{Event: "session.end", SessionID: cfg.SessionID, Fields: map[string]any{"stop_reason": "end_turn"}}
+				promptDone := make(chan error, 1)
+				promptDone <- nil
+				cfg.EventCh = eventCh
+				cfg.PromptDone = promptDone
+			},
+			wantExitCode:    0,
+			wantCancels:     0,
+			wantSessionEnds: 1,
+		},
+		{
+			name: "authoritative end without prompt return",
+			setup: func(cfg *SessionWaitConfig) {
+				eventCh := make(chan events.Event, 1)
+				eventCh <- events.Event{Event: "session.end", SessionID: cfg.SessionID, Fields: map[string]any{"stop_reason": "end_turn"}}
+				close(eventCh)
+				cfg.EventCh = eventCh
+			},
+			wantExitCode:    0,
+			wantCancels:     1,
+			wantSessionEnds: 1,
+		},
+		{
+			name: "event stream closes without end",
+			setup: func(cfg *SessionWaitConfig) {
+				eventCh := make(chan events.Event)
+				close(eventCh)
+				cfg.EventCh = eventCh
+			},
+			wantExitCode: 1,
+			wantCancels:  1,
+		},
+		{
+			name: "prompt failure",
+			setup: func(cfg *SessionWaitConfig) {
+				promptDone := make(chan error, 1)
+				promptDone <- errors.New("prompt failed")
+				cfg.PromptDone = promptDone
+			},
+			wantExitCode: 1,
+			wantCancels:  1,
+			wantErrors:   1,
+		},
+		{
+			name: "authoritative identity conflict",
+			setup: func(cfg *SessionWaitConfig) {
+				eventCh := make(chan events.Event, 1)
+				eventCh <- events.Event{Event: "session.start", SessionID: cfg.SessionID, Fields: map[string]any{"conversation_id": "occupied"}}
+				cfg.EventCh = eventCh
+				cfg.AcceptSessionID = func(string) bool { return false }
+			},
+			wantExitCode:   1,
+			wantStopReason: runtime.SessionIDConflictStopReason,
+			wantCancels:    1,
+			wantErrors:     1,
+		},
+		{
+			name: "synthetic timeout",
+			setup: func(cfg *SessionWaitConfig) {
+				timeout := make(chan time.Time, 1)
+				timeout <- time.Now()
+				cfg.Timeout = timeout
+			},
+			wantExitCode:    124,
+			wantStopReason:  "timeout",
+			wantCancels:     1,
+			wantSessionEnds: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := &waitExitMatrixProvider{}
+			sink := &waitExitMatrixSink{}
+			cfg := SessionWaitConfig{SessionID: "ses_exit_matrix", RunID: "run_exit_matrix"}
+			tt.setup(&cfg)
+
+			result := WaitForSession(context.Background(), provider, cfg, SessionWaitDeps{
+				Writer:                sink,
+				Stderr:                io.Discard,
+				permissionJoinTimeout: 20 * time.Millisecond,
+			})
+			if result.ExitCode != tt.wantExitCode || result.StopReason != tt.wantStopReason {
+				t.Fatalf("result = {exit:%d stop:%q}, want {%d %q}", result.ExitCode, result.StopReason, tt.wantExitCode, tt.wantStopReason)
+			}
+			cancelCount, sessions := provider.cancelSnapshot()
+			if cancelCount != tt.wantCancels {
+				t.Fatalf("provider Cancel calls = %d (%v), want %d", cancelCount, sessions, tt.wantCancels)
+			}
+			for _, sessionID := range sessions {
+				if sessionID != cfg.SessionID {
+					t.Fatalf("provider Cancel session = %q, want %q", sessionID, cfg.SessionID)
+				}
+			}
+			sessionEnds, errorEvents := sink.counts()
+			if sessionEnds != tt.wantSessionEnds || errorEvents != tt.wantErrors {
+				t.Fatalf("audit counts = {session.end:%d errors:%d}, want {%d %d}", sessionEnds, errorEvents, tt.wantSessionEnds, tt.wantErrors)
+			}
+		})
+	}
+}
+
+func TestWaitForSessionExitMatrixPreservesForwardedAuthoritativeEndDuringTeardown(t *testing.T) {
+	tests := []struct {
+		name              string
+		permissionFailure bool
+		trigger           func(context.CancelFunc, *SessionWaitConfig, *SessionWaitDeps, *waitExitMatrixProvider) func()
+	}{
+		{
+			name: "interrupt",
+			trigger: func(_ context.CancelFunc, cfg *SessionWaitConfig, _ *SessionWaitDeps, _ *waitExitMatrixProvider) func() {
+				interruptCh := make(chan struct{})
+				cfg.InterruptCh = interruptCh
+				return func() { close(interruptCh) }
+			},
+		},
+		{
+			name: "parent context cancellation",
+			trigger: func(cancel context.CancelFunc, _ *SessionWaitConfig, _ *SessionWaitDeps, _ *waitExitMatrixProvider) func() {
+				return cancel
+			},
+		},
+		{
+			name: "prompt context cancellation",
+			trigger: func(_ context.CancelFunc, cfg *SessionWaitConfig, _ *SessionWaitDeps, _ *waitExitMatrixProvider) func() {
+				promptDone := make(chan error, 1)
+				cfg.PromptDone = promptDone
+				return func() { promptDone <- context.Canceled }
+			},
+		},
+		{
+			name: "prompt failure",
+			trigger: func(_ context.CancelFunc, cfg *SessionWaitConfig, _ *SessionWaitDeps, _ *waitExitMatrixProvider) func() {
+				promptDone := make(chan error, 1)
+				cfg.PromptDone = promptDone
+				return func() { promptDone <- errors.New("late prompt failure") }
+			},
+		},
+		{
+			name: "progress timeout",
+			trigger: func(_ context.CancelFunc, _ *SessionWaitConfig, deps *SessionWaitDeps, _ *waitExitMatrixProvider) func() {
+				progressCh := make(chan time.Time, 1)
+				deps.ProgressTimerC = progressCh
+				return func() { progressCh <- time.Now() }
+			},
+		},
+		{
+			name: "configured timeout",
+			trigger: func(_ context.CancelFunc, cfg *SessionWaitConfig, _ *SessionWaitDeps, _ *waitExitMatrixProvider) func() {
+				timeoutCh := make(chan time.Time, 1)
+				cfg.Timeout = timeoutCh
+				return func() { timeoutCh <- time.Now() }
+			},
+		},
+		{
+			name:              "permission failure",
+			permissionFailure: true,
+			trigger: func(_ context.CancelFunc, cfg *SessionWaitConfig, _ *SessionWaitDeps, provider *waitExitMatrixProvider) func() {
+				release := make(chan struct{})
+				provider.permissionRelease = release
+				provider.permissionErr = errors.New("late permission failure")
+				cfg.AutoApprove = true
+				return func() { close(release) }
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			provider := &waitExitMatrixProvider{}
+			eventCh := make(chan events.Event, 3)
+			eventCh <- events.Event{
+				Event:     "agent.message_chunk",
+				SessionID: "ses_authoritative_teardown",
+				Fields:    map[string]any{"content": map[string]any{"text": "authoritative reply"}},
+			}
+			if tt.permissionFailure {
+				eventCh <- events.Event{
+					Event:     "permission.request",
+					SessionID: "ses_authoritative_teardown",
+					Fields: map[string]any{
+						"request_id": "req_authoritative_teardown",
+						"options": []any{
+							map[string]any{"optionId": "allow", "kind": "allow"},
+						},
+					},
+				}
+			}
+			eventCh <- events.Event{
+				Event:     "session.end",
+				SessionID: "ses_authoritative_teardown",
+				Fields: map[string]any{
+					"stop_reason": "refusal",
+					"usage":       map[string]any{"input_tokens": 7},
+				},
+			}
+
+			cfg := SessionWaitConfig{
+				EventCh:    eventCh,
+				PromptDone: make(chan error),
+				SessionID:  "ses_authoritative_teardown",
+				RunID:      "run_authoritative_teardown",
+			}
+			deps := SessionWaitDeps{
+				Stderr:                io.Discard,
+				permissionJoinTimeout: 20 * time.Millisecond,
+			}
+			trigger := tt.trigger(cancel, &cfg, &deps, provider)
+			sink := &waitExitMatrixSink{}
+			var triggerOnce sync.Once
+			sink.onSessionEnd = func() { triggerOnce.Do(trigger) }
+			deps.Writer = sink
+
+			result := WaitForSession(ctx, provider, cfg, deps)
+			if result.ExitCode != 2 || result.StopReason != "" {
+				t.Fatalf("result = {exit:%d stop:%q}, want authoritative {2 %q}", result.ExitCode, result.StopReason, "")
+			}
+			if result.Output != "authoritative reply" || result.FinalReply != "authoritative reply" {
+				t.Fatalf("result reply = {output:%q final:%q}, want authoritative reply", result.Output, result.FinalReply)
+			}
+			if result.Usage == nil || result.Usage["input_tokens"] != 7 {
+				t.Fatalf("result usage = %#v, want authoritative usage", result.Usage)
+			}
+			if got := sink.terminalStopReasons(); len(got) != 1 || got[0] != "refusal" {
+				t.Fatalf("terminal stop reasons = %v, want exactly [refusal]", got)
+			}
+			if sessionEnds, errorEvents := sink.counts(); sessionEnds != 1 || errorEvents != 0 {
+				t.Fatalf("audit counts = {session.end:%d errors:%d}, want {1 0}", sessionEnds, errorEvents)
+			}
+			if cancelCount, sessions := provider.cancelSnapshot(); cancelCount != 1 || len(sessions) != 1 || sessions[0] != cfg.SessionID {
+				t.Fatalf("provider Cancel calls = %d (%v), want one for %q", cancelCount, sessions, cfg.SessionID)
+			}
+		})
+	}
+}
+
+func TestWaitForSessionTerminationCancelsBeforeJoiningPermissionAnswer(t *testing.T) {
+	tests := []struct {
+		name       string
+		trigger    string
+		stopReason string
+	}{
+		{name: "interrupt", trigger: "interrupt", stopReason: "cancelled"},
+		{name: "context", trigger: "context", stopReason: "cancelled"},
+		{name: "prompt cancellation", trigger: "prompt", stopReason: "cancelled"},
+		{name: "progress timeout", trigger: "progress", stopReason: "progress_timeout"},
+		{name: "configured timeout", trigger: "timeout", stopReason: "timeout"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := newCancelUnblocksPermissionProvider()
+			writer, err := NewEventWriter("")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			interruptCh := make(chan struct{})
+			progressCh := make(chan time.Time, 1)
+			timeoutCh := make(chan time.Time, 1)
+			promptDone := make(chan error, 1)
+			eventCh := make(chan events.Event, 1)
+			eventCh <- events.Event{
+				Event:     "permission.request",
+				SessionID: "ses_cancel_answer",
+				Fields: map[string]any{
+					"request_id": "req_cancel_answer",
+					"options": []any{
+						map[string]any{"optionId": "allow", "kind": "allow"},
+					},
+				},
+			}
+
+			resultCh := make(chan sessionResult, 1)
+			waitDone := make(chan struct{})
+			t.Cleanup(func() {
+				provider.cancelOnce.Do(func() { close(provider.cancelStarted) })
+				cancel()
+				select {
+				case <-waitDone:
+				case <-time.After(time.Second):
+					t.Error("WaitForSession goroutine did not exit during cleanup")
+				}
+				if err := writer.Close(); err != nil {
+					t.Errorf("close writer: %v", err)
+				}
+			})
+			go func() {
+				defer close(waitDone)
+				resultCh <- WaitForSession(ctx, provider, SessionWaitConfig{
+					EventCh:     eventCh,
+					PromptDone:  promptDone,
+					InterruptCh: interruptCh,
+					SessionID:   "ses_cancel_answer",
+					RunID:       "run_cancel_answer",
+					AutoApprove: true,
+					Timeout:     timeoutCh,
+				}, SessionWaitDeps{
+					Writer:         writer,
+					Stderr:         io.Discard,
+					ProgressTimerC: progressCh,
+				})
+			}()
+
+			select {
+			case <-provider.answerStarted:
+			case <-time.After(time.Second):
+				t.Fatal("AnswerPermission did not reach the forced blocking point")
+			}
+			switch tt.trigger {
+			case "interrupt":
+				close(interruptCh)
+			case "context":
+				cancel()
+			case "prompt":
+				promptDone <- context.Canceled
+			case "progress":
+				progressCh <- time.Now()
+			case "timeout":
+				timeoutCh <- time.Now()
+			}
+
+			select {
+			case result := <-resultCh:
+				if result.StopReason != tt.stopReason {
+					t.Fatalf("StopReason = %q, want %q", result.StopReason, tt.stopReason)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("WaitForSession deadlocked joining AnswerPermission before provider.Cancel")
+			}
+			select {
+			case <-provider.cancelStarted:
+			default:
+				t.Fatal("provider.Cancel was not called")
+			}
+			select {
+			case <-provider.answerReturned:
+			default:
+				t.Fatal("WaitForSession returned before AnswerPermission joined")
+			}
+		})
+	}
+}
+
+func TestProviderLifecycleDefersCloseAndSharesBlockedCancel(t *testing.T) {
+	for _, answerFirst := range []bool{true, false} {
+		name := "cancel returns first"
+		if answerFirst {
+			name = "answer returns first"
+		}
+		t.Run(name, func(t *testing.T) {
+			provider := newCoordinatedLifecycleProvider()
+			ctx, cancel := context.WithCancel(context.Background())
+			lifecycle := NewProviderLifecycle(provider)
+			turn := lifecycle.NewTurn()
+			resolverFinished := make(chan struct{})
+			writer, err := NewEventWriter("")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			interruptCh := make(chan struct{})
+			eventCh := make(chan events.Event, 1)
+			eventCh <- events.Event{
+				Event:     "permission.request",
+				SessionID: "ses_coordinated_lifecycle",
+				Fields: map[string]any{
+					"request_id": "req_coordinated_lifecycle",
+					"options": []any{
+						map[string]any{"optionId": "allow", "kind": "allow"},
+					},
+				},
+			}
+			resultCh := make(chan sessionResult, 1)
+			waitDone := make(chan struct{})
+			t.Cleanup(func() {
+				cancel()
+				provider.release()
+				select {
+				case <-waitDone:
+				case <-time.After(time.Second):
+					t.Error("WaitForSession goroutine did not exit during cleanup")
+				}
+				closeDone := lifecycle.RequestClose()
+				select {
+				case <-closeDone:
+				case <-time.After(time.Second):
+					t.Error("provider lifecycle did not close during cleanup")
+				}
+				if err := writer.Close(); err != nil {
+					t.Errorf("close writer: %v", err)
+				}
+			})
+			go func() {
+				defer close(waitDone)
+				resultCh <- WaitForSession(ctx, provider, SessionWaitConfig{
+					EventCh:     eventCh,
+					PromptDone:  make(chan error),
+					InterruptCh: interruptCh,
+					SessionID:   "ses_coordinated_lifecycle",
+					RunID:       "run_coordinated_lifecycle",
+					AutoApprove: true,
+				}, SessionWaitDeps{
+					Writer:                writer,
+					Stderr:                io.Discard,
+					ProviderTurn:          turn,
+					permissionJoinTimeout: 20 * time.Millisecond,
+					permissionResultSent:  func() { close(resolverFinished) },
+				})
+			}()
+
+			waitFor := func(label string, done <-chan struct{}) {
+				t.Helper()
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatalf("%s did not finish", label)
+				}
+			}
+			assertPending := func(label string, done <-chan struct{}) {
+				t.Helper()
+				select {
+				case <-done:
+					t.Fatalf("%s finished before its provider call was released", label)
+				default:
+				}
+			}
+
+			waitFor("AnswerPermission start", provider.answerStarted)
+			close(interruptCh)
+			waitFor("Cancel start", provider.cancelStarted)
+			select {
+			case result := <-resultCh:
+				if result.StopReason != "cancelled" {
+					t.Fatalf("StopReason = %q, want cancelled", result.StopReason)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("WaitForSession did not return after the provider-call bounds")
+			}
+
+			// Model runSingleAttempt/stable teardown and a second cancellation
+			// owner. Both must share the one still-live provider Cancel.
+			lifecycle.RequestClose()
+			secondTurn := lifecycle.NewTurn()
+			secondCancelDone := secondTurn.RequestCancel("ses_coordinated_lifecycle", 20*time.Millisecond)
+			assertPending("deferred Close", provider.closeCalled)
+			assertPending("second cancel wait", secondCancelDone)
+			if cancelCalls, _, _ := provider.lifecycleCounts(); cancelCalls != 1 {
+				t.Fatalf("provider Cancel calls = %d, want one shared lifecycle", cancelCalls)
+			}
+
+			if answerFirst {
+				provider.releaseAnswer()
+				waitFor("AnswerPermission", provider.answerReturned)
+				waitFor("permission resolver", resolverFinished)
+				assertPending("deferred Close after answer", provider.closeCalled)
+				assertPending("second cancel wait after answer", secondCancelDone)
+				provider.releaseCancel()
+				waitFor("Cancel", provider.cancelReturned)
+				waitFor("second cancel wait", secondCancelDone)
+			} else {
+				provider.releaseCancel()
+				waitFor("Cancel", provider.cancelReturned)
+				waitFor("second cancel wait", secondCancelDone)
+				assertPending("deferred Close after cancel", provider.closeCalled)
+				assertPending("AnswerPermission after cancel", provider.answerReturned)
+				provider.releaseAnswer()
+				waitFor("AnswerPermission", provider.answerReturned)
+				waitFor("permission resolver", resolverFinished)
+			}
+			waitFor("deferred Close", provider.closeCalled)
+			if cancelCalls, closeCalls, raced := provider.lifecycleCounts(); cancelCalls != 1 || closeCalls != 1 || raced {
+				t.Fatalf("provider lifecycle = {cancel calls:%d close calls:%d close raced:%v}, want {1 1 false}", cancelCalls, closeCalls, raced)
+			}
+		})
+	}
+}
+
+func TestProviderLifecycleConcurrentCompletionStartsOneClose(t *testing.T) {
+	provider := newCoordinatedLifecycleProvider()
+	provider.enableConcurrentCompletion()
+	t.Cleanup(func() {
+		provider.release()
+		provider.releaseConcurrentCompletion()
+	})
+	lifecycle := NewProviderLifecycle(provider)
+	turn := lifecycle.NewTurn()
+	answerDone := make(chan error, 1)
+	go func() {
+		answerDone <- turn.AnswerPermission(context.Background(), "ses_concurrent_close", "req_concurrent_close", runtime.PermissionResponse{})
+	}()
+	select {
+	case <-provider.answerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("AnswerPermission did not start")
+	}
+
+	cancelDone := turn.RequestCancel("ses_concurrent_close", time.Second)
+	select {
+	case <-provider.cancelStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Cancel did not start")
+	}
+	closeDone := lifecycle.RequestClose()
+	select {
+	case <-closeDone:
+		t.Fatal("provider closed while AnswerPermission and Cancel were live")
+	default:
+	}
+
+	provider.release()
+	for range 2 {
+		select {
+		case <-provider.completionReady:
+		case <-time.After(time.Second):
+			t.Fatal("provider calls did not reach the concurrent completion barrier")
+		}
+	}
+	provider.releaseConcurrentCompletion()
+
+	select {
+	case err := <-answerDone:
+		if err != nil {
+			t.Fatalf("AnswerPermission: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AnswerPermission did not return")
+	}
+	select {
+	case <-cancelDone:
+		if err := turn.cancelError(); err != nil {
+			t.Fatalf("Cancel: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Cancel did not return")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not close after concurrent completions")
+	}
+	_, closeCalls, raced := provider.lifecycleCounts()
+	if closeCalls != 1 || raced {
+		t.Fatalf("provider close lifecycle = {calls:%d raced:%v}, want {1 false}", closeCalls, raced)
+	}
+}
+
+func TestProviderLifecycleDefersCloseForPromptAndRejectsLateCalls(t *testing.T) {
+	provider := newBlockingPromptLifecycleProvider()
+	t.Cleanup(provider.unblock)
+	lifecycle := NewProviderLifecycle(provider)
+	turn := lifecycle.NewTurn()
+	promptDone := make(chan error, 1)
+	go func() { promptDone <- turn.Prompt(context.Background(), "ses_prompt", "prompt") }()
+
+	select {
+	case <-provider.started:
+	case <-time.After(time.Second):
+		t.Fatal("Prompt did not reach the forced blocking point")
+	}
+	const closeRequests = 8
+	closeResults := make(chan (<-chan struct{}), closeRequests)
+	for range closeRequests {
+		go func() { closeResults <- lifecycle.RequestClose() }()
+	}
+	var closeDone <-chan struct{}
+	for range closeRequests {
+		var done <-chan struct{}
+		select {
+		case done = <-closeResults:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent RequestClose call blocked")
+		}
+		if closeDone == nil {
+			closeDone = done
+		} else if done != closeDone {
+			t.Fatal("concurrent RequestClose calls returned different completion channels")
+		}
+	}
+	select {
+	case <-closeDone:
+		t.Fatal("provider closed while Prompt remained live")
+	default:
+	}
+	lateTurn := lifecycle.NewTurn()
+	if err := lateTurn.Prompt(context.Background(), "ses_prompt", "late"); !errors.Is(err, errProviderLifecycleClosing) {
+		t.Fatalf("late Prompt error = %v, want provider lifecycle closing", err)
+	}
+	if err := lateTurn.AnswerPermission(context.Background(), "ses_prompt", "req_late", runtime.PermissionResponse{}); !errors.Is(err, errProviderLifecycleClosing) {
+		t.Fatalf("late AnswerPermission error = %v, want provider lifecycle closing", err)
+	}
+	lateCancelDone := lateTurn.RequestCancel("ses_prompt", 20*time.Millisecond)
+	select {
+	case <-lateCancelDone:
+		if err := lateTurn.cancelError(); !errors.Is(err, errProviderLifecycleClosing) {
+			t.Fatalf("late Cancel error = %v, want provider lifecycle closing", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late Cancel rejection did not complete")
+	}
+
+	provider.unblock()
+	select {
+	case err := <-promptDone:
+		if err != nil {
+			t.Fatalf("Prompt: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Prompt did not return after release")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(time.Second):
+		t.Fatal("provider did not close after Prompt returned")
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if provider.closeCalls != 1 || provider.closeRaced {
+		t.Fatalf("provider close lifecycle = {calls:%d raced:%v}, want {1 false}", provider.closeCalls, provider.closeRaced)
+	}
+}
+
+func TestProviderLifecycleDoesNotShareCancelAcrossSessions(t *testing.T) {
+	provider := newMultiSessionCancelProvider()
+	t.Cleanup(provider.unblock)
+	lifecycle := NewProviderLifecycle(provider)
+	firstDone := lifecycle.NewTurn().RequestCancel("ses_first", time.Second)
+	secondDone := lifecycle.NewTurn().RequestCancel("ses_second", time.Second)
+
+	seen := map[string]bool{}
+	for range 2 {
+		select {
+		case sessionID := <-provider.started:
+			seen[sessionID] = true
+		case <-time.After(time.Second):
+			t.Fatal("distinct-session Cancel did not start")
+		}
+	}
+	if !seen["ses_first"] || !seen["ses_second"] {
+		t.Fatalf("provider Cancel sessions = %v, want both sessions", provider.sessions())
+	}
+	provider.unblock()
+	for name, done := range map[string]<-chan struct{}{"first": firstDone, "second": secondDone} {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("%s Cancel did not return after release", name)
+		}
+	}
+	if got := provider.sessions(); len(got) != 2 {
+		t.Fatalf("provider Cancel calls = %v, want two distinct calls", got)
+	}
+}
+
+func TestProviderLifecycleCleansCompletedCancelAndAllowsSessionReuse(t *testing.T) {
+	provider := newReusableLifecycleCancelProvider(2)
+	t.Cleanup(provider.releaseAll)
+	lifecycle := NewProviderLifecycle(provider)
+
+	firstTurn := lifecycle.NewTurn()
+	firstDone := firstTurn.RequestCancel("ses_reused_cancel", time.Second)
+	select {
+	case call := <-provider.started:
+		if call != 1 {
+			t.Fatalf("first started call = %d, want 1", call)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first Cancel did not start")
+	}
+	sharedTurn := lifecycle.NewTurn()
+	sharedDone := sharedTurn.RequestCancel("ses_reused_cancel", time.Second)
+	if sharedDone != firstDone || sharedTurn.cancelCall != firstTurn.cancelCall {
+		t.Fatal("live same-session Cancel did not share the exact call")
+	}
+	lifecycle.mu.Lock()
+	activeBefore := len(lifecycle.activeCancels)
+	mappedBefore := lifecycle.activeCancels["ses_reused_cancel"]
+	lifecycle.mu.Unlock()
+	if activeBefore != 1 || mappedBefore != firstTurn.cancelCall {
+		t.Fatalf("active cancel before completion = {%d %p}, want {1 %p}", activeBefore, mappedBefore, firstTurn.cancelCall)
+	}
+
+	provider.release(1)
+	for name, done := range map[string]<-chan struct{}{"first": firstDone, "shared": sharedDone} {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("%s Cancel did not finish", name)
+		}
+	}
+	lifecycle.mu.Lock()
+	activeAfterFirst := len(lifecycle.activeCancels)
+	lifecycle.mu.Unlock()
+	if activeAfterFirst != 0 {
+		t.Fatalf("active cancels after first completion = %d, want 0", activeAfterFirst)
+	}
+
+	laterTurn := lifecycle.NewTurn()
+	laterDone := laterTurn.RequestCancel("ses_reused_cancel", time.Second)
+	select {
+	case call := <-provider.started:
+		if call != 2 {
+			t.Fatalf("later started call = %d, want 2", call)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("later same-session Cancel was incorrectly deduplicated")
+	}
+	if laterTurn.cancelCall == firstTurn.cancelCall {
+		t.Fatal("later same-session Cancel reused a completed call")
+	}
+	provider.release(2)
+	select {
+	case <-laterDone:
+	case <-time.After(time.Second):
+		t.Fatal("later Cancel did not finish")
+	}
+	lifecycle.mu.Lock()
+	activeAfterSecond := len(lifecycle.activeCancels)
+	lifecycle.mu.Unlock()
+	if activeAfterSecond != 0 {
+		t.Fatalf("active cancels after second completion = %d, want 0", activeAfterSecond)
+	}
+}
+
+func TestWaitForSessionTerminationBoundsNonCooperativeProviderCalls(t *testing.T) {
+	provider := newNonCooperativePermissionProvider()
+	resolverFinished := make(chan struct{})
+	writer, err := NewEventWriter("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	waitDone := make(chan struct{})
+	t.Cleanup(func() {
+		provider.release()
+		cancel()
+		select {
+		case <-provider.answerReturned:
+		case <-time.After(time.Second):
+			t.Error("AnswerPermission goroutine did not exit after cleanup release")
+		}
+		select {
+		case <-provider.cancelReturned:
+		case <-time.After(time.Second):
+			t.Error("Cancel goroutine did not exit after cleanup release")
+		}
+		select {
+		case <-resolverFinished:
+		case <-time.After(time.Second):
+			t.Error("permission resolver goroutine did not exit after cleanup release")
+		}
+		select {
+		case <-waitDone:
+		case <-time.After(time.Second):
+			t.Error("WaitForSession goroutine did not exit during cleanup")
+		}
+		if err := writer.Close(); err != nil {
+			t.Errorf("close writer: %v", err)
+		}
+	})
+
+	interruptCh := make(chan struct{})
+	eventCh := make(chan events.Event, 1)
+	eventCh <- events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_stubborn_answer",
+		Fields: map[string]any{
+			"request_id": "req_stubborn_answer",
+			"options": []any{
+				map[string]any{"optionId": "allow", "kind": "allow"},
+			},
+		},
+	}
+	resultCh := make(chan sessionResult, 1)
+	go func() {
+		defer close(waitDone)
+		resultCh <- WaitForSession(ctx, provider, SessionWaitConfig{
+			EventCh:     eventCh,
+			PromptDone:  make(chan error),
+			InterruptCh: interruptCh,
+			SessionID:   "ses_stubborn_answer",
+			RunID:       "run_stubborn_answer",
+			AutoApprove: true,
+		}, SessionWaitDeps{
+			Writer:                writer,
+			Stderr:                io.Discard,
+			permissionJoinTimeout: 20 * time.Millisecond,
+			permissionResultSent:  func() { close(resolverFinished) },
+		})
+	}()
+
+	select {
+	case <-provider.answerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("AnswerPermission did not reach the forced blocking point")
+	}
+	close(interruptCh)
+	select {
+	case <-provider.cancelStarted:
+	case <-time.After(time.Second):
+		t.Fatal("provider.Cancel did not reach the forced blocking point")
+	}
+	select {
+	case result := <-resultCh:
+		if result.StopReason != "cancelled" {
+			t.Fatalf("StopReason = %q, want cancelled", result.StopReason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("non-cooperative provider calls made termination unbounded")
+	}
+	select {
+	case <-provider.answerReturned:
+		t.Fatal("AnswerPermission unexpectedly returned before test cleanup")
+	default:
+	}
+	select {
+	case <-provider.cancelReturned:
+		t.Fatal("Cancel unexpectedly returned before test cleanup")
+	default:
+	}
+}
+
 // TestAutoAnswerGoroutineDoesNotBlockEventLoop verifies that a slow
 // AnswerPermission call does not prevent subsequent events from draining.
 // It injects a blocking provider, sends a permission.request followed by
@@ -1291,12 +2932,8 @@ func TestAutoAnswerMissingRequestIDEmitsErrorNotWorking(t *testing.T) {
 	eventCh <- events.Event{
 		Event:     "permission.request",
 		SessionID: "ses_1",
-		Fields: map[string]any{
-			// intentionally no "request_id"
-			"options": []any{
-				map[string]any{"optionId": "allow", "kind": "allow"},
-			},
-		},
+		// Nil fields exercise request-event enrichment before serialization.
+		Fields: nil,
 	}
 	// session.end so the loop can terminate
 	eventCh <- events.Event{
@@ -1324,8 +2961,14 @@ func TestAutoAnswerMissingRequestIDEmitsErrorNotWorking(t *testing.T) {
 	}
 
 	got := readEventLogForTest(t, eventsPath)
-	var hasError, hasWorking bool
+	var hasError, hasWorking, hasRequest bool
 	for _, ev := range got {
+		if ev.Event == "permission.request" {
+			hasRequest = true
+			if gotResolver := ev.Fields["resolver"]; gotResolver != "automatic" {
+				t.Fatalf("permission.request resolver = %v, want automatic", gotResolver)
+			}
+		}
 		if ev.Event == "avenor.error" {
 			msg, _ := ev.Fields["message"].(string)
 			if strings.Contains(msg, "missing request_id") {
@@ -1335,6 +2978,9 @@ func TestAutoAnswerMissingRequestIDEmitsErrorNotWorking(t *testing.T) {
 		if ev.Event == "agent.status" && ev.Fields["phase"] == "working" {
 			hasWorking = true
 		}
+	}
+	if !hasRequest {
+		t.Fatalf("permission.request was not emitted; events: %+v", got)
 	}
 	if !hasError {
 		t.Fatalf("expected avenor.error with 'missing request_id'; events: %+v", got)
@@ -1421,9 +3067,8 @@ func TestAutoAnswerEmitsPermissionResponse(t *testing.T) {
 }
 
 // TestAutoAnswerAnswerPermissionErrorEmitsError verifies that when
-// AnswerPermission returns an error, the loop emits an avenor.error event
-// and exits with code 1. A session.end is included so the loop waits for the
-// goroutine to complete rather than exiting early on the closed eventCh.
+// AnswerPermission returns an error before an authoritative terminal, the loop
+// emits an avenor.error event and exits with code 1.
 func TestAutoAnswerAnswerPermissionErrorEmitsError(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
@@ -1432,7 +3077,7 @@ func TestAutoAnswerAnswerPermissionErrorEmitsError(t *testing.T) {
 		t.Fatalf("newEventWriter: %v", err)
 	}
 
-	eventCh := make(chan events.Event, 3)
+	eventCh := make(chan events.Event, 1)
 	eventCh <- events.Event{
 		Event:     "permission.request",
 		SessionID: "ses_1",
@@ -1442,13 +3087,6 @@ func TestAutoAnswerAnswerPermissionErrorEmitsError(t *testing.T) {
 				map[string]any{"optionId": "allow", "kind": "allow"},
 			},
 		},
-	}
-	// Include session.end so finalStopReason is set and the loop waits
-	// for permissionDone before deciding to exit.
-	eventCh <- events.Event{
-		Event:     "session.end",
-		SessionID: "ses_1",
-		Fields:    map[string]any{"stop_reason": "end_turn"},
 	}
 	close(eventCh)
 
@@ -2023,8 +3661,16 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 
 	promptDone := make(chan error, 1)
 	resultCh := make(chan sessionResult, 1)
+	overlapSeen := make(chan struct{})
+	sink := &signalEventSink{
+		EventSink: writer,
+		eventName: "avenor.error",
+		field:     "message",
+		value:     "another permission request is already pending",
+		signal:    overlapSeen,
+	}
 	go func() {
-		resultCh <- waitForSessionForTest(context.Background(), provider, writer, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
+		resultCh <- waitForSessionForTest(context.Background(), provider, sink, nil, nil, eventCh, promptDone, nil, "ses_1", "run_1", "", true, DefaultPermissionClaimTimeout, nil, io.Discard)
 	}()
 	var unblockOnce sync.Once
 	unblockProvider := func() { unblockOnce.Do(func() { close(provider.unblockAnswer) }) }
@@ -2048,14 +3694,20 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 			},
 		},
 	}
-	// Unblock so the loop can proceed to process the second request.
+	// Keep the first resolver active until the overlap error is emitted. The
+	// deferred resolver join cannot complete until the provider is released.
+	select {
+	case <-overlapSeen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("WaitForSession did not reject overlapping request")
+	}
 	unblockProvider()
 
 	var result sessionResult
 	select {
 	case result = <-resultCh:
 	case <-time.After(5 * time.Second):
-		t.Fatal("WaitForSession did not reject overlapping request")
+		t.Fatal("WaitForSession did not finish after rejecting overlapping request")
 	}
 	if closeErr := writer.Close(); closeErr != nil {
 		t.Fatalf("close writer: %v", closeErr)
@@ -2090,6 +3742,154 @@ func TestAutoAnswerSecondRequestWhilePendingEmitsErrorAndExits(t *testing.T) {
 	}
 	if requestCount != 1 {
 		t.Fatalf("permission.request count = %d, want only the first; events: %+v", requestCount, got)
+	}
+}
+
+func TestPermissionRequestConsumesCompletedResolverBeforeReusedID(t *testing.T) {
+	eventsPath := filepath.Join(t.TempDir(), "events.ndjson")
+	writer, err := NewEventWriter(eventsPath)
+	if err != nil {
+		t.Fatalf("newEventWriter: %v", err)
+	}
+
+	provider := newSequentialPermissionProvider()
+	completionSent := make(chan struct{})
+	gateTimedOut := make(chan struct{}, 1)
+	var completionOnce sync.Once
+	sink := &callbackEventSink{
+		EventSink: writer,
+		eventName: "agent.status",
+		field:     "label",
+		value:     "second request",
+		callback: func() {
+			close(provider.releaseFirst)
+			select {
+			case <-completionSent:
+			case <-time.After(5 * time.Second):
+				gateTimedOut <- struct{}{}
+			}
+		},
+	}
+	controlServer := control.NewServer(control.NewState("run_1", "", 0))
+	eventCh := make(chan events.Event, 4)
+	eventCh <- events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_1",
+		Fields: map[string]any{
+			"request_id": "req_reused",
+			"question":   "first request",
+			"options": []any{
+				map[string]any{"optionId": "allow_first", "kind": "allow"},
+			},
+		},
+	}
+	promptDone := make(chan error, 1)
+	resultCh := make(chan sessionResult, 1)
+	go func() {
+		resultCh <- WaitForSession(context.Background(), provider, SessionWaitConfig{
+			EventCh:              eventCh,
+			PromptDone:           promptDone,
+			SessionID:            "ses_1",
+			RunID:                "run_1",
+			PermissionClaimScope: "rt_1",
+			AutoApprove:          true,
+		}, SessionWaitDeps{
+			Writer:        sink,
+			ControlServer: controlServer,
+			Stderr:        io.Discard,
+			permissionResultSent: func() {
+				completionOnce.Do(func() { close(completionSent) })
+			},
+		})
+	}()
+
+	select {
+	case <-provider.firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first permission resolution did not start")
+	}
+
+	// The second waiting status is emitted after the event loop selects request
+	// B but before it checks permissionDone. Its sink callback releases A and
+	// waits until A's buffered completion result is definitely ready, forcing
+	// the regression window without scheduler timing.
+	eventCh <- events.Event{
+		Event:     "permission.request",
+		SessionID: "ses_1",
+		Fields: map[string]any{
+			"request_id": "req_reused",
+			"question":   "second request",
+			"options": []any{
+				map[string]any{"optionId": "allow_second", "kind": "allow"},
+			},
+		},
+	}
+
+	select {
+	case <-provider.secondAnswered:
+	case result := <-resultCh:
+		_ = writer.Close()
+		t.Fatalf("WaitForSession exited before resolving the second request: %+v", result)
+	case <-time.After(5 * time.Second):
+		t.Fatal("second permission resolution did not complete")
+	}
+	select {
+	case <-gateTimedOut:
+		t.Fatal("timed out waiting for the first completion result")
+	default:
+	}
+
+	eventCh <- events.Event{Event: "session.end", SessionID: "ses_1", Fields: map[string]any{"stop_reason": "end_turn"}}
+	promptDone <- nil
+	close(eventCh)
+
+	var result sessionResult
+	select {
+	case result = <-resultCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("WaitForSession did not finish")
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("WaitForSession() = %d, want 0", result.ExitCode)
+	}
+	if got := provider.answers(); len(got) != 2 || got[0] != "req_reused" || got[1] != "req_reused" {
+		t.Fatalf("provider answers = %v, want [req_reused req_reused]", got)
+	}
+
+	var lifecycle []string
+	for _, event := range readEventLogForTest(t, eventsPath) {
+		switch event.Event {
+		case "permission.request":
+			requestID, _ := event.Fields["request_id"].(string)
+			options, _ := event.Fields["options"].([]any)
+			option, _ := options[0].(map[string]any)
+			optionID, _ := option["optionId"].(string)
+			lifecycle = append(lifecycle, event.Event+":"+requestID+":"+optionID)
+		case "permission.response":
+			requestID, _ := event.Fields["request_id"].(string)
+			optionID, _ := event.Fields["option_id"].(string)
+			lifecycle = append(lifecycle, event.Event+":"+requestID+":"+optionID)
+		case "avenor.error":
+			message, _ := event.Fields["message"].(string)
+			if strings.Contains(message, "already pending") {
+				t.Fatalf("completed resolver was reported as overlapping: %+v", event)
+			}
+		}
+	}
+	want := []string{
+		"permission.request:req_reused:allow_first",
+		"permission.response:req_reused:allow_first",
+		"permission.request:req_reused:allow_second",
+		"permission.response:req_reused:allow_second",
+	}
+	if fmt.Sprint(lifecycle) != fmt.Sprint(want) {
+		t.Fatalf("permission lifecycle = %v, want %v", lifecycle, want)
+	}
+	if state := controlServer.PermissionResolverState("rt_1", "req_reused"); state != control.PermissionResolverResolved {
+		t.Fatalf("resolver state = %v, want resolved", state)
 	}
 }
 
@@ -2276,13 +4076,12 @@ func TestControlPermissionClaimDisconnectFallsThrough(t *testing.T) {
 	}
 
 	provider := &cliFakeProvider{}
-	emit := func(events.Event) error { return nil }
 
 	// claimTimeout = 0 means no wall-clock timer; fallback happens only on
 	// client disconnect.
 	resultCh := make(chan permissionResult, 1)
 	go func() {
-		resultCh <- resolvePermission(context.Background(), provider, nil, cs, event, "ses_timeout", "", "req_timeout", false, 0, emit)
+		resultCh <- resolvePermission(context.Background(), provider, nil, cs, event, "ses_timeout", "", "req_timeout", false, 0)
 	}()
 
 	// Wait for the claim to be registered before disconnecting.
@@ -2477,8 +4276,8 @@ func TestPermissionClaimIsReservedBeforeSynchronousRequestSink(t *testing.T) {
 	default:
 		t.Fatal("permission.response was not emitted")
 	}
-	if got := cs.PermissionResolverState("rt_sync", "0"); got != control.PermissionResolverUnknown {
-		t.Fatalf("completed claim state = %v, want removed", got)
+	if got := cs.PermissionResolverState("rt_sync", "0"); got != control.PermissionResolverResolved {
+		t.Fatalf("completed claim state = %v, want resolved", got)
 	}
 }
 
@@ -2520,7 +4319,7 @@ func TestLateControlAnswerIsBlockedWhileFileResolverOwnsRequest(t *testing.T) {
 	}
 	cs.PreparePermissionClaim("rt_file", "0", control.PermissionResolverReserved, nil)
 	go func() {
-		resultCh <- resolvePermission(ctx, provider, handler, cs, event, "ses_file", "rt_file", "0", false, time.Millisecond, nil)
+		resultCh <- resolvePermission(ctx, provider, handler, cs, event, "ses_file", "rt_file", "0", false, time.Millisecond)
 	}()
 
 	deadline := time.Now().Add(time.Second)
@@ -2561,7 +4360,7 @@ func TestFailedAutomaticPermissionRemovesClaim(t *testing.T) {
 			},
 		},
 	}
-	result := resolvePermission(context.Background(), provider, nil, cs, event, "ses_auto", "rt_auto", "0", true, time.Second, nil)
+	result := resolvePermission(context.Background(), provider, nil, cs, event, "ses_auto", "rt_auto", "0", true, time.Second)
 	if result.err == nil {
 		t.Fatal("automatic permission unexpectedly succeeded")
 	}
@@ -2639,13 +4438,12 @@ func TestControlPermissionClaimDisconnectFallsToFileHandler(t *testing.T) {
 	}
 
 	provider := &cliFakeProvider{}
-	emit := func(events.Event) error { return nil }
 
 	// claimTimeout = 0 means no wall-clock timer; fallback happens only on
 	// client disconnect.
 	resultCh := make(chan permissionResult, 1)
 	go func() {
-		resultCh <- resolvePermission(context.Background(), provider, fh, cs, event, "ses_fh", "", "req_fh", false, 0, emit)
+		resultCh <- resolvePermission(context.Background(), provider, fh, cs, event, "ses_fh", "", "req_fh", false, 0)
 	}()
 
 	// Wait for the claim to be registered before disconnecting.
@@ -2718,7 +4516,7 @@ func TestFilePermissionCancelledOutcomeDoesNotError(t *testing.T) {
 	}
 
 	provider := &cliFakeProvider{}
-	res := resolvePermission(context.Background(), provider, fh, nil, event, "ses_fh", "", "req_fh", false, DefaultPermissionClaimTimeout, nil)
+	res := resolvePermission(context.Background(), provider, fh, nil, event, "ses_fh", "", "req_fh", false, DefaultPermissionClaimTimeout)
 
 	if res.err != nil {
 		t.Fatalf("unexpected error: %v", res.err)
@@ -2893,13 +4691,12 @@ func TestControlPermissionClaimContextCancelReleasesClaim(t *testing.T) {
 	}
 
 	provider := &cliFakeProvider{}
-	emit := func(events.Event) error { return nil }
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	resultCh := make(chan permissionResult, 1)
 	go func() {
-		resultCh <- resolvePermission(ctx, provider, nil, cs, event, "ses_cancel", "", "req_cancel", false, claimTimeout, emit)
+		resultCh <- resolvePermission(ctx, provider, nil, cs, event, "ses_cancel", "", "req_cancel", false, claimTimeout)
 	}()
 
 	// Wait for the claim to be registered before cancelling.
@@ -2976,12 +4773,11 @@ func TestControlPermissionClaimExplicitTimeoutFallsThrough(t *testing.T) {
 	}
 
 	provider := &cliFakeProvider{}
-	emit := func(events.Event) error { return nil }
 
 	// With an explicit timeout > 0, the timer fires even though the client
 	// stays connected.
 	start := time.Now()
-	res := resolvePermission(context.Background(), provider, nil, cs, event, "ses_et", "", "req_et", false, claimTimeout, emit)
+	res := resolvePermission(context.Background(), provider, nil, cs, event, "ses_et", "", "req_et", false, claimTimeout)
 	elapsed := time.Since(start)
 
 	// Lower bound: must have waited at least the claim timeout (80ms gives 20ms slack).
@@ -3507,9 +5303,8 @@ func TestWaitForSessionChunkedStatusMarkerDedup(t *testing.T) {
 	}
 }
 
-// TestCancelAndEndIncludesBufferedUsage verifies that when the timeout path
-// fires, cancelAndEnd includes usage accumulated from prior events in the
-// synthetic session.end event.
+// TestCancelAndEndIncludesBufferedUsage verifies that the timeout path includes
+// usage accumulated from prior events in the synthetic session.end event.
 func TestCancelAndEndIncludesBufferedUsage(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")
@@ -3607,8 +5402,8 @@ func TestCancelAndEndIncludesBufferedUsage(t *testing.T) {
 	}
 }
 
-// TestCancelAndEndNilUsage verifies that when timeout fires before any
-// usage-bearing event, cancelAndEnd emits session.end without a usage key.
+// TestCancelAndEndNilUsage verifies that a timeout before any usage-bearing
+// event emits session.end without a usage key.
 func TestCancelAndEndNilUsage(t *testing.T) {
 	dir := t.TempDir()
 	eventsPath := filepath.Join(dir, "events.ndjson")

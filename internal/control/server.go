@@ -2,6 +2,7 @@ package control
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,10 +25,11 @@ const controlIdentityTokenEnv = "AVENOR_CONTROL_IDENTITY_TOKEN"
 
 var dialControlSocket = net.DialTimeout
 
-// These no-op hooks let socket-lifecycle tests coordinate at the lock boundary
-// without changing production lock behavior.
+// These no-op hooks let lifecycle tests coordinate at lock and transition
+// boundaries without changing production behavior.
 var beforeControlSocketLock = func() {}
 var beforeControlSocketCleanup = func() {}
+var beforeDirectPermissionClaimWait = func() {}
 
 type PermissionAnswer struct {
 	RequestID string `json:"request_id"`
@@ -68,7 +70,8 @@ type ControlServer struct {
 	watch      map[chan events.Event]struct{}
 	eventState map[string]*runtimeEventState
 
-	cancelFn func()
+	cancelFn                  func()
+	afterClientDisconnectScan func() // deterministic lifecycle test hook
 
 	pendingMu     sync.Mutex
 	pendingClaims map[permissionClaimKey]*permissionClaim
@@ -334,23 +337,112 @@ const (
 	PermissionResolverResolved
 )
 
+func (s PermissionResolverState) String() string {
+	switch s {
+	case PermissionResolverUnknown:
+		return "unknown"
+	case PermissionResolverReserved:
+		return "reserved"
+	case PermissionResolverControl:
+		return "control"
+	case PermissionResolverAutomatic:
+		return "automatic"
+	case PermissionResolverFile:
+		return "file"
+	case PermissionResolverNoResolver:
+		return "none"
+	case PermissionResolverDirectDelivery:
+		return "direct_delivery"
+	case PermissionResolverResolved:
+		return "resolved"
+	default:
+		return "unknown"
+	}
+}
+
 type permissionClaim struct {
-	state           PermissionResolverState
-	answerCh        chan PermissionAnswer
-	answerQueued    bool
-	disconnectCh    chan struct{} // closed when all clients disconnect while in Reserved/Control state
-	requiresMessage map[string]bool
+	state            PermissionResolverState
+	resolutionSource string
+	answerCh         chan PermissionAnswer
+	answerQueued     bool
+	disconnectCh     chan struct{} // closed when all clients disconnect while in Reserved/Control state
+	requiresMessage  map[string]bool
+	directDone       chan struct{}
+	directAbandoned  bool
 }
 
 // PreparePermissionClaim records resolver ownership before permission.request
 // is published. Terminal entries may be replaced when an ACP session reuses a
 // request ID for a later request.
 func (s *ControlServer) PreparePermissionClaim(scope, requestID string, state PermissionResolverState, options []any) bool {
+	// Serialize Reserved claim creation with the last-client disconnect path.
+	// Otherwise signalClientDisconnect can observe no claim immediately before
+	// this method creates one with an open disconnect channel.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
+	prepared := s.preparePermissionClaimLocked(scope, requestID, state, options)
+	if prepared && state == PermissionResolverReserved && len(s.conns) == 0 {
+		signalPermissionDisconnect(s.pendingClaims[permissionClaimKey{scope: scope, requestID: requestID}])
+	}
+	return prepared
+}
+
+// PreparePermissionClaimAfterDirectDelivery serializes request-ID reuse with a
+// direct provider answer already in flight. It never holds pendingMu while it
+// waits, so provider completion can take the normal writeMu -> controlMu ->
+// pendingMu path before the replacement claim is prepared.
+func (s *ControlServer) PreparePermissionClaimAfterDirectDelivery(ctx context.Context, scope, requestID string, state PermissionResolverState, options []any) bool {
+	return s.PreparePermissionClaimAfterDirectDeliveryWith(ctx, scope, requestID, state, options, nil)
+}
+
+// PreparePermissionClaimAfterDirectDeliveryWith invokes onPrepared while the
+// new claim is still protected by the server and pending-claim locks. The
+// callback must not call ControlServer methods; stable runtimes use it only to
+// publish an exact provider-generation binding before the claim is answerable.
+func (s *ControlServer) PreparePermissionClaimAfterDirectDeliveryWith(ctx context.Context, scope, requestID string, state PermissionResolverState, options []any, onPrepared func()) bool {
+	for {
+		// Use the same s.mu -> pendingMu order as signalClientDisconnect so a
+		// Reserved replacement is either created while a client is live or is
+		// born with its disconnect signal already closed.
+		s.mu.Lock()
+		s.pendingMu.Lock()
+		claim := s.pendingClaims[permissionClaimKey{scope: scope, requestID: requestID}]
+		if claim == nil || claim.state != PermissionResolverDirectDelivery || claim.directDone == nil {
+			prepared := s.preparePermissionClaimLocked(scope, requestID, state, options)
+			if prepared && state == PermissionResolverReserved && len(s.conns) == 0 {
+				signalPermissionDisconnect(s.pendingClaims[permissionClaimKey{scope: scope, requestID: requestID}])
+			}
+			if prepared && onPrepared != nil {
+				onPrepared()
+			}
+			s.pendingMu.Unlock()
+			s.mu.Unlock()
+			return prepared
+		}
+		done := claim.directDone
+		s.pendingMu.Unlock()
+		s.mu.Unlock()
+
+		beforeDirectPermissionClaimWait()
+		select {
+		case <-done:
+			s.pendingMu.Lock()
+			abandoned := claim.directAbandoned
+			s.pendingMu.Unlock()
+			if abandoned {
+				return false
+			}
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+func (s *ControlServer) preparePermissionClaimLocked(scope, requestID string, state PermissionResolverState, options []any) bool {
 	key := permissionClaimKey{scope: scope, requestID: requestID}
-	if existing := s.pendingClaims[key]; existing != nil &&
-		existing.state != PermissionResolverResolved {
+	if existing := s.pendingClaims[key]; existing != nil && existing.state != PermissionResolverResolved {
 		return false
 	}
 	claim := &permissionClaim{
@@ -386,6 +478,44 @@ func (s *ControlServer) SetPermissionResolverState(scope, requestID string, stat
 	}
 }
 
+// MarkPermissionClaimResolved changes claim.state to PermissionResolverResolved.
+// DeliverPendingPermission returns AlreadyResolved for that state.
+// Live-only channels and queued metadata are cleared so the resolved claim
+// cannot be mistaken for a pending request. Channels are safely closed to
+// unblock any lingering waiters before being set to nil.
+func (s *ControlServer) MarkPermissionClaimResolved(scope, requestID, source string) bool {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	claim := s.pendingClaims[permissionClaimKey{scope: scope, requestID: requestID}]
+	if claim == nil {
+		return false
+	}
+	claim.state = PermissionResolverResolved
+	claim.resolutionSource = source
+	finishDirectPermissionClaim(claim)
+	if claim.answerCh != nil {
+		select {
+		case <-claim.answerCh:
+			// drain any queued value; claim is being resolved
+		default:
+		}
+		close(claim.answerCh)
+	}
+	claim.answerCh = nil
+	claim.answerQueued = false
+	if claim.disconnectCh != nil {
+		select {
+		case <-claim.disconnectCh:
+			// already closed by signalClientDisconnect
+		default:
+			close(claim.disconnectCh)
+		}
+	}
+	claim.disconnectCh = nil
+	claim.requiresMessage = nil
+	return true
+}
+
 // RetryDirectPermissionDelivery returns a failed direct delivery to the
 // unowned state. It only changes the exact in-flight claim, so cleanup or a
 // replacement claim cannot be overwritten by a late failure.
@@ -398,6 +528,7 @@ func (s *ControlServer) RetryDirectPermissionDelivery(scope, requestID string) b
 		return false
 	}
 	claim.state = PermissionResolverNoResolver
+	finishDirectPermissionClaim(claim)
 	return true
 }
 
@@ -431,8 +562,9 @@ func (s *ControlServer) HandoffPermissionClaim(scope, requestID string, next Per
 func (s *ControlServer) ClearPermissionClaims(scope string) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	for key := range s.pendingClaims {
+	for key, claim := range s.pendingClaims {
 		if key.scope == scope {
+			abandonDirectPermissionClaim(claim)
 			delete(s.pendingClaims, key)
 		}
 	}
@@ -454,6 +586,11 @@ func (s *ControlServer) PermissionResolverState(scope, requestID string) Permiss
 // fallback handler. Request IDs are only unique within an ACP session, so
 // stable runtimes must use distinct scopes.
 func (s *ControlServer) BeginPermissionClaim(scope, requestID string) (<-chan PermissionAnswer, <-chan struct{}, bool) {
+	// resolvePermission can call Begin directly for an unprepared claim. Keep
+	// that creation atomic with disconnect handling too, using the established
+	// s.mu -> pendingMu lock order.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
 	key := permissionClaimKey{scope: scope, requestID: requestID}
@@ -465,13 +602,46 @@ func (s *ControlServer) BeginPermissionClaim(scope, requestID string) (<-chan Pe
 		return nil, nil, false
 	}
 	claim.state = PermissionResolverControl
+	if len(s.conns) == 0 {
+		signalPermissionDisconnect(claim)
+	}
 	return claim.answerCh, claim.disconnectCh, true
 }
 
 func (s *ControlServer) EndPermissionClaim(scope, requestID string) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	delete(s.pendingClaims, permissionClaimKey{scope: scope, requestID: requestID})
+	key := permissionClaimKey{scope: scope, requestID: requestID}
+	abandonDirectPermissionClaim(s.pendingClaims[key])
+	delete(s.pendingClaims, key)
+}
+
+func finishDirectPermissionClaim(claim *permissionClaim) {
+	if claim == nil || claim.directDone == nil {
+		return
+	}
+	close(claim.directDone)
+	claim.directDone = nil
+}
+
+func abandonDirectPermissionClaim(claim *permissionClaim) {
+	if claim == nil {
+		return
+	}
+	claim.directAbandoned = true
+	finishDirectPermissionClaim(claim)
+}
+
+func signalPermissionDisconnect(claim *permissionClaim) {
+	if claim == nil || claim.disconnectCh == nil {
+		return
+	}
+	select {
+	case <-claim.disconnectCh:
+		// already closed
+	default:
+		close(claim.disconnectCh)
+	}
 }
 
 // signalClientDisconnect closes the disconnect channel for every pending
@@ -489,8 +659,8 @@ func (s *ControlServer) signalClientDisconnect() {
 	// Hold s.mu across the connection check and the channel-close loop so
 	// that no new client can connect (via acceptLoop) and register a claim
 	// (via BeginPermissionClaim) in the gap between the check and closing
-	// disconnect channels. Lock ordering s.mu → pendingMu is safe: no other
-	// code path acquires both locks.
+	// disconnect channels. Claim preparation and admission use the same
+	// s.mu → pendingMu lock order.
 	s.mu.Lock()
 	if len(s.conns) > 0 {
 		s.mu.Unlock()
@@ -499,15 +669,13 @@ func (s *ControlServer) signalClientDisconnect() {
 	s.pendingMu.Lock()
 	for _, claim := range s.pendingClaims {
 		if claim.state == PermissionResolverReserved || claim.state == PermissionResolverControl {
-			select {
-			case <-claim.disconnectCh:
-				// already closed
-			default:
-				close(claim.disconnectCh)
-			}
+			signalPermissionDisconnect(claim)
 		}
 	}
 	s.pendingMu.Unlock()
+	if s.afterClientDisconnectScan != nil {
+		s.afterClientDisconnectScan()
+	}
 	s.mu.Unlock()
 }
 
@@ -524,10 +692,15 @@ func (s *ControlServer) HasPendingPermission() bool {
 	return false
 }
 
-// AnswerPendingPermission delivers an answer to the active permission claim.
-// The bool reports whether the answer was actually delivered.
+// AnswerPendingPermission accepts an answer for the active permission claim.
+// An already-resolved claim is also accepted as a benign no-op.
 func (s *ControlServer) AnswerPendingPermission(scope, requestID, optionID, message string) bool {
-	return s.DeliverPendingPermission(scope, requestID, optionID, message) == PermissionAnswerDelivered
+	switch s.DeliverPendingPermission(scope, requestID, optionID, message) {
+	case PermissionAnswerDelivered, PermissionAnswerAlreadyResolved:
+		return true
+	default:
+		return false
+	}
 }
 
 type PermissionAnswerDelivery uint8
@@ -535,6 +708,7 @@ type PermissionAnswerDelivery uint8
 const (
 	PermissionAnswerNotFound PermissionAnswerDelivery = iota
 	PermissionAnswerDelivered
+	PermissionAnswerAlreadyResolved
 	PermissionAnswerChannelFull
 	PermissionAnswerResolverOwned
 	PermissionAnswerNoResolver
@@ -542,14 +716,17 @@ const (
 )
 
 // DeliverPendingPermission distinguishes a missing claim from a claim that
-// has already accepted an answer. answerQueued remains set after the resolver
-// drains answerCh, making delivery single-use until the claim is ended.
+// has already resolved. It checks claim.state before validating payloads.
+// For PermissionResolverResolved, it returns AlreadyResolved without a provider.
 func (s *ControlServer) DeliverPendingPermission(scope, requestID, optionID, message string) PermissionAnswerDelivery {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
 	claim := s.pendingClaims[permissionClaimKey{scope: scope, requestID: requestID}]
 	if claim == nil {
 		return PermissionAnswerNotFound
+	}
+	if claim.state == PermissionResolverResolved {
+		return PermissionAnswerAlreadyResolved
 	}
 	if claim.requiresMessage != nil {
 		requiresMessage, offered := claim.requiresMessage[optionID]
@@ -561,6 +738,7 @@ func (s *ControlServer) DeliverPendingPermission(scope, requestID, optionID, mes
 	case PermissionResolverReserved, PermissionResolverControl:
 	case PermissionResolverNoResolver:
 		claim.state = PermissionResolverDirectDelivery
+		claim.directDone = make(chan struct{})
 		return PermissionAnswerNoResolver
 	default:
 		return PermissionAnswerResolverOwned
@@ -831,13 +1009,20 @@ func (s *ControlServer) dispatch(c *connState, req Request) Response {
 		if p.RequestID == "" || p.OptionID == "" {
 			return failure(req.ID, -32602, "invalid params", map[string]any{"required": []string{"request_id", "option_id"}})
 		}
+		if s.PermissionResolverState("", p.RequestID) == PermissionResolverResolved {
+			return success(req.ID, map[string]any{"accepted": true})
+		}
 		if err := runtime.ValidatePermissionMessage(p.Message); err != nil {
 			return failure(req.ID, -32602, "invalid params", map[string]any{"detail": err.Error()})
 		}
-		if !s.AnswerPendingPermission("", p.RequestID, p.OptionID, p.Message) {
+		switch delivery := s.DeliverPendingPermission("", p.RequestID, p.OptionID, p.Message); delivery {
+		case PermissionAnswerDelivered, PermissionAnswerAlreadyResolved:
+			return success(req.ID, map[string]any{"accepted": true})
+		case PermissionAnswerNotFound:
+			return failure(req.ID, -32001, "no_pending_permission", nil)
+		default:
 			return failure(req.ID, -32001, "no_pending_permission", nil)
 		}
-		return success(req.ID, map[string]any{"accepted": true})
 	case "prompt":
 		if rtID := runtimeIDFromParams(req.Params); rtID != "" {
 			if s.stableHandler == nil {

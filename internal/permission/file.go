@@ -62,7 +62,10 @@ func NewFileHandler(basePath string) *FileHandler {
 	}
 }
 
-func (h *FileHandler) Handle(ctx context.Context, provider runtime.Provider, event events.Event, emit func(events.Event) error) (Resolution, error) {
+// Handle manages the file protocol for an already-published permission.request.
+// The caller owns event publication so a request receives one effective resolver
+// hint rather than a duplicate normalized event.
+func (h *FileHandler) Handle(ctx context.Context, provider runtime.Provider, event events.Event) (res Resolution, err error) {
 	if h == nil {
 		return Resolution{}, errors.New("permission file handler is nil")
 	}
@@ -91,27 +94,34 @@ func (h *FileHandler) Handle(ctx context.Context, provider runtime.Provider, eve
 		return Resolution{}, err
 	}
 
-	if emit != nil {
-		if err := emit(normalizedPermissionEvent(request)); err != nil {
-			return Resolution{}, err
+	// The .req file is now on disk. Clean it up on any error path so that
+	// callers (including tests using t.TempDir) do not encounter leftover
+	// files when the handler returns with a failure.
+	defer func() {
+		if err != nil {
+			os.Remove(requestPath)
 		}
-	}
-
-	rawResponse, optionID, err := h.waitForResponse(ctx, responsePath)
-	if err != nil {
-		return Resolution{}, err
+	}()
+	rawResponse, optionID, wErr := h.waitForResponse(ctx, responsePath)
+	if wErr != nil {
+		err = wErr
+		return
 	}
 	if rawResponse.Outcome == "cancelled" {
-		return Resolution{RequestID: request.RequestID, OptionID: optionID, Cancelled: true}, nil
+		res = Resolution{RequestID: request.RequestID, OptionID: optionID, Cancelled: true}
+		return
 	}
-	response, err := permissionResponseFromRequest(request.Options, rawResponse, optionID)
-	if err != nil {
-		return Resolution{}, err
+	response, err2 := permissionResponseFromRequest(request.Options, rawResponse, optionID)
+	if err2 != nil {
+		err = err2
+		return
 	}
-	if err := provider.AnswerPermission(ctx, event.SessionID, request.RequestID, response); err != nil {
-		return Resolution{}, err
+	if e := provider.AnswerPermission(ctx, event.SessionID, request.RequestID, response); e != nil {
+		err = e
+		return
 	}
-	return Resolution{RequestID: request.RequestID, OptionID: optionID}, nil
+	res = Resolution{RequestID: request.RequestID, OptionID: optionID}
+	return
 }
 
 func (h *FileHandler) waitForResponse(ctx context.Context, path string) (fileResponse, string, error) {
@@ -266,25 +276,5 @@ func requestFromEvent(event events.Event) FileRequest {
 		Question:  question,
 		Options:   fields["options"],
 		Payload:   fields,
-	}
-}
-
-func normalizedPermissionEvent(request FileRequest) events.Event {
-	fields := map[string]any{
-		"request_id": request.RequestID,
-	}
-	if request.Tool != "" {
-		fields["tool"] = request.Tool
-	}
-	if request.Question != "" {
-		fields["question"] = request.Question
-	}
-	if request.Options != nil {
-		fields["options"] = request.Options
-	}
-	return events.Event{
-		Event:     "permission.request",
-		SessionID: request.SessionID,
-		Fields:    fields,
 	}
 }

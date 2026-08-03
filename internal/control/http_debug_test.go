@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -843,6 +844,83 @@ func TestHTTPAnswerPermissionInvalidUTF8Message(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("POST /answer-permission (invalid UTF-8 message): %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestHTTPAnswerPermissionInvalidAnswer(t *testing.T) {
+	ctrl := NewServer(NewState("run_cli", "", 0))
+	if !ctrl.PreparePermissionClaim("", "req_invalid", PermissionResolverReserved, []any{
+		map[string]any{"optionId": "other", "kind": "allow", "requiresMessage": true},
+	}) {
+		t.Fatal("PreparePermissionClaim returned false")
+	}
+	_, addr, token := startDebugServer(t, ctrl, nil)
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	body := `{"request_id":"req_invalid","option_id":"other"}`
+	resp := authedPostBody(t, client, "http://"+addr+"/answer-permission", token, body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("POST /answer-permission (invalid answer): %d, want 400", resp.StatusCode)
+	}
+	message, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read invalid-answer response: %v", err)
+	}
+	if got, want := string(message), "invalid permission message\n"; got != want {
+		t.Fatalf("invalid-answer response = %q, want %q", got, want)
+	}
+}
+
+func TestHTTPAnswerPermissionNoResolver(t *testing.T) {
+	ctrl := NewServer(NewState("run_cli", "", 0))
+	if !ctrl.PreparePermissionClaim("", "req_direct", PermissionResolverNoResolver, nil) {
+		t.Fatal("PreparePermissionClaim returned false")
+	}
+	_, addr, token := startDebugServer(t, ctrl, nil)
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	body := `{"request_id":"req_direct","option_id":"allow"}`
+	resp := authedPostBody(t, client, "http://"+addr+"/answer-permission", token, body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("POST /answer-permission (no resolver): %d, want 409", resp.StatusCode)
+	}
+	message, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read no-resolver response: %v", err)
+	}
+	if got, want := string(message), "permission handling delegated to provider\n"; got != want {
+		t.Fatalf("no-resolver response = %q, want %q", got, want)
+	}
+	if got := ctrl.PermissionResolverState("", "req_direct"); got != PermissionResolverDirectDelivery {
+		t.Fatalf("PermissionResolverState = %v, want DirectDelivery", got)
+	}
+}
+
+func TestHTTPAnswerPermissionAlreadyResolvedIsAccepted(t *testing.T) {
+	ctrl := NewServer(NewState("run_cli", "", 0))
+	if !ctrl.PreparePermissionClaim("", "req_done", PermissionResolverAutomatic, nil) {
+		t.Fatal("PreparePermissionClaim returned false")
+	}
+	if !ctrl.MarkPermissionClaimResolved("", "req_done", "avenor") {
+		t.Fatal("MarkPermissionClaimResolved returned false")
+	}
+	_, addr, token := startDebugServer(t, ctrl, nil)
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	body := `{"request_id":"req_done","option_id":"stale","message":""}`
+	resp := authedPostBody(t, client, "http://"+addr+"/answer-permission", token, body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /answer-permission (resolved): %d, want 200", resp.StatusCode)
+	}
+	var result map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if result["accepted"] != true {
+		t.Fatalf("response = %#v, want accepted=true", result)
 	}
 }
 

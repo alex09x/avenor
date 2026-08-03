@@ -253,6 +253,390 @@ func TestOwnerRejectionForMutatingMethods(t *testing.T) {
 	}
 }
 
+func TestJSONAnswerPermissionAlreadyResolvedIsAccepted(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	path := testSocketPath(t)
+	if err := s.Start(path); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Stop()
+	if !s.PreparePermissionClaim("", "req_done", PermissionResolverAutomatic, nil) {
+		t.Fatal("PreparePermissionClaim returned false")
+	}
+	if !s.MarkPermissionClaimResolved("", "req_done", "avenor") {
+		t.Fatal("MarkPermissionClaimResolved returned false")
+	}
+
+	conn := mustDial(t, path)
+	defer conn.Close()
+	params, _ := json.Marshal(PermissionAnswer{RequestID: "req_done", OptionID: "stale"})
+	_ = writeReq(t, conn, Request{JSONRPC: "2.0", ID: 1, Method: "answer_permission", Params: params})
+	response := readResp(t, conn)
+	if response.Error != nil {
+		t.Fatalf("resolved answer returned error: %+v", response.Error)
+	}
+	result, ok := response.Result.(map[string]any)
+	if !ok || result["accepted"] != true {
+		t.Fatalf("resolved answer result = %#v, want accepted=true", response.Result)
+	}
+}
+
+func TestPermissionResolverStateString(t *testing.T) {
+	tests := []struct {
+		state PermissionResolverState
+		want  string
+	}{
+		{PermissionResolverUnknown, "unknown"},
+		{PermissionResolverReserved, "reserved"},
+		{PermissionResolverControl, "control"},
+		{PermissionResolverAutomatic, "automatic"},
+		{PermissionResolverFile, "file"},
+		{PermissionResolverNoResolver, "none"},
+		{PermissionResolverDirectDelivery, "direct_delivery"},
+		{PermissionResolverResolved, "resolved"},
+		{PermissionResolverState(255), "unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			if got := tt.state.String(); got != tt.want {
+				t.Fatalf("PermissionResolverState(%d).String() = %q, want %q", tt.state, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMarkPermissionClaimResolvedRetainsTombstone(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	if !s.PreparePermissionClaim("rt_1", "req_1", PermissionResolverAutomatic, []any{
+		map[string]any{"optionId": "allow", "kind": "allow", "requiresMessage": true},
+	}) {
+		t.Fatal("PreparePermissionClaim returned false")
+	}
+	if !s.MarkPermissionClaimResolved("rt_1", "req_1", "avenor") {
+		t.Fatal("MarkPermissionClaimResolved returned false")
+	}
+	if got := s.PermissionResolverState("rt_1", "req_1"); got != PermissionResolverResolved {
+		t.Fatalf("resolver state = %v, want resolved", got)
+	}
+	s.pendingMu.Lock()
+	source := s.pendingClaims[permissionClaimKey{scope: "rt_1", requestID: "req_1"}].resolutionSource
+	s.pendingMu.Unlock()
+	if source != "avenor" {
+		t.Fatalf("resolution source = %q, want avenor", source)
+	}
+	if got := s.DeliverPendingPermission("rt_1", "req_1", "missing", ""); got != PermissionAnswerAlreadyResolved {
+		t.Fatalf("late delivery = %v, want already-resolved", got)
+	}
+	if !s.AnswerPendingPermission("rt_1", "req_1", "missing", "") {
+		t.Fatal("AnswerPendingPermission rejected an already-resolved claim")
+	}
+	if got := s.DeliverPendingPermission("rt_1", "missing", "allow", ""); got != PermissionAnswerNotFound {
+		t.Fatalf("unknown delivery = %v, want not-found", got)
+	}
+}
+
+func TestMarkPermissionClaimResolvedDoubleClose(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	if !s.PreparePermissionClaim("rt_1", "req_1", PermissionResolverAutomatic, nil) {
+		t.Fatal("PreparePermissionClaim returned false")
+	}
+
+	s.pendingMu.Lock()
+	close(s.pendingClaims[permissionClaimKey{scope: "rt_1", requestID: "req_1"}].disconnectCh)
+	s.pendingMu.Unlock()
+
+	if !s.MarkPermissionClaimResolved("rt_1", "req_1", "disconnect") {
+		t.Fatal("MarkPermissionClaimResolved returned false")
+	}
+}
+
+func TestMarkPermissionClaimResolvedConcurrent(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	if !s.PreparePermissionClaim("rt_1", "req_1", PermissionResolverAutomatic, nil) {
+		t.Fatal("PreparePermissionClaim returned false")
+	}
+
+	s.pendingMu.Lock()
+	close(s.pendingClaims[permissionClaimKey{scope: "rt_1", requestID: "req_1"}].disconnectCh)
+	s.pendingMu.Unlock()
+
+	const callers = 8
+	results := make(chan bool, callers)
+	for range callers {
+		go func() {
+			results <- s.MarkPermissionClaimResolved("rt_1", "req_1", "concurrent")
+		}()
+	}
+	for range callers {
+		if !<-results {
+			t.Fatal("MarkPermissionClaimResolved returned false")
+		}
+	}
+	key := permissionClaimKey{scope: "rt_1", requestID: "req_1"}
+	s.pendingMu.Lock()
+	claim := s.pendingClaims[key]
+	s.pendingMu.Unlock()
+	if claim.state != PermissionResolverResolved {
+		t.Fatalf("claim state = %v, want Resolved", claim.state)
+	}
+	if claim.answerCh != nil {
+		t.Fatal("claim.answerCh should be nil after resolution")
+	}
+	if claim.disconnectCh != nil {
+		t.Fatal("claim.disconnectCh should be nil after resolution")
+	}
+	if claim.resolutionSource != "concurrent" {
+		t.Fatalf("claim.resolutionSource = %q, want concurrent", claim.resolutionSource)
+	}
+}
+
+func TestPreparePermissionClaimReplacesResolvedTombstone(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	if !s.PreparePermissionClaim("rt_1", "req_1", PermissionResolverAutomatic, nil) {
+		t.Fatal("initial PreparePermissionClaim returned false")
+	}
+	if !s.MarkPermissionClaimResolved("rt_1", "req_1", "avenor") {
+		t.Fatal("MarkPermissionClaimResolved returned false")
+	}
+	if !s.PreparePermissionClaim("rt_1", "req_1", PermissionResolverFile, nil) {
+		t.Fatal("resolved tombstone was not replaced")
+	}
+	if got := s.PermissionResolverState("rt_1", "req_1"); got != PermissionResolverFile {
+		t.Fatalf("replacement state = %v, want file", got)
+	}
+	if got := s.DeliverPendingPermission("rt_1", "req_1", "allow", ""); got != PermissionAnswerResolverOwned {
+		t.Fatalf("delivery to replacement = %v, want resolver-owned", got)
+	}
+}
+
+func TestPreparePermissionClaimWaitsForDirectCompletionBeforeReusedID(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	if !s.PreparePermissionClaim("rt_1", "reused", PermissionResolverNoResolver, nil) {
+		t.Fatal("initial PreparePermissionClaim returned false")
+	}
+	if got := s.DeliverPendingPermission("rt_1", "reused", "old", ""); got != PermissionAnswerNoResolver {
+		t.Fatalf("direct delivery = %v, want no-resolver", got)
+	}
+
+	origHook := beforeDirectPermissionClaimWait
+	defer func() { beforeDirectPermissionClaimWait = origHook }()
+	waiting := make(chan struct{})
+	releaseWait := make(chan struct{})
+	beforeDirectPermissionClaimWait = func() {
+		close(waiting)
+		<-releaseWait
+	}
+
+	prepared := make(chan bool, 1)
+	go func() {
+		prepared <- s.PreparePermissionClaimAfterDirectDelivery(context.Background(), "rt_1", "reused", PermissionResolverFile, nil)
+	}()
+	<-waiting
+	if !s.MarkPermissionClaimResolved("rt_1", "reused", "direct") {
+		t.Fatal("direct provider completion did not resolve claim")
+	}
+	close(releaseWait)
+	if !<-prepared {
+		t.Fatal("reused request was rejected after direct completion")
+	}
+	if got := s.PermissionResolverState("rt_1", "reused"); got != PermissionResolverFile {
+		t.Fatalf("replacement state = %v, want file", got)
+	}
+}
+
+func TestReservedClaimCreatedAfterCompletedDisconnectScanIsSignalled(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	if err := s.Start(testSocketPath(t)); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer s.Stop()
+	conn, err := net.Dial("unix", s.path)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for !s.HasClients() {
+		if time.Now().After(deadline) {
+			t.Fatal("control client was not registered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	scanned := make(chan struct{})
+	release := make(chan struct{})
+	s.mu.Lock()
+	s.afterClientDisconnectScan = func() {
+		close(scanned)
+		<-release
+	}
+	s.mu.Unlock()
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close client: %v", err)
+	}
+	select {
+	case <-scanned:
+	case <-time.After(time.Second):
+		t.Fatal("last-client disconnect did not complete its claim scan")
+	}
+	// The disconnect scan is complete and found no claims. Let it release the
+	// connection lock, then create the stale Reserved decision from an earlier
+	// HasClients observation. Claim creation itself must inherit disconnection.
+	close(release)
+	if !s.PreparePermissionClaim("rt_1", "req_gap", PermissionResolverReserved, nil) {
+		t.Fatal("PreparePermissionClaim returned false")
+	}
+	_, disconnectCh, ok := s.BeginPermissionClaim("rt_1", "req_gap")
+	if !ok {
+		t.Fatal("BeginPermissionClaim returned false")
+	}
+	select {
+	case <-disconnectCh:
+	default:
+		t.Fatal("Reserved claim created after disconnect scan was not signalled")
+	}
+}
+
+func TestPermissionClaimsCreatedWithoutClientsSignalDisconnect(t *testing.T) {
+	t.Run("direct begin", func(t *testing.T) {
+		s := NewServer(NewState("run_1", "", 0))
+		_, disconnectCh, ok := s.BeginPermissionClaim("rt_1", "direct")
+		if !ok {
+			t.Fatal("BeginPermissionClaim returned false")
+		}
+		select {
+		case <-disconnectCh:
+		default:
+			t.Fatal("unprepared claim did not inherit the no-client disconnect state")
+		}
+	})
+
+	t.Run("replacement after direct delivery", func(t *testing.T) {
+		s := NewServer(NewState("run_1", "", 0))
+		if !s.PreparePermissionClaim("rt_1", "reused", PermissionResolverNoResolver, nil) {
+			t.Fatal("initial PreparePermissionClaim returned false")
+		}
+		if got := s.DeliverPendingPermission("rt_1", "reused", "old", ""); got != PermissionAnswerNoResolver {
+			t.Fatalf("direct delivery = %v, want no-resolver", got)
+		}
+
+		origHook := beforeDirectPermissionClaimWait
+		defer func() { beforeDirectPermissionClaimWait = origHook }()
+		waiting := make(chan struct{})
+		beforeDirectPermissionClaimWait = func() { close(waiting) }
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		prepared := make(chan bool, 1)
+		go func() {
+			prepared <- s.PreparePermissionClaimAfterDirectDelivery(ctx, "rt_1", "reused", PermissionResolverReserved, nil)
+		}()
+		select {
+		case <-waiting:
+		case <-time.After(time.Second):
+			t.Fatal("replacement did not begin waiting for direct completion")
+		}
+		if !s.MarkPermissionClaimResolved("rt_1", "reused", "direct") {
+			t.Fatal("direct provider completion did not resolve claim")
+		}
+		select {
+		case ok := <-prepared:
+			if !ok {
+				t.Fatal("replacement claim was not prepared")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("replacement claim did not finish after direct completion")
+		}
+		_, disconnectCh, ok := s.BeginPermissionClaim("rt_1", "reused")
+		if !ok {
+			t.Fatal("BeginPermissionClaim returned false for replacement")
+		}
+		select {
+		case <-disconnectCh:
+		default:
+			t.Fatal("replacement claim did not inherit the no-client disconnect state")
+		}
+	})
+}
+
+func TestPreparePermissionClaimAfterDirectDeliveryCancellation(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	if !s.PreparePermissionClaim("rt_1", "reused", PermissionResolverNoResolver, nil) {
+		t.Fatal("initial PreparePermissionClaim returned false")
+	}
+	if got := s.DeliverPendingPermission("rt_1", "reused", "old", ""); got != PermissionAnswerNoResolver {
+		t.Fatalf("direct delivery = %v, want no-resolver", got)
+	}
+
+	origHook := beforeDirectPermissionClaimWait
+	defer func() { beforeDirectPermissionClaimWait = origHook }()
+	waiting := make(chan struct{})
+	beforeDirectPermissionClaimWait = func() { close(waiting) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prepared := make(chan bool, 1)
+	go func() {
+		prepared <- s.PreparePermissionClaimAfterDirectDelivery(ctx, "rt_1", "reused", PermissionResolverFile, nil)
+	}()
+	select {
+	case <-waiting:
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not begin waiting for direct completion")
+	}
+	cancel()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("context did not cancel while waiting for direct completion")
+	}
+	select {
+	case got := <-prepared:
+		if got {
+			t.Fatal("replacement succeeded after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not return after cancellation")
+	}
+	if got := s.PermissionResolverState("rt_1", "reused"); got != PermissionResolverDirectDelivery {
+		t.Fatalf("resolver state after cancellation = %v, want direct-delivery", got)
+	}
+	if !s.MarkPermissionClaimResolved("rt_1", "reused", "direct") {
+		t.Fatal("direct provider completion did not resolve claim")
+	}
+}
+
+func TestPreparePermissionClaimAfterDirectDeliveryAbandoned(t *testing.T) {
+	s := NewServer(NewState("run_1", "", 0))
+	if !s.PreparePermissionClaim("rt_1", "reused", PermissionResolverNoResolver, nil) {
+		t.Fatal("initial PreparePermissionClaim returned false")
+	}
+	if got := s.DeliverPendingPermission("rt_1", "reused", "old", ""); got != PermissionAnswerNoResolver {
+		t.Fatalf("direct delivery = %v, want no-resolver", got)
+	}
+
+	origHook := beforeDirectPermissionClaimWait
+	defer func() { beforeDirectPermissionClaimWait = origHook }()
+	waiting := make(chan struct{})
+	beforeDirectPermissionClaimWait = func() { close(waiting) }
+
+	prepared := make(chan bool, 1)
+	go func() {
+		prepared <- s.PreparePermissionClaimAfterDirectDelivery(context.Background(), "rt_1", "reused", PermissionResolverFile, nil)
+	}()
+	<-waiting
+	s.EndPermissionClaim("rt_1", "reused")
+	select {
+	case got := <-prepared:
+		if got {
+			t.Fatal("replacement succeeded after abandon")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not return after abandon")
+	}
+	if got := s.PermissionResolverState("rt_1", "reused"); got != PermissionResolverUnknown {
+		t.Fatalf("resolver state after abandon = %v, want Unknown", got)
+	}
+}
+
 func TestAnswerPendingPermissionDeliversMatchingAnswer(t *testing.T) {
 	s := NewServer(NewState("run_1", "", 0))
 	answerCh, _, ok := s.BeginPermissionClaim("", "req_1")
@@ -432,6 +816,7 @@ func TestPreparePermissionClaimRejectsExistingNoResolver(t *testing.T) {
 func TestClearPermissionClaimsRemovesOnlyRequestedScope(t *testing.T) {
 	s := NewServer(NewState("run_1", "", 0))
 	s.PreparePermissionClaim("rt_1", "0", PermissionResolverFile, nil)
+	s.MarkPermissionClaimResolved("rt_1", "0", "file")
 	s.PreparePermissionClaim("rt_2", "0", PermissionResolverFile, nil)
 	s.ClearPermissionClaims("rt_1")
 	if got := s.PermissionResolverState("rt_1", "0"); got != PermissionResolverUnknown {
