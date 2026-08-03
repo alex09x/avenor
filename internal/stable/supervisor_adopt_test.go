@@ -16,6 +16,38 @@ import (
 	"github.com/sdougbrown/avenor/internal/teamrunner"
 )
 
+// adoptChildSessionID preserves the pre-attempt-token test API. Production
+// ownership is registered explicitly and never depends on the aggregate child.
+func (s *Supervisor) adoptChildSessionID(child *childRuntime, provider runtime.Provider, expectedOldID, externalID string) bool {
+	s.sessionIdentityMu.RLock()
+	attempt := s.sessionOwners[expectedOldID]
+	s.sessionIdentityMu.RUnlock()
+	if attempt == nil {
+		child.mu.Lock()
+		if child.provider != provider || child.session.SessionID != expectedOldID {
+			child.mu.Unlock()
+			return false
+		}
+		identity := effectiveIdentity{
+			Backend: child.effectiveBackend, Agent: child.effectiveAgent, Model: child.effectiveModel,
+			AgentProfile: child.agentProfile, RosterFile: child.rosterFile, RosterEntry: child.rosterEntry,
+		}
+		child.mu.Unlock()
+		if mapped, ok := s.sessionIdentity(expectedOldID); ok {
+			identity = mapped
+		}
+		var err error
+		attempt, err = s.registerSessionAttempt(expectedOldID, identity, provider, expectedOldID)
+		if err != nil {
+			return false
+		}
+	}
+	if attempt.provider != provider {
+		return false
+	}
+	return s.adoptSessionAttempt(child, attempt, expectedOldID, externalID)
+}
+
 // newDeferredChild builds a childRuntime backed by a stableDeferredProvider
 // whose spawn-time session id is provisional. The child is registered with the
 // supervisor so RuntimeStatus/List reflect its aggregate state.
@@ -284,6 +316,113 @@ func TestSessionStartUpdatesChildBeforeEventForwarding(t *testing.T) {
 	}
 	if len(sink.events) == 0 || sink.events[0].Event != "session.start" {
 		t.Fatalf("first forwarded event = %#v", sink.events)
+	}
+}
+
+func TestRunChildSessionIDConflictIsFatalWithRetriesEnabled(t *testing.T) {
+	sup := NewSupervisor(Config{ControlSocket: "/tmp/test-direct-conflict-fatal.sock", MaxRuntimes: 1})
+	sup.rememberSessionIdentity("occupied", effectiveIdentity{Backend: "agy", Agent: "owner"}, nil)
+	provider := &stableDeferredProvider{
+		provisionalID: "pending-direct-conflict",
+		realID:        "occupied",
+		backend:       "agy",
+		events:        deferredStartEndEvents("occupied", nil),
+	}
+	sentinelPath := filepath.Join(t.TempDir(), "direct-conflict.env")
+	child := &childRuntime{
+		id: "rt_direct_conflict", label: "direct-conflict", provider: provider,
+		session:     runtime.Session{SessionID: provider.provisionalID, Backend: "agy"},
+		eventWriter: stableTestSink{}, sentinelFile: sentinelPath,
+		done: make(chan struct{}), promptCh: make(chan struct{}, 1), promptQueue: []string{"must not run"}, runID: sup.runID,
+	}
+	sup.runtimes[child.id] = child
+
+	sup.runChild(context.Background(), child, "conflict", 0, 3)
+
+	provider.mu.Lock()
+	prompts, resumes := provider.prompts, provider.resumes
+	provider.mu.Unlock()
+	if prompts != 1 || resumes != 0 {
+		t.Fatalf("prompts=%d resumes=%d, want one fatal attempt and no provisional resume", prompts, resumes)
+	}
+	child.mu.Lock()
+	exitCode := child.exitCode
+	child.mu.Unlock()
+	if exitCode != 1 {
+		t.Fatalf("exitCode = %d, want 1", exitCode)
+	}
+	if content := readSentinel(t, sentinelPath); !strings.Contains(content, "STOP_REASON="+runtime.SessionIDConflictStopReason+"\n") {
+		t.Fatalf("sentinel = %q, want explicit fatal conflict", content)
+	}
+}
+
+func TestRunLoopChildSessionIDConflictIsFatalWithRetriesEnabled(t *testing.T) {
+	sup := NewSupervisor(Config{ControlSocket: "/tmp/test-loop-conflict-fatal.sock", MaxRuntimes: 1})
+	sup.rememberSessionIdentity("occupied", effectiveIdentity{Backend: "agy", Agent: "owner"}, nil)
+	provider := &stableDeferredProvider{
+		provisionalID: "pending-loop-conflict", realID: "occupied", backend: "agy",
+		events: deferredStartEndEvents("occupied", nil),
+	}
+	factoryCalls := 0
+	sup.newProviderFunc = func(runtime.StartOptions, string) (runtime.Provider, error) {
+		factoryCalls++
+		return provider, nil
+	}
+	child := &childRuntime{
+		id: "rt_loop_conflict", label: "loop-conflict", eventWriter: stableTestSink{},
+		done: make(chan struct{}), promptCh: make(chan struct{}, 1), cancelFn: func() {}, runID: sup.runID,
+	}
+	sup.runtimes[child.id] = child
+	cfg := &looprunner.LoopConfig{MaxIterations: 1, Pre: []phaseconfig.Phase{{Name: "conflict", Prompt: "conflict"}}}
+
+	sup.runLoopChild(context.Background(), child, cfg, 3, "", "", "", "", "", "agy")
+
+	provider.mu.Lock()
+	prompts, resumes := provider.prompts, provider.resumes
+	provider.mu.Unlock()
+	if factoryCalls != 1 || prompts != 1 || resumes != 0 {
+		t.Fatalf("factory=%d prompts=%d resumes=%d, want one fatal attempt", factoryCalls, prompts, resumes)
+	}
+	child.mu.Lock()
+	exitCode := child.exitCode
+	child.mu.Unlock()
+	if exitCode != 1 {
+		t.Fatalf("exitCode = %d, want 1", exitCode)
+	}
+}
+
+func TestRunTeamChildSessionIDConflictIsFatalWithRetriesEnabled(t *testing.T) {
+	sup := NewSupervisor(Config{ControlSocket: "/tmp/test-team-conflict-fatal.sock", MaxRuntimes: 1})
+	sup.rememberSessionIdentity("occupied", effectiveIdentity{Backend: "agy", Agent: "owner"}, nil)
+	provider := &stableDeferredProvider{
+		provisionalID: "pending-team-conflict", realID: "occupied", backend: "agy",
+		events: deferredStartEndEvents("occupied", nil),
+	}
+	factoryCalls := 0
+	sup.newProviderFunc = func(runtime.StartOptions, string) (runtime.Provider, error) {
+		factoryCalls++
+		return provider, nil
+	}
+	child := &childRuntime{
+		id: "rt_team_conflict", label: "team-conflict", eventWriter: stableTestSink{},
+		done: make(chan struct{}), promptCh: make(chan struct{}, 1), cancelFn: func() {}, runID: sup.runID,
+	}
+	sup.runtimes[child.id] = child
+	cfg := &teamrunner.TeamConfig{Pre: []phaseconfig.Phase{{Name: "conflict", Prompt: "conflict"}}}
+
+	sup.runTeamChild(context.Background(), child, cfg, 3, "", "", "", "", "", "agy")
+
+	provider.mu.Lock()
+	prompts, resumes := provider.prompts, provider.resumes
+	provider.mu.Unlock()
+	if factoryCalls != 1 || prompts != 1 || resumes != 0 {
+		t.Fatalf("factory=%d prompts=%d resumes=%d, want one fatal attempt", factoryCalls, prompts, resumes)
+	}
+	child.mu.Lock()
+	exitCode := child.exitCode
+	child.mu.Unlock()
+	if exitCode != 1 {
+		t.Fatalf("exitCode = %d, want 1", exitCode)
 	}
 }
 
@@ -701,15 +840,14 @@ func TestRunTeamChildStaleAttemptCleanupDoesNotEraseNewerSession(t *testing.T) {
 	close(endRelease)
 	waitForStableDone(t, child)
 
-	assertChildSessionID(t, child, "conv-team-newer")
+	// Workflow finalization is authoritative over the transient aggregate slot:
+	// the configured phase completed with the older provider's adopted session.
+	assertChildSessionID(t, child, realID)
 	child.mu.Lock()
-	providerIsNewer := child.provider == newer
+	provider := child.provider
 	pid := child.session.PID
 	child.mu.Unlock()
-	if !providerIsNewer {
-		t.Fatalf("stale older attempt erased newer provider/session; provider = %v", child.provider)
-	}
-	if pid != 9449 {
-		t.Fatalf("newer session pid = %d, want 9449", pid)
+	if provider != nil || pid != 0 {
+		t.Fatalf("completed workflow retained live provider state: provider=%v pid=%d", provider, pid)
 	}
 }

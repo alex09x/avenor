@@ -2,16 +2,8 @@ import { Supervisor } from '../supervisor.js'
 import { getSupervisorClient } from './get-supervisor-client.js'
 import { asRecord, stringField } from '../value-fields.js'
 import { validateRunId } from './validate.js'
-
-function findRunByLabel(sup: Supervisor, runId: string): { label: string; runtimeId?: string } | undefined {
-  const runs = (sup as any).runs as Map<string, { label: string; runtimeId?: string }>
-  const byKey = runs.get(runId)
-  if (byKey) return byKey
-  for (const info of runs.values()) {
-    if (info.label === runId) return info
-  }
-  return undefined
-}
+import { findExternalRun } from './run-registry.js'
+import { findLocalRunByReference } from './run-resolution.js'
 
 export function pendingPermissionRequestID(liveStatus: unknown): string | undefined {
   const status = asRecord(liveStatus)
@@ -42,7 +34,11 @@ export async function answerPermissionTool(args: {
 
   try {
     validateRunId(args.runId)
-    const runInfo = sup ? findRunByLabel(sup, args.runId) : undefined
+    const runInfo = sup
+      ? findLocalRunByReference(sup, args.runId)
+      : supervisorId
+        ? findExternalRun(supervisorId, args.runId)
+        : undefined
     const runtimeId = runInfo?.runtimeId ?? args.runId
     if (!requestId) {
       const liveStatus = await client.status(runtimeId)

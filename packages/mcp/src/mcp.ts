@@ -13,6 +13,7 @@ import {
   followUpTool,
   eventsTool,
   shutdownTool,
+  validateSpawnSelection,
 } from '@dougbots/avenor-core'
 
 const LOCALHOST_ORIGINS = new Set(['localhost', '127.0.0.1', '[::1]'])
@@ -72,9 +73,19 @@ server.registerTool('avenor_spawn', {
   model,
   thinking,
   backend,
+  roster_file,
+  roster_entry,
   server_url,
   supervisor_id,
 }) => {
+  validateSpawnSelection({
+    agent,
+    model,
+    backend,
+    roster_file,
+    roster_entry,
+  })
+
   return spawnTool({
     agent,
     dir: repo_dir,
@@ -85,6 +96,8 @@ server.registerTool('avenor_spawn', {
     model,
     thinking,
     backend,
+    rosterFile: roster_file,
+    rosterEntry: roster_entry,
     serverUrl: server_url,
     supervisorId: supervisor_id,
   })

@@ -1,32 +1,25 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import * as crypto from 'node:crypto'
-import { Supervisor, type RunInfo } from '../supervisor.js'
-import type { ThinkingLevel } from '../client.js'
+import { Supervisor, retainLiveIdentity, type RunInfo } from '../supervisor.js'
+import type { SpawnParams, ThinkingLevel } from '../client.js'
 import { ensureRunPaths, runsRoot } from '../paths.js'
 import { validateRunId } from './validate.js'
 import { getSupervisorClient as realGetSupervisorClient } from './get-supervisor-client.js'
+import { findExternalRun, registerExternalRun } from './run-registry.js'
+import { findLocalRunByReference } from './run-resolution.js'
 
-interface FollowUpToolArgs {
+export interface FollowUpToolArgs {
   runId: string
   message: string
   label?: string
   supervisorId?: string
 }
 
-interface FollowUpToolResult {
+export interface FollowUpToolResult {
   run_id: string
   label: string
-}
-
-function findRunByLabel(sup: Supervisor, runId: string): RunInfo | undefined {
-  const runs = (sup as any).runs as Map<string, RunInfo>
-  const byKey = runs.get(runId)
-  if (byKey) return byKey
-  for (const info of runs.values()) {
-    if (info.label === runId) return info
-  }
-  return undefined
+  runtime_id?: string
 }
 
 function resolveAutoApprove(
@@ -38,11 +31,26 @@ function resolveAutoApprove(
   return typeof runInfo?.autoApprove === 'boolean' ? runInfo.autoApprove : undefined
 }
 
-function requireResumableAgent(agent: string | undefined): string {
-  if (agent === undefined) {
-    throw new Error('run has no agent to resume')
+function value(candidate: unknown): string | undefined {
+  return typeof candidate === 'string' && candidate.length > 0 ? candidate : undefined
+}
+
+function resolvedIdentity(
+  liveStatus: Record<string, unknown> | null,
+  effectiveKey: string,
+  directKey: string,
+  fallbackEffective: string | undefined,
+  fallbackDirect: string | undefined,
+): string | undefined {
+  // A live empty string is authoritative too: agent-only/model-only/defaulted
+  // sessions must clear stale run-level fallback fields on follow-up.
+  if (liveStatus && typeof liveStatus[effectiveKey] === 'string') {
+    return value(liveStatus[effectiveKey])
   }
-  return agent
+  if (liveStatus && typeof liveStatus[directKey] === 'string') {
+    return value(liveStatus[directKey])
+  }
+  return fallbackEffective ?? fallbackDirect
 }
 
 async function parseSentinel(filePath: string): Promise<Record<string, string> | null> {
@@ -66,19 +74,32 @@ async function parseSentinel(filePath: string): Promise<Record<string, string> |
   }
 }
 
+function rejectSessionConflict(
+  sentinel: Record<string, string> | null,
+  liveStatus: Record<string, unknown> | null,
+): void {
+  const sentinelStopReason = value(sentinel?.STOP_REASON)
+  const liveStopReason = value(liveStatus?.stop_reason)
+  if (sentinelStopReason === 'session_id_conflict' || liveStopReason === 'session_id_conflict') {
+    throw new Error('run is not resumable: session_id_conflict')
+  }
+}
+
 async function executeFollowUpTool(
   args: FollowUpToolArgs,
   getSupervisorClient: typeof realGetSupervisorClient,
 ): Promise<FollowUpToolResult> {
   if (args.supervisorId) {
-    const { client, isSingleton, sup } = await getSupervisorClient(args.supervisorId)
+    const { client, isSingleton, sup, supervisorId } = await getSupervisorClient(args.supervisorId)
     try {
       validateRunId(args.runId)
 
       // Try to resolve the run via the local supervisor's run map first
       let runInfo: RunInfo | undefined
       if (isSingleton && sup) {
-        runInfo = findRunByLabel(sup, args.runId)
+        runInfo = findLocalRunByReference(sup, args.runId)
+      } else {
+        runInfo = findExternalRun(supervisorId, args.runId)
       }
       const fallbackSessionId = runInfo?.sessionId
 
@@ -91,8 +112,10 @@ async function executeFollowUpTool(
 
       const sentinelPath =
         (liveStatus?.sentinel_file as string | undefined) ??
+        runInfo?.sentinelPath ??
         path.join(runsRoot(), args.runId, 'sentinel.done')
       const sentinel = await parseSentinel(sentinelPath)
+      rejectSessionConflict(sentinel, liveStatus)
       const sessionId =
         sentinel?.SESSION ??
         (liveStatus?.session_id as string | undefined) ??
@@ -101,14 +124,31 @@ async function executeFollowUpTool(
         throw new Error('run has no session to resume')
       }
 
-      // Prefer live supervisor metadata, then the local run map, so an
-      // explicit supervisor retains the original runtime context as well.
-      const agent = requireResumableAgent(
-        (liveStatus?.agent as string | undefined) ?? runInfo?.agent,
+      // Prefer the supervisor's resolved identity, then local metadata. Never
+      // send the roster selector on a follow-up: the original resolved values
+      // are immutable for this continuation.
+      const agent = resolvedIdentity(
+        liveStatus,
+        'effective_agent',
+        'agent',
+        runInfo?.effectiveAgent,
+        runInfo?.agent,
       )
-      const backend =
-        (liveStatus?.backend as string | undefined) ?? runInfo?.backend
-      const model = (liveStatus?.model as string | undefined) ?? runInfo?.model
+      const model = resolvedIdentity(
+        liveStatus,
+        'effective_model',
+        'model',
+        runInfo?.effectiveModel,
+        runInfo?.model,
+      )
+      const backend = resolvedIdentity(
+        liveStatus,
+        'effective_backend',
+        'backend',
+        runInfo?.effectiveBackend,
+        runInfo?.backend,
+      )
+      if (runInfo && liveStatus) retainLiveIdentity(runInfo, liveStatus)
       const thinking = (liveStatus?.thinking as ThinkingLevel | undefined) ?? runInfo?.thinking
       const dir = (liveStatus?.dir as string | undefined) ?? runInfo?.dir
       const agentProfile =
@@ -117,17 +157,12 @@ async function executeFollowUpTool(
 
       const followUpRunId = crypto.randomUUID()
       const followUpLabel = args.label ?? `${args.runId}-followup`
-      const { sentinelPath: followUpSentinelPath, eventLogPath } =
-        ensureRunPaths(followUpRunId)
-
-      const spawnParams: Record<string, unknown> = {
-        agent,
+      const spawnParams: SpawnParams = {
         prompt: args.message,
         label: followUpLabel,
         session_id: sessionId,
-        sentinel_file: followUpSentinelPath,
-        on_event: eventLogPath,
       }
+      if (agent) spawnParams.agent = agent
       if (backend) spawnParams.backend = backend
       if (model) spawnParams.model = model
       if (thinking) spawnParams.thinking = thinking
@@ -135,14 +170,52 @@ async function executeFollowUpTool(
       if (agentProfile) spawnParams.agent_profile = agentProfile
       if (autoApprove === true) spawnParams.auto_approve = true
 
+      if (isSingleton && sup) {
+        const followUpRun = await sup.spawn(spawnParams, followUpRunId, {
+          rosterFile: runInfo?.rosterFile,
+          rosterEntry: runInfo?.rosterEntry,
+          effectiveAgent: agent,
+          effectiveModel: model,
+          effectiveBackend: backend,
+        })
+        return {
+          run_id: followUpRun.runId,
+          label: followUpRun.label,
+          runtime_id: followUpRun.runtimeId,
+        }
+      }
+
+      const { sentinelPath: followUpSentinelPath, eventLogPath } =
+        ensureRunPaths(followUpRunId)
+      spawnParams.sentinel_file = followUpSentinelPath
+      spawnParams.on_event = eventLogPath
       const result = await client.spawn(spawnParams)
-      // With an external supervisor there is no local Supervisor.run map to
-      // translate our filesystem UUID back to the control-plane runtime. As
-      // spawnTool does, expose the runtime ID so status/permission calls can
-      // address the follow-up directly.
-      return {
-        run_id: (result.runtime_id as string | undefined) ?? followUpRunId,
+      const runtimeId = value(result.runtime_id)
+      registerExternalRun({
+        runId: followUpRunId,
         label: followUpLabel,
+        supervisorId,
+        sentinelPath: followUpSentinelPath,
+        eventLogPath,
+        runtimeId,
+        sessionId: value(result.session_id) ?? sessionId,
+        agent,
+        model,
+        backend,
+        effectiveAgent: agent,
+        effectiveModel: model,
+        effectiveBackend: backend,
+        rosterFile: runInfo?.rosterFile,
+        rosterEntry: runInfo?.rosterEntry,
+        thinking,
+        dir,
+        agentProfile,
+        autoApprove,
+      })
+      return {
+        run_id: followUpRunId,
+        label: followUpLabel,
+        runtime_id: runtimeId,
       }
     } finally {
       if (!isSingleton) {
@@ -152,13 +225,14 @@ async function executeFollowUpTool(
   }
 
   const sup = await Supervisor.get()
-  const runInfo = findRunByLabel(sup, args.runId)
+  const runInfo = findLocalRunByReference(sup, args.runId)
 
   if (!runInfo) {
     throw new Error(`run not found: ${args.runId}`)
   }
 
   const sentinel = await parseSentinel(runInfo.sentinelPath)
+  rejectSessionConflict(sentinel, null)
   const sessionId = sentinel?.SESSION ?? runInfo.sessionId
 
   if (!sessionId) {
@@ -177,11 +251,29 @@ async function executeFollowUpTool(
       // Stored metadata still permits a follow-up when status is unavailable.
     }
   }
-  const agent = requireResumableAgent(
-    (liveStatus?.agent as string | undefined) ?? runInfo.agent,
+  rejectSessionConflict(sentinel, liveStatus)
+  const agent = resolvedIdentity(
+    liveStatus,
+    'effective_agent',
+    'agent',
+    runInfo.effectiveAgent,
+    runInfo.agent,
   )
-  const backend = (liveStatus?.backend as string | undefined) ?? runInfo.backend
-  const model = (liveStatus?.model as string | undefined) ?? runInfo.model
+  const model = resolvedIdentity(
+    liveStatus,
+    'effective_model',
+    'model',
+    runInfo.effectiveModel,
+    runInfo.model,
+  )
+  const backend = resolvedIdentity(
+    liveStatus,
+    'effective_backend',
+    'backend',
+    runInfo.effectiveBackend,
+    runInfo.backend,
+  )
+  if (liveStatus) retainLiveIdentity(runInfo, liveStatus)
   const thinking = (liveStatus?.thinking as ThinkingLevel | undefined) ?? runInfo.thinking
   const dir = (liveStatus?.dir as string | undefined) ?? runInfo.dir
   const agentProfile =
@@ -190,20 +282,31 @@ async function executeFollowUpTool(
 
   const followUpLabel = args.label ?? `${runInfo.label}-followup`
 
-  const followUpRun = await sup.spawn({
-    agent,
-    backend,
-    model,
-    thinking,
-    dir,
-    agent_profile: agentProfile,
+  const followUpParams: SpawnParams = {
+    ...(agent ? { agent } : {}),
+    ...(backend ? { backend } : {}),
+    ...(model ? { model } : {}),
+    ...(thinking ? { thinking } : {}),
+    ...(dir ? { dir } : {}),
+    ...(agentProfile ? { agent_profile: agentProfile } : {}),
     prompt: args.message,
     session_id: sessionId,
     label: followUpLabel,
     ...(autoApprove === true ? { auto_approve: true } : {}),
+  }
+  const followUpRun = await sup.spawn(followUpParams, undefined, {
+    rosterFile: runInfo.rosterFile,
+    rosterEntry: runInfo.rosterEntry,
+    effectiveAgent: agent,
+    effectiveModel: model,
+    effectiveBackend: backend,
   })
 
-  return { run_id: followUpRun.runId, label: followUpRun.label }
+  return {
+    run_id: followUpRun.runId,
+    label: followUpRun.label,
+    runtime_id: followUpRun.runtimeId,
+  }
 }
 
 export function createFollowUpTool(

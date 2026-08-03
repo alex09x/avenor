@@ -20,6 +20,7 @@ import (
 	"github.com/sdougbrown/avenor/internal/looprunner"
 	"github.com/sdougbrown/avenor/internal/permission"
 	"github.com/sdougbrown/avenor/internal/phaseconfig"
+	"github.com/sdougbrown/avenor/internal/rosterconfig"
 	"github.com/sdougbrown/avenor/internal/runtime"
 	"github.com/sdougbrown/avenor/internal/runtime/pony"
 	"github.com/sdougbrown/avenor/internal/runtime/pony/model/openai"
@@ -107,6 +108,8 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	permClaimTimeout := fs.Duration("permission-claim-timeout", 0, "how long to wait for a connected socket client to answer a permission request before falling through to the file handler or 'none' resolver (0 = disabled: fall through only when all clients disconnect; use a non-zero value for unattended automation where client processes may hang)")
 	loopFile := fs.String("loop-file", "", "path to loop config JSON (optional; enables multi-phase mode)")
 	teamFile := fs.String("team-file", "", "path to team config JSON (optional; enables parallel-team mode)")
+	rosterFile := fs.String("roster-file", "", "path to roster JSON (direct selector or workflow fallback)")
+	rosterEntry := fs.String("roster-entry", "", "roster entry name for direct selection")
 	ponyConfig := fs.String("pony-config", "", "path to pony backend JSON config (required for --backend pony)")
 
 	if err := fs.Parse(args); err != nil {
@@ -117,6 +120,14 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	if runID == "" {
 		runID = GenerateRunID()
 	}
+
+	workflowMode := *loopFile != "" || *teamFile != ""
+	backendExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "backend" {
+			backendExplicit = true
+		}
+	})
 
 	// finalSessionID is updated after each attempt so exitWithSentinel always
 	// writes the most recent session ID regardless of which return path fires.
@@ -134,29 +145,70 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		return code
 	}
 
-	discovery := DiscoverServer(*serverURL, getenv)
-	switch *backend {
-	case backendPony:
-	case backendOpenCodeACP:
-	case backendGeminiACP:
-	case backendAgy:
-	case backendCursorACP:
-	case backendOpenCodeHTTP:
-		if discovery.URL == "" {
-			fmt.Fprintf(stderr, "avenor: --server-url is required for backend opencode-http\n")
+	if workflowMode {
+		if *rosterEntry != "" {
+			fmt.Fprintln(stderr, "avenor: --roster-entry is not valid with --loop-file or --team-file")
 			return exitWithSentinel(1)
 		}
-	case backendCodexAppServer:
-	case backendClaude:
-	case backendClaudeChannel:
-	case backendPi:
-	default:
-		fmt.Fprintf(stderr, "avenor: unknown backend %q\n", *backend)
-		return exitWithSentinel(1)
+	} else if *rosterFile != "" || *rosterEntry != "" {
+		if *rosterFile == "" || *rosterEntry == "" {
+			fmt.Fprintln(stderr, "avenor: --roster-file and --roster-entry must be supplied together for direct selection")
+			return exitWithSentinel(1)
+		}
+		if *agent != "" || *model != "" || backendExplicit {
+			fmt.Fprintln(stderr, "avenor: direct identity fields are mutually exclusive with roster selection")
+			return exitWithSentinel(1)
+		}
+		roster, err := rosterconfig.Load(*rosterFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "avenor: %v\n", err)
+			return exitWithSentinel(1)
+		}
+		entry, err := roster.Lookup(*rosterEntry)
+		if err != nil {
+			fmt.Fprintf(stderr, "avenor: %v\n", err)
+			return exitWithSentinel(1)
+		}
+		*backend = entry.Backend
+		*agent = entry.Agent
+		*model = entry.Model
+		if *agent != "" && *model == "" {
+			resolved, resolveErr := resolveAgentModel(*agent, *backend, getenv)
+			if resolveErr != nil {
+				fmt.Fprintf(stderr, "avenor: %v\n", resolveErr)
+				return exitWithSentinel(1)
+			}
+			if resolved != "" {
+				*model = resolved
+			}
+		}
 	}
-	if err := runtime.ValidateThinkingForBackend(*backend, *thinking); err != nil {
-		fmt.Fprintf(stderr, "avenor: %v\n", err)
-		return exitWithSentinel(1)
+
+	discovery := DiscoverServer(*serverURL, getenv)
+	if !workflowMode {
+		switch *backend {
+		case backendPony:
+		case backendOpenCodeACP:
+		case backendGeminiACP:
+		case backendAgy:
+		case backendCursorACP:
+		case backendOpenCodeHTTP:
+			if discovery.URL == "" {
+				fmt.Fprintf(stderr, "avenor: --server-url is required for backend opencode-http\n")
+				return exitWithSentinel(1)
+			}
+		case backendCodexAppServer:
+		case backendClaude:
+		case backendClaudeChannel:
+		case backendPi:
+		default:
+			fmt.Fprintf(stderr, "avenor: unknown backend %q\n", *backend)
+			return exitWithSentinel(1)
+		}
+		if err := runtime.ValidateThinkingForBackend(*backend, *thinking); err != nil {
+			fmt.Fprintf(stderr, "avenor: %v\n", err)
+			return exitWithSentinel(1)
+		}
 	}
 
 	// Pony backend setup
@@ -373,14 +425,20 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		timer = t.C
 	}
 
-	agentOverride := *agent
-	modelOverride := *model
+	// Stable supervisor metadata is unavailable in this execution path. Keep
+	// the authoritative session/backend relationship local to this CLI run.
+	sessionBackends := newSessionBackendMap()
 
-	execAttempt := func(ctx context.Context, agent, model, resumeID, prompt string) attemptResult {
+	execAttempt := func(ctx context.Context, selection rosterconfig.ResolvedSelection, resumeID, prompt string) attemptResult {
+		if err := validateCLISelection(selection.Backend, discovery, *thinking); err != nil {
+			fmt.Fprintf(stderr, "avenor: %v\n", err)
+			return attemptResult{exitCode: 1}
+		}
 		return runAttempt(ctx, attemptConfig{
-			startOptions:           runtime.StartOptions{Agent: agent, Model: model, Dir: *dir, ServerURL: discovery.URL, Thinking: *thinking},
-			backend:                *backend,
+			startOptions:           runtime.StartOptions{Agent: selection.Agent, Model: selection.Model, Label: *label, Dir: *dir, ServerURL: discovery.URL, Thinking: *thinking},
+			backend:                selection.Backend,
 			resumeID:               resumeID,
+			sessionBackends:        sessionBackends,
 			initialPrompt:          prompt,
 			runID:                  runID,
 			runLabel:               *label,
@@ -392,53 +450,150 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			writer:        writer,
 			fileHandler:   fileHandler,
 			controlServer: controlServer,
-			stderr:        os.Stderr,
+			stderr:        stderr,
 		})
 	}
 
-	phaseAttemptForLoop := func(ctx context.Context, phase phaseconfig.Phase, _ int, _ int, prevSessionID string) (looprunner.PhaseAttemptResult, error) {
-		r := execAttempt(ctx, agentOverride, modelOverride, prevSessionID, phase.Prompt)
-		return looprunner.PhaseAttemptResult{
-			ExitCode:      r.exitCode,
-			SessionID:     r.sessionID,
-			StopReason:    r.stopReason,
-			LoopDirective: r.loopDirective,
-			LoopLabel:     r.loopLabel,
-			BrokerRunID:   "",
-		}, nil
-	}
-
-	phaseAttemptForTeam := func(ctx context.Context, phase phaseconfig.Phase, _ int, prevSessionID string) (teamrunner.PhaseAttemptResult, error) {
-		a, m := agentOverride, modelOverride
-		if phase.Agent != "" {
-			a = phase.Agent
-		}
-		if phase.Model != "" {
-			m = phase.Model
-		} else if phase.Agent != "" {
-			resolved, err := resolveAgentModel(phase.Agent, *backend, getenv)
+	preparePhaseSelection := func(selection rosterconfig.ResolvedSelection) (rosterconfig.ResolvedSelection, error) {
+		if selection.Agent != "" && selection.Model == "" {
+			resolved, err := resolveAgentModel(selection.Agent, selection.Backend, getenv)
 			if err != nil {
-				return teamrunner.PhaseAttemptResult{ExitCode: 1, BrokerRunID: ""}, err
+				return rosterconfig.ResolvedSelection{}, err
 			}
 			if resolved != "" {
-				m = resolved
+				selection.Model = resolved
 			}
 		}
-		r := execAttempt(ctx, a, m, prevSessionID, phase.Prompt)
-		return teamrunner.PhaseAttemptResult{
-			ExitCode:      r.exitCode,
-			SessionID:     r.sessionID,
-			StopReason:    r.stopReason,
-			LoopDirective: r.loopDirective,
-			LoopLabel:     r.loopLabel,
-			Output:        r.output,
-			FinalReply:    r.finalReply,
-			BrokerRunID:   "",
-		}, nil
+		if err := validateCLISelection(selection.Backend, discovery, *thinking); err != nil {
+			return rosterconfig.ResolvedSelection{}, err
+		}
+		return selection, nil
+	}
+
+	makePhaseAttemptForLoop := func(roster *rosterconfig.Config) func(context.Context, phaseconfig.Phase, int, int, string) (looprunner.PhaseAttemptResult, error) {
+		var selectionMu sync.Mutex
+		resolvedSelections := make(map[string]rosterconfig.ResolvedSelection)
+		return func(ctx context.Context, phase phaseconfig.Phase, _ int, _ int, prevSessionID string) (looprunner.PhaseAttemptResult, error) {
+			selectionMu.Lock()
+			selection, cached := resolvedSelections[phase.Name]
+			selectionMu.Unlock()
+			if !cached {
+				var entry *rosterconfig.Entry
+				if phase.RosterEntry != "" {
+					if roster == nil {
+						return looprunner.PhaseAttemptResult{ExitCode: 1}, fmt.Errorf("phase %q roster entry %q requires a roster", phase.Name, phase.RosterEntry)
+					}
+					loaded, err := roster.Lookup(phase.RosterEntry)
+					if err != nil {
+						return looprunner.PhaseAttemptResult{ExitCode: 1}, err
+					}
+					entry = &loaded
+				}
+				var err error
+				selection, err = rosterconfig.Resolve(rosterconfig.ResolveInput{
+					Backend: *backend,
+					Agent:   *agent,
+					Model:   *model,
+					Roster:  entry,
+					Loop:    true,
+				})
+				if err != nil {
+					return looprunner.PhaseAttemptResult{ExitCode: 1}, err
+				}
+				selection, err = preparePhaseSelection(selection)
+				if err != nil {
+					return looprunner.PhaseAttemptResult{ExitCode: 1}, err
+				}
+				selectionMu.Lock()
+				resolvedSelections[phase.Name] = selection
+				selectionMu.Unlock()
+			}
+			r := execAttempt(ctx, selection, prevSessionID, phase.Prompt)
+			if r.err != nil {
+				return looprunner.PhaseAttemptResult{ExitCode: 1}, r.err
+			}
+			return looprunner.PhaseAttemptResult{
+				ExitCode:      r.exitCode,
+				SessionID:     r.sessionID,
+				StopReason:    r.stopReason,
+				LoopDirective: r.loopDirective,
+				LoopLabel:     r.loopLabel,
+				BrokerRunID:   "",
+			}, nil
+		}
+	}
+
+	makePhaseAttemptForTeam := func(roster *rosterconfig.Config) func(context.Context, phaseconfig.Phase, int, string) (teamrunner.PhaseAttemptResult, error) {
+		var selectionMu sync.Mutex
+		resolvedSelections := make(map[string]rosterconfig.ResolvedSelection)
+		return func(ctx context.Context, phase phaseconfig.Phase, _ int, prevSessionID string) (teamrunner.PhaseAttemptResult, error) {
+			selectionMu.Lock()
+			selection, cached := resolvedSelections[phase.Name]
+			selectionMu.Unlock()
+			if !cached {
+				var entry *rosterconfig.Entry
+				if phase.RosterEntry != "" {
+					if roster == nil {
+						return teamrunner.PhaseAttemptResult{ExitCode: 1}, fmt.Errorf("phase %q roster entry %q requires a roster", phase.Name, phase.RosterEntry)
+					}
+					loaded, err := roster.Lookup(phase.RosterEntry)
+					if err != nil {
+						return teamrunner.PhaseAttemptResult{ExitCode: 1}, err
+					}
+					entry = &loaded
+				}
+				var err error
+				selection, err = rosterconfig.Resolve(rosterconfig.ResolveInput{
+					Backend:     *backend,
+					Agent:       *agent,
+					Model:       *model,
+					InlineAgent: phase.Agent,
+					InlineModel: phase.Model,
+					Roster:      entry,
+				})
+				if err != nil {
+					return teamrunner.PhaseAttemptResult{ExitCode: 1}, err
+				}
+				if entry == nil && phase.Agent != "" && phase.Model == "" {
+					resolved, resolveErr := resolveAgentModel(phase.Agent, selection.Backend, getenv)
+					if resolveErr != nil {
+						return teamrunner.PhaseAttemptResult{ExitCode: 1}, resolveErr
+					}
+					if resolved != "" {
+						selection.Model = resolved
+					}
+				}
+				selection, err = preparePhaseSelection(selection)
+				if err != nil {
+					return teamrunner.PhaseAttemptResult{ExitCode: 1}, err
+				}
+				selectionMu.Lock()
+				resolvedSelections[phase.Name] = selection
+				selectionMu.Unlock()
+			}
+			r := execAttempt(ctx, selection, prevSessionID, phase.Prompt)
+			if r.err != nil {
+				return teamrunner.PhaseAttemptResult{ExitCode: 1}, r.err
+			}
+			return teamrunner.PhaseAttemptResult{
+				ExitCode:      r.exitCode,
+				SessionID:     r.sessionID,
+				StopReason:    r.stopReason,
+				LoopDirective: r.loopDirective,
+				LoopLabel:     r.loopLabel,
+				Output:        r.output,
+				FinalReply:    r.finalReply,
+				BrokerRunID:   "",
+			}, nil
+		}
 	}
 
 	if *loopFile != "" {
-		cfg, err := looprunner.LoadLoopConfig(*loopFile)
+		fallbackRosterPath := *rosterFile
+		if fallbackRosterPath != "" && !filepath.IsAbs(fallbackRosterPath) {
+			fallbackRosterPath = filepath.Join(*dir, fallbackRosterPath)
+		}
+		cfg, rootRoster, err := looprunner.LoadLoopConfigWithRoster(*loopFile, nil, fallbackRosterPath)
 		if err != nil {
 			fmt.Fprintf(stderr, "avenor: load loop config: %v\n", err)
 			if *sentinelFile != "" {
@@ -451,73 +606,78 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			cfg.InsertInitialPrompt(string(promptText))
 		}
 
-		var nestedRun func(ctx context.Context, configPath string, runType string) (looprunner.NestedResult, error)
-		nestedRun = func(ctx context.Context, configPath string, runType string) (looprunner.NestedResult, error) {
-			if runType == "loop" {
-				subCfg, err := looprunner.LoadLoopConfig(configPath)
-				if err != nil {
-					return looprunner.NestedResult{}, fmt.Errorf("load nested loop config: %w", err)
+		var makeNestedRun func(*rosterconfig.Config) func(context.Context, string, string) (looprunner.NestedResult, error)
+		makeNestedRun = func(inherited *rosterconfig.Config) func(context.Context, string, string) (looprunner.NestedResult, error) {
+			return func(ctx context.Context, configPath string, runType string) (looprunner.NestedResult, error) {
+				if runType == "loop" {
+					subCfg, subRoster, err := looprunner.LoadLoopConfigWithRoster(configPath, inherited, "")
+					if err != nil {
+						return looprunner.NestedResult{}, fmt.Errorf("load nested loop config: %w", err)
+					}
+					subOpts := looprunner.RunOptions{
+						WorkDir:      *dir,
+						RunID:        runID,
+						EventSink:    writer,
+						Config:       subCfg,
+						MaxRetries:   *maxRetries,
+						Broker:       nil,
+						ConfigDir:    filepath.Dir(configPath),
+						Roster:       subRoster,
+						PhaseAttempt: makePhaseAttemptForLoop(subRoster),
+						NestedRun:    makeNestedRun(subRoster),
+					}
+					subResult, err := looprunner.Run(ctx, subOpts)
+					if err != nil {
+						return looprunner.NestedResult{}, err
+					}
+					return looprunner.NestedResult{
+						ExitCode:   subResult.ExitCode,
+						StopReason: subResult.StopReason,
+						SessionID:  subResult.SessionID,
+						Reason:     subResult.Reason,
+					}, nil
 				}
-				subOpts := looprunner.RunOptions{
-					WorkDir:      *dir,
-					RunID:        runID,
-					EventSink:    writer,
-					Config:       subCfg,
-					MaxRetries:   *maxRetries,
-					Broker:       nil,
-					ConfigDir:    filepath.Dir(configPath),
-					PhaseAttempt: phaseAttemptForLoop,
-					NestedRun:    nestedRun,
+				if runType == "team" {
+					subCfg, subRoster, err := teamrunner.LoadTeamConfigWithRoster(configPath, inherited, "")
+					if err != nil {
+						return looprunner.NestedResult{}, fmt.Errorf("load nested team config: %w", err)
+					}
+					teamNestedRun := func(ctx context.Context, configPath string, runType string) (teamrunner.NestedResult, error) {
+						nr, err := makeNestedRun(subRoster)(ctx, configPath, runType)
+						return teamrunner.NestedResult{
+							ExitCode:   nr.ExitCode,
+							StopReason: nr.StopReason,
+							SessionID:  nr.SessionID,
+							Reason:     nr.Reason,
+						}, err
+					}
+					subOpts := teamrunner.RunOptions{
+						WorkDir:      *dir,
+						RunID:        runID,
+						EventSink:    writer,
+						Config:       subCfg,
+						MaxRetries:   *maxRetries,
+						Broker:       nil,
+						ConfigDir:    filepath.Dir(configPath),
+						Roster:       subRoster,
+						PhaseAttempt: makePhaseAttemptForTeam(subRoster),
+						NestedRun:    teamNestedRun,
+					}
+					subResult, err := teamrunner.Run(ctx, subOpts)
+					if err != nil {
+						return looprunner.NestedResult{}, err
+					}
+					return looprunner.NestedResult{
+						ExitCode:   subResult.ExitCode,
+						StopReason: subResult.StopReason,
+						SessionID:  subResult.SessionID,
+						Reason:     subResult.Reason,
+					}, nil
 				}
-				subResult, err := looprunner.Run(ctx, subOpts)
-				if err != nil {
-					return looprunner.NestedResult{}, err
-				}
-				return looprunner.NestedResult{
-					ExitCode:   subResult.ExitCode,
-					StopReason: subResult.StopReason,
-					SessionID:  subResult.SessionID,
-					Reason:     subResult.Reason,
-				}, nil
+				return looprunner.NestedResult{}, fmt.Errorf("unknown run type %q", runType)
 			}
-			if runType == "team" {
-				subCfg, err := teamrunner.LoadTeamConfig(configPath)
-				if err != nil {
-					return looprunner.NestedResult{}, fmt.Errorf("load nested team config: %w", err)
-				}
-				teamNestedRun := func(ctx context.Context, configPath string, runType string) (teamrunner.NestedResult, error) {
-					nr, err := nestedRun(ctx, configPath, runType)
-					return teamrunner.NestedResult{
-						ExitCode:   nr.ExitCode,
-						StopReason: nr.StopReason,
-						SessionID:  nr.SessionID,
-						Reason:     nr.Reason,
-					}, err
-				}
-				subOpts := teamrunner.RunOptions{
-					WorkDir:      *dir,
-					RunID:        runID,
-					EventSink:    writer,
-					Config:       subCfg,
-					MaxRetries:   *maxRetries,
-					Broker:       nil,
-					ConfigDir:    filepath.Dir(configPath),
-					PhaseAttempt: phaseAttemptForTeam,
-					NestedRun:    teamNestedRun,
-				}
-				subResult, err := teamrunner.Run(ctx, subOpts)
-				if err != nil {
-					return looprunner.NestedResult{}, err
-				}
-				return looprunner.NestedResult{
-					ExitCode:   subResult.ExitCode,
-					StopReason: subResult.StopReason,
-					SessionID:  subResult.SessionID,
-					Reason:     subResult.Reason,
-				}, nil
-			}
-			return looprunner.NestedResult{}, fmt.Errorf("unknown run type %q", runType)
 		}
+		nestedRun := makeNestedRun(rootRoster)
 
 		opts := looprunner.RunOptions{
 			WorkDir:      *dir,
@@ -527,7 +687,8 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			MaxRetries:   *maxRetries,
 			Broker:       nil,
 			ConfigDir:    filepath.Dir(*loopFile),
-			PhaseAttempt: phaseAttemptForLoop,
+			Roster:       rootRoster,
+			PhaseAttempt: makePhaseAttemptForLoop(rootRoster),
 			NestedRun:    nestedRun,
 		}
 
@@ -549,7 +710,11 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	}
 
 	if *teamFile != "" {
-		cfg, err := teamrunner.LoadTeamConfig(*teamFile)
+		fallbackRosterPath := *rosterFile
+		if fallbackRosterPath != "" && !filepath.IsAbs(fallbackRosterPath) {
+			fallbackRosterPath = filepath.Join(*dir, fallbackRosterPath)
+		}
+		cfg, rootRoster, err := teamrunner.LoadTeamConfigWithRoster(*teamFile, nil, fallbackRosterPath)
 		if err != nil {
 			fmt.Fprintf(stderr, "avenor: load team config: %v\n", err)
 			if *sentinelFile != "" {
@@ -562,73 +727,78 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			cfg.InsertInitialPrompt(string(promptText))
 		}
 
-		var nestedRun func(ctx context.Context, configPath string, runType string) (teamrunner.NestedResult, error)
-		nestedRun = func(ctx context.Context, configPath string, runType string) (teamrunner.NestedResult, error) {
-			if runType == "loop" {
-				subCfg, err := looprunner.LoadLoopConfig(configPath)
-				if err != nil {
-					return teamrunner.NestedResult{}, fmt.Errorf("load nested loop config: %w", err)
+		var makeNestedRun func(*rosterconfig.Config) func(context.Context, string, string) (teamrunner.NestedResult, error)
+		makeNestedRun = func(inherited *rosterconfig.Config) func(context.Context, string, string) (teamrunner.NestedResult, error) {
+			return func(ctx context.Context, configPath string, runType string) (teamrunner.NestedResult, error) {
+				if runType == "loop" {
+					subCfg, subRoster, err := looprunner.LoadLoopConfigWithRoster(configPath, inherited, "")
+					if err != nil {
+						return teamrunner.NestedResult{}, fmt.Errorf("load nested loop config: %w", err)
+					}
+					loopNestedRun := func(ctx context.Context, configPath string, runType string) (looprunner.NestedResult, error) {
+						nr, err := makeNestedRun(subRoster)(ctx, configPath, runType)
+						return looprunner.NestedResult{
+							ExitCode:   nr.ExitCode,
+							StopReason: nr.StopReason,
+							SessionID:  nr.SessionID,
+							Reason:     nr.Reason,
+						}, err
+					}
+					subOpts := looprunner.RunOptions{
+						WorkDir:      *dir,
+						RunID:        runID,
+						EventSink:    writer,
+						Config:       subCfg,
+						MaxRetries:   *maxRetries,
+						Broker:       nil,
+						ConfigDir:    filepath.Dir(configPath),
+						Roster:       subRoster,
+						PhaseAttempt: makePhaseAttemptForLoop(subRoster),
+						NestedRun:    loopNestedRun,
+					}
+					subResult, err := looprunner.Run(ctx, subOpts)
+					if err != nil {
+						return teamrunner.NestedResult{}, err
+					}
+					return teamrunner.NestedResult{
+						ExitCode:   subResult.ExitCode,
+						StopReason: subResult.StopReason,
+						SessionID:  subResult.SessionID,
+						Reason:     subResult.Reason,
+					}, nil
 				}
-				loopNestedRun := func(ctx context.Context, configPath string, runType string) (looprunner.NestedResult, error) {
-					nr, err := nestedRun(ctx, configPath, runType)
-					return looprunner.NestedResult{
-						ExitCode:   nr.ExitCode,
-						StopReason: nr.StopReason,
-						SessionID:  nr.SessionID,
-						Reason:     nr.Reason,
-					}, err
+				if runType == "team" {
+					subCfg, subRoster, err := teamrunner.LoadTeamConfigWithRoster(configPath, inherited, "")
+					if err != nil {
+						return teamrunner.NestedResult{}, fmt.Errorf("load nested team config: %w", err)
+					}
+					subOpts := teamrunner.RunOptions{
+						WorkDir:      *dir,
+						RunID:        runID,
+						EventSink:    writer,
+						Config:       subCfg,
+						MaxRetries:   *maxRetries,
+						Broker:       nil,
+						ConfigDir:    filepath.Dir(configPath),
+						Roster:       subRoster,
+						PhaseAttempt: makePhaseAttemptForTeam(subRoster),
+						NestedRun:    makeNestedRun(subRoster),
+					}
+					subResult, err := teamrunner.Run(ctx, subOpts)
+					if err != nil {
+						return teamrunner.NestedResult{}, err
+					}
+					return teamrunner.NestedResult{
+						ExitCode:   subResult.ExitCode,
+						StopReason: subResult.StopReason,
+						SessionID:  subResult.SessionID,
+						Reason:     subResult.Reason,
+					}, nil
 				}
-				subOpts := looprunner.RunOptions{
-					WorkDir:      *dir,
-					RunID:        runID,
-					EventSink:    writer,
-					Config:       subCfg,
-					MaxRetries:   *maxRetries,
-					Broker:       nil,
-					ConfigDir:    filepath.Dir(configPath),
-					PhaseAttempt: phaseAttemptForLoop,
-					NestedRun:    loopNestedRun,
-				}
-				subResult, err := looprunner.Run(ctx, subOpts)
-				if err != nil {
-					return teamrunner.NestedResult{}, err
-				}
-				return teamrunner.NestedResult{
-					ExitCode:   subResult.ExitCode,
-					StopReason: subResult.StopReason,
-					SessionID:  subResult.SessionID,
-					Reason:     subResult.Reason,
-				}, nil
+				return teamrunner.NestedResult{}, fmt.Errorf("unknown run type %q", runType)
 			}
-			if runType == "team" {
-				subCfg, err := teamrunner.LoadTeamConfig(configPath)
-				if err != nil {
-					return teamrunner.NestedResult{}, fmt.Errorf("load nested team config: %w", err)
-				}
-				subOpts := teamrunner.RunOptions{
-					WorkDir:      *dir,
-					RunID:        runID,
-					EventSink:    writer,
-					Config:       subCfg,
-					MaxRetries:   *maxRetries,
-					Broker:       nil,
-					ConfigDir:    filepath.Dir(configPath),
-					PhaseAttempt: phaseAttemptForTeam,
-					NestedRun:    nestedRun,
-				}
-				subResult, err := teamrunner.Run(ctx, subOpts)
-				if err != nil {
-					return teamrunner.NestedResult{}, err
-				}
-				return teamrunner.NestedResult{
-					ExitCode:   subResult.ExitCode,
-					StopReason: subResult.StopReason,
-					SessionID:  subResult.SessionID,
-					Reason:     subResult.Reason,
-				}, nil
-			}
-			return teamrunner.NestedResult{}, fmt.Errorf("unknown run type %q", runType)
 		}
+		nestedRun := makeNestedRun(rootRoster)
 
 		opts := teamrunner.RunOptions{
 			WorkDir:      *dir,
@@ -638,7 +808,8 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			MaxRetries:   *maxRetries,
 			Broker:       nil,
 			ConfigDir:    filepath.Dir(*teamFile),
-			PhaseAttempt: phaseAttemptForTeam,
+			Roster:       rootRoster,
+			PhaseAttempt: makePhaseAttemptForTeam(rootRoster),
 			NestedRun:    nestedRun,
 		}
 
@@ -675,6 +846,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 			startOptions:           startOptions,
 			backend:                *backend,
 			resumeID:               resumeID,
+			sessionBackends:        sessionBackends,
 			initialPrompt:          string(promptText),
 			runID:                  runID,
 			runLabel:               *label,
@@ -691,7 +863,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 		finalSessionID = result.sessionID
 		finalStopReason = result.stopReason
 
-		if result.exitCode != 1 || attempt > *maxRetries {
+		if result.err != nil || !runtime.IsRetryableFailure(result.exitCode, result.stopReason) || attempt > *maxRetries {
 			break
 		}
 
@@ -718,6 +890,20 @@ func run(args []string, getenv func(string) string, stderr io.Writer) int {
 	}
 
 	return exitWithSentinel(result.exitCode)
+}
+
+func validateCLISelection(backend string, discovery ServerDiscovery, thinking string) error {
+	switch backend {
+	case backendPony, backendOpenCodeACP, backendGeminiACP, backendAgy, backendCursorACP,
+		backendCodexAppServer, backendClaude, backendClaudeChannel, backendPi:
+	case backendOpenCodeHTTP:
+		if discovery.URL == "" {
+			return fmt.Errorf("--server-url is required for backend opencode-http")
+		}
+	default:
+		return fmt.Errorf("unknown backend %q", backend)
+	}
+	return runtime.ValidateThinkingForBackend(backend, thinking)
 }
 
 type resumeWithOptionser interface {
@@ -814,7 +1000,12 @@ type SessionWaitConfig struct {
 	PermissionClaimTimeout time.Duration
 	ProgressTimeout        time.Duration
 	Timeout                <-chan time.Time
-	AdoptSessionID         func(string)
+	// AcceptSessionID validates an authoritative provider ID before the legacy
+	// AdoptSessionID callback is invoked. Rejection is a fatal session identity
+	// conflict; continuing on the provisional ID would report false success for
+	// a conversation owned by another attempt.
+	AcceptSessionID func(string) bool
+	AdoptSessionID  func(string)
 }
 
 type SessionWaitDeps struct {
@@ -905,6 +1096,14 @@ func WaitForSession(ctx context.Context, provider runtime.Provider, cfg SessionW
 				if event.Event == "session.start" {
 					externalID, _ := event.Fields["conversation_id"].(string)
 					if externalID != "" && externalID != cfg.SessionID {
+						adopted := true
+						if cfg.AcceptSessionID != nil {
+							adopted = cfg.AcceptSessionID(externalID)
+						}
+						if !adopted {
+							emitErrorEvent(deps.Writer, cfg.SessionID, cfg.RunID, "session", fmt.Sprintf("authoritative session ID %q conflicts with an existing session", externalID), deps.Stderr, cfg.RunLabel)
+							return sessionResult{ExitCode: 1, StopReason: runtime.SessionIDConflictStopReason}
+						}
 						cfg.SessionID = externalID
 						tracker.sessionID = externalID
 						if cfg.AdoptSessionID != nil {

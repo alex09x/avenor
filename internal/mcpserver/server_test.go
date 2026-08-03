@@ -358,6 +358,67 @@ func TestAvenorStatusSingle(t *testing.T) {
 	}
 }
 
+func TestAvenorStatusUsesTerminalSentinelAfterWorkflowRuntimeRemoval(t *testing.T) {
+	sentinelPath := filepath.Join(t.TempDir(), "workflow.done")
+	if err := os.WriteFile(sentinelPath, []byte("DONE\nSESSION=ses_workflow\nSTOP_REASON=end_turn\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeClient{statusErr: errors.New("runtime not found")}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.registry.Store(&RunInfo{
+		RunID:            "run-workflow",
+		Label:            "workflow",
+		RuntimeID:        "rt-workflow",
+		SentinelPath:     sentinelPath,
+		AgentProfile:     "cloud",
+		EffectiveBackend: "agy",
+	})
+
+	_, result, err := s.handleAvenorStatus(context.Background(), nil, statusArgs{RunID: "run-workflow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := result.(map[string]any)
+	if status["status"] != "done" || status["session_id"] != "ses_workflow" {
+		t.Fatalf("terminal status = %#v", status)
+	}
+	if status["agent_profile"] != "cloud" || status["effective_backend"] != "agy" {
+		t.Fatalf("terminal identity = %#v", status)
+	}
+}
+
+func TestAvenorStatusListIncludesTerminalRegistryRunAfterWorkflowRemoval(t *testing.T) {
+	sentinelPath := filepath.Join(t.TempDir(), "workflow.done")
+	if err := os.WriteFile(sentinelPath, []byte("FAILED\nSESSION=ses_workflow\nSTOP_REASON=error\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: &fakeClient{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.registry.Store(&RunInfo{
+		RunID:        "run-workflow-list",
+		Label:        "workflow-list",
+		SentinelPath: sentinelPath,
+		AgentProfile: "cloud",
+	})
+
+	_, result, err := s.handleAvenorStatus(context.Background(), nil, statusArgs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := result.([]map[string]any)
+	if len(list) != 1 || list[0]["run_id"] != "run-workflow-list" || list[0]["status"] != "failed" {
+		t.Fatalf("terminal list = %#v", list)
+	}
+	if list[0]["agent_profile"] != "cloud" {
+		t.Fatalf("terminal list profile = %#v", list[0])
+	}
+}
+
 func TestAvenorStatusLifecycleViewOmitsFinalOutput(t *testing.T) {
 	fake := &fakeClient{
 		statusResult: map[string]any{
@@ -1105,6 +1166,84 @@ func TestAvenorSpawn(t *testing.T) {
 	}
 }
 
+func TestAvenorSpawnRosterSelectorAndResolvedIdentity(t *testing.T) {
+	rosterPath := filepath.Join(t.TempDir(), "roster.json")
+	fake := &fakeClient{
+		statusResult: map[string]any{
+			"runtime_id":        "rt_roster_1",
+			"session_id":        "ses_roster_1",
+			"backend":           "agy",
+			"agent_profile":     "cloud",
+			"agent":             "planner-agent",
+			"model":             "planner-model",
+			"roster_file":       rosterPath,
+			"roster_entry":      "planner",
+			"effective_backend": "agy",
+			"effective_agent":   "planner-agent",
+			"effective_model":   "planner-model",
+		},
+		spawnResult: map[string]any{
+			"runtime_id": "rt_roster_1",
+			"session_id": "ses_roster_1",
+		},
+	}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, result, err := s.handleAvenorSpawn(context.Background(), nil, spawnArgs{
+		RepoDir:     "/tmp/roster-repo",
+		RosterFile:  rosterPath,
+		RosterEntry: "planner",
+	})
+	if err != nil {
+		t.Fatalf("roster spawn: %v", err)
+	}
+	if result.(map[string]any)["run_id"] == "" {
+		t.Fatal("expected run ID")
+	}
+	if fake.spawnCapturedParams["roster_file"] != rosterPath || fake.spawnCapturedParams["roster_entry"] != "planner" {
+		t.Fatalf("roster selector not forwarded: %#v", fake.spawnCapturedParams)
+	}
+
+	ri := s.registry.Lookup(result.(map[string]any)["run_id"].(string))
+	if ri == nil {
+		t.Fatal("expected registry entry")
+	}
+	if ri.RosterFile != rosterPath || ri.RosterEntry != "planner" {
+		t.Fatalf("roster metadata = %#v", ri)
+	}
+	if ri.EffectiveBackend != "agy" || ri.EffectiveAgent != "planner-agent" || ri.EffectiveModel != "planner-model" || ri.AgentProfile != "cloud" {
+		t.Fatalf("effective identity = %#v", ri)
+	}
+}
+
+func TestAvenorSpawnRejectsMixedRosterSelectors(t *testing.T) {
+	cases := []spawnArgs{
+		{RepoDir: "/tmp/repo", RosterFile: "/tmp/roster.json"},
+		{RepoDir: "/tmp/repo", RosterEntry: "planner"},
+		{RepoDir: "/tmp/repo", RosterFile: "/tmp/roster.json", RosterEntry: "planner", Agent: "inline"},
+		{RepoDir: "/tmp/repo", RosterFile: "/tmp/roster.json", RosterEntry: "planner", Model: "inline"},
+		{RepoDir: "/tmp/repo", RosterFile: "/tmp/roster.json", RosterEntry: "planner", Backend: "pi"},
+	}
+	for i, args := range cases {
+		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
+			fake := &fakeClient{}
+			s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := s.handleAvenorSpawn(context.Background(), nil, args); err == nil {
+				t.Fatal("expected invalid roster selector")
+			}
+			if fake.spawnCapturedParams != nil {
+				t.Fatalf("invalid selector reached control client: %#v", fake.spawnCapturedParams)
+			}
+		})
+	}
+}
+
 func TestAvenorSpawnError(t *testing.T) {
 	cause := errors.New("control plane unavailable")
 	fake := &fakeClient{spawnErr: cause}
@@ -1833,10 +1972,15 @@ func TestAvenorStatusListWithRegistry(t *testing.T) {
 	}
 
 	s.registry.Store(&RunInfo{
-		RunID:        "run-list-1",
-		Label:        "list-run-1",
-		RuntimeID:    "rt_1",
-		SentinelPath: sentinelPath,
+		RunID:            "run-list-1",
+		Label:            "list-run-1",
+		RuntimeID:        "rt_1",
+		SentinelPath:     sentinelPath,
+		RosterFile:       "/repo/roster.json",
+		RosterEntry:      "planner",
+		EffectiveBackend: "agy",
+		EffectiveAgent:   "planner-agent",
+		EffectiveModel:   "planner-model",
 	})
 	s.registry.Store(&RunInfo{
 		RunID:     "run-list-2",
@@ -1862,12 +2006,50 @@ func TestAvenorStatusListWithRegistry(t *testing.T) {
 	if list[0]["status"] != "running" {
 		t.Errorf("expected running status for rt_1, got %v", list[0]["status"])
 	}
+	if list[0]["roster_entry"] != "planner" || list[0]["effective_backend"] != "agy" || list[0]["effective_agent"] != "planner-agent" {
+		t.Errorf("roster identity missing from list: %#v", list[0])
+	}
 
 	if list[1]["run_id"] != "run-list-2" {
 		t.Errorf("expected run_id run-list-2, got %v", list[1]["run_id"])
 	}
 	if list[1]["status"] != "done" {
 		t.Errorf("expected done status for rt_2, got %v", list[1]["status"])
+	}
+}
+
+func TestAvenorStatusPreservesRosterIdentity(t *testing.T) {
+	fake := &fakeClient{statusResult: map[string]any{"status": "running", "runtime_id": "rt_roster_status"}}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.registry.Store(&RunInfo{
+		RunID:            "run-roster-status",
+		Label:            "roster-status",
+		RuntimeID:        "rt_roster_status",
+		RosterFile:       "/repo/roster.json",
+		RosterEntry:      "planner",
+		EffectiveBackend: "agy",
+		EffectiveAgent:   "planner-agent",
+		EffectiveModel:   "planner-model",
+	})
+
+	_, result, err := s.handleAvenorStatus(context.Background(), nil, statusArgs{RunID: "run-roster-status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := result.(map[string]any)
+	for key, want := range map[string]any{
+		"roster_file":       "/repo/roster.json",
+		"roster_entry":      "planner",
+		"effective_backend": "agy",
+		"effective_agent":   "planner-agent",
+		"effective_model":   "planner-model",
+	} {
+		if status[key] != want {
+			t.Fatalf("status[%q] = %v, want %v", key, status[key], want)
+		}
 	}
 }
 
@@ -2359,6 +2541,7 @@ func TestAvenorFollowUp(t *testing.T) {
 		RuntimeID:    "rt_prior_1",
 		SentinelPath: sentinelPath,
 		Agent:        "claude",
+		AgentProfile: "cloud",
 		Backend:      "pi",
 		Thinking:     "high",
 		Dir:          "/tmp/prior-repo",
@@ -2402,6 +2585,9 @@ func TestAvenorFollowUp(t *testing.T) {
 	if p["thinking"] != "high" {
 		t.Errorf("expected thinking high, got %v", p["thinking"])
 	}
+	if p["agent_profile"] != "cloud" {
+		t.Errorf("expected agent_profile cloud, got %v", p["agent_profile"])
+	}
 	if p["dir"] != "/tmp/prior-repo" {
 		t.Errorf("expected dir /tmp/prior-repo, got %v", p["dir"])
 	}
@@ -2422,6 +2608,9 @@ func TestAvenorFollowUp(t *testing.T) {
 	if ri.Thinking != "high" {
 		t.Errorf("expected thinking high, got %s", ri.Thinking)
 	}
+	if ri.AgentProfile != "cloud" {
+		t.Errorf("expected agent_profile cloud, got %s", ri.AgentProfile)
+	}
 	if ri.Dir != "/tmp/prior-repo" {
 		t.Errorf("expected dir /tmp/prior-repo, got %s", ri.Dir)
 	}
@@ -2430,6 +2619,102 @@ func TestAvenorFollowUp(t *testing.T) {
 	}
 	if ri.SessionID != "ses_followup_1" {
 		t.Errorf("expected new session_id ses_followup_1, got %s", ri.SessionID)
+	}
+}
+
+func TestAvenorRosterFollowUpUsesResolvedIdentity(t *testing.T) {
+	sentinelPath := filepath.Join(t.TempDir(), "roster-followup.done")
+	if err := os.WriteFile(sentinelPath, []byte("DONE\nSESSION=ses_prior\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	var captured map[string]any
+	fake := &fakeClient{
+		spawnFunc: func(params map[string]any) (map[string]any, error) {
+			captured = params
+			return map[string]any{"runtime_id": "rt_roster_followup", "session_id": "ses_roster_followup"}, nil
+		},
+	}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.registry.Store(&RunInfo{
+		RunID:            "run-roster-prior",
+		Label:            "roster-prior",
+		RuntimeID:        "rt-roster-prior",
+		SessionID:        "ses-prior",
+		SentinelPath:     sentinelPath,
+		RosterFile:       "/tmp/mutable-roster.json",
+		RosterEntry:      "planner",
+		EffectiveAgent:   "resolved-agent",
+		EffectiveModel:   "resolved-model",
+		EffectiveBackend: "agy",
+		Agent:            "resolved-agent",
+		Model:            "resolved-model",
+		Backend:          "agy",
+		Dir:              "/tmp/roster-repo",
+	})
+
+	_, result, err := s.handleAvenorFollowUp(context.Background(), nil, followUpArgs{
+		RunID: "run-roster-prior", Message: "continue",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured["backend"] != "agy" || captured["agent"] != "resolved-agent" || captured["model"] != "resolved-model" {
+		t.Fatalf("follow-up identity = %#v", captured)
+	}
+	if _, ok := captured["roster_file"]; ok {
+		t.Fatalf("follow-up reread roster_file: %#v", captured)
+	}
+	if _, ok := captured["roster_entry"]; ok {
+		t.Fatalf("follow-up reread roster_entry: %#v", captured)
+	}
+	followupID := result.(map[string]any)["run_id"].(string)
+	followup := s.registry.Lookup(followupID)
+	if followup == nil || followup.RosterFile != "/tmp/mutable-roster.json" || followup.EffectiveBackend != "agy" {
+		t.Fatalf("follow-up metadata = %#v", followup)
+	}
+}
+
+func TestAvenorWorkflowFollowUpClearsStaleModelFromAgentOnlyFinalPhase(t *testing.T) {
+	sentinelPath := filepath.Join(t.TempDir(), "agent-only-followup.done")
+	if err := os.WriteFile(sentinelPath, []byte("DONE\nSESSION=final-session\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var captured map[string]any
+	fake := &fakeClient{
+		statusResult: map[string]any{
+			"session_id": "final-session", "effective_agent": "final-agent",
+			"effective_model": "", "effective_backend": "agy", "agent_profile": "cloud",
+		},
+		spawnFunc: func(params map[string]any) (map[string]any, error) {
+			captured = params
+			return map[string]any{"runtime_id": "rt-agent-only-followup"}, nil
+		},
+	}
+	s, err := NewServer(Options{Transport: "stdio", NoAutostart: true, ControlClient: fake})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.registry.Store(&RunInfo{
+		RunID: "agent-only-workflow", Label: "agent-only-workflow", RuntimeID: "rt-agent-only",
+		SentinelPath: sentinelPath, EffectiveAgent: "stale-agent", EffectiveModel: "stale-model",
+		EffectiveBackend: "pi", AgentProfile: "cloud", Dir: "/tmp/repo",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := s.handleAvenorFollowUp(context.Background(), nil, followUpArgs{
+		RunID: "agent-only-workflow", Message: "continue",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if captured["agent"] != "final-agent" || captured["backend"] != "agy" || captured["agent_profile"] != "cloud" {
+		t.Fatalf("final identity not forwarded: %#v", captured)
+	}
+	if _, exists := captured["model"]; exists {
+		t.Fatalf("stale run-level model was forwarded: %#v", captured)
 	}
 }
 

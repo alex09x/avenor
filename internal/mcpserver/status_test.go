@@ -15,6 +15,65 @@ func writeSentinel(t *testing.T, dir, name, content string) string {
 	return path
 }
 
+func TestTranslateStatusPreservesRosterIdentity(t *testing.T) {
+	result := translateStatus(map[string]any{
+		"status":            "running",
+		"roster_file":       "/repo/roster.json",
+		"roster_entry":      "planner",
+		"effective_backend": "agy",
+		"agent_profile":     "cloud",
+		"effective_agent":   "planner-agent",
+		"effective_model":   "planner-model",
+	}, "")
+	for key, want := range map[string]any{
+		"roster_file":       "/repo/roster.json",
+		"roster_entry":      "planner",
+		"effective_backend": "agy",
+		"agent_profile":     "cloud",
+		"effective_agent":   "planner-agent",
+		"effective_model":   "planner-model",
+	} {
+		if result[key] != want {
+			t.Fatalf("status[%q] = %v, want %v", key, result[key], want)
+		}
+	}
+}
+
+func TestApplyRunInfoIdentityFallback(t *testing.T) {
+	status := map[string]any{}
+	applyRunInfoIdentity(status, &RunInfo{
+		RosterFile:       "/repo/roster.json",
+		RosterEntry:      "planner",
+		EffectiveBackend: "agy",
+		AgentProfile:     "cloud",
+		EffectiveAgent:   "planner-agent",
+		EffectiveModel:   "planner-model",
+	})
+	if status["roster_entry"] != "planner" || status["effective_backend"] != "agy" || status["agent_profile"] != "cloud" || status["agent"] != "planner-agent" {
+		t.Fatalf("identity fallback = %#v", status)
+	}
+}
+
+func TestApplyRunInfoIdentityDoesNotResurrectAuthoritativelyClearedFields(t *testing.T) {
+	status := translateStatus(map[string]any{
+		"status": "ended", "agent": "", "model": "", "agent_profile": "",
+		"effective_agent": "", "effective_model": "", "effective_backend": "agy",
+	}, "")
+	applyRunInfoIdentity(status, &RunInfo{
+		Agent: "stale-agent", Model: "stale-model", AgentProfile: "cloud",
+		EffectiveAgent: "stale-agent", EffectiveModel: "stale-model", EffectiveBackend: "pi",
+	})
+	for _, key := range []string{"agent", "model", "agent_profile", "effective_agent", "effective_model"} {
+		value, present := status[key]
+		if !present || value != "" {
+			t.Fatalf("status[%q] = %#v (present=%v), want authoritative empty string", key, value, present)
+		}
+	}
+	if status["effective_backend"] != "agy" {
+		t.Fatalf("effective_backend = %v, want live value", status["effective_backend"])
+	}
+}
+
 func TestTranslateStatusIdle(t *testing.T) {
 	raw := map[string]any{"status": "idle", "session_id": "ses_1", "phase": "working"}
 	result := translateStatus(raw, "")

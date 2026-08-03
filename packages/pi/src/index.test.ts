@@ -10,6 +10,7 @@ import extensionFactory, {
   createExtension,
   isTerminalStatus,
   renderStatusLines,
+  spawnIdentityMetadata,
   statusSupervisorId,
 } from './index.js'
 import { findLiveStatusForTrackedRun } from './types.js'
@@ -39,6 +40,17 @@ function buildSnapshot(): RunSnapshot {
   reducer.apply({ event: 'agent.message_chunk', runtime_id: 'rt-1', seq: 2, delta: 'world' })
   reducer.apply({ event: 'session.end', runtime_id: 'rt-1', seq: 3, final_output: 'hello world', stop_reason: 'end_turn' })
   return reducer.snapshot()
+}
+
+async function withoutAmbientAgentProfile<T>(run: () => Promise<T>): Promise<T> {
+  const previous = process.env.PI_AGENT_PROFILE
+  delete process.env.PI_AGENT_PROFILE
+  try {
+    return await run()
+  } finally {
+    if (previous === undefined) delete process.env.PI_AGENT_PROFILE
+    else process.env.PI_AGENT_PROFILE = previous
+  }
 }
 
 function makeInspectResult(statusOverrides: Partial<StatusResult> = {}): InspectResult {
@@ -84,6 +96,25 @@ describe('Avenor Pi extension', () => {
   it('only reuses a supervisor socket when the caller supplied one', () => {
     expect(statusSupervisorId(undefined, '/tmp/spawned.sock')).toBeUndefined()
     expect(statusSupervisorId('/tmp/requested.sock', '/tmp/spawned.sock')).toBe('/tmp/spawned.sock')
+  })
+
+  it('preserves roster selectors and effective identity in tool metadata', () => {
+    expect(spawnIdentityMetadata({
+      roster_file: '/repo/roster.json',
+      roster_entry: 'planner',
+    }, {
+      roster_file: '/repo/roster.json',
+      roster_entry: 'planner',
+      effective_agent: 'planner-agent',
+      effective_model: 'provider/model',
+      effective_backend: 'agy',
+    })).toEqual({
+      roster_file: '/repo/roster.json',
+      roster_entry: 'planner',
+      effective_agent: 'planner-agent',
+      effective_model: 'provider/model',
+      effective_backend: 'agy',
+    })
   })
 
   it('formats structured completion text with final output and inspection guidance', () => {
@@ -250,9 +281,11 @@ describe('Avenor Pi extension', () => {
     const externalClient = { close: externalClose, cancel: async () => {}, interruptAndPrompt: externalInterruptAndPrompt, events() { throw new Error('unused') } }
 
     const spawnToolMock = mock(async (args: { supervisorId?: string; label?: string }) => ({
-      run_id: args.label === 'waited'
-        ? 'run-wait'
-        : args.supervisorId === '/tmp/external.sock' ? 'run-external' : 'run-1',
+      run_id: args.label === 'roster-run'
+        ? 'run-roster'
+        : args.label === 'waited'
+          ? 'run-wait'
+          : args.supervisorId === '/tmp/external.sock' ? 'run-external' : 'run-1',
       label: args.label ?? 'demo',
       supervisor_id: args.supervisorId ?? '/tmp/sock',
       runtime_id: args.label === 'waited' ? 'rt-wait' : 'rt-1',
@@ -311,25 +344,70 @@ describe('Avenor Pi extension', () => {
     expect(Object.keys(registeredCommands)).toContain('avenor-watch')
     expect(Object.keys(registeredCommands)).toContain('avenor-cancel')
 
-    await registeredTools.avenor_spawn.execute(
-      'tool-1',
-      { agent: 'explore', label: '\u001b[31mtest-pi-explore\u001b[0m', thinking: 'high', supervisor_id: '/tmp/sock', wait: false },
-      undefined,
-      undefined,
-      {
-        cwd: '/tmp',
-        sessionManager: {
-          getEntries: () => [
-            { type: 'custom', customType: 'pi-agents:profile', data: { name: 'cloud' } },
-          ],
+    await withoutAmbientAgentProfile(async () => {
+      await registeredTools.avenor_spawn.execute(
+        'tool-1',
+        { agent: 'explore', label: '\u001b[31mtest-pi-explore\u001b[0m', thinking: 'high', supervisor_id: '/tmp/sock', wait: false },
+        undefined,
+        undefined,
+        {
+          cwd: '/tmp',
+          sessionManager: {
+            getEntries: () => [
+              { type: 'custom', customType: 'pi-agents:profile', data: { name: 'cloud' } },
+            ],
+          },
         },
-      },
-    )
-    expect(spawnToolMock.mock.calls[0]?.[0]).toMatchObject({
-      backend: 'pi',
-      thinking: 'high',
-      agentProfile: 'cloud',
+      )
+      expect(spawnToolMock.mock.calls[0]?.[0]).toMatchObject({
+        backend: 'pi',
+        thinking: 'high',
+        agentProfile: 'cloud',
+      })
     })
+
+    await withoutAmbientAgentProfile(async () => {
+      await registeredTools.avenor_spawn.execute(
+        'tool-roster',
+        {
+          roster_file: '/repo/roster.json',
+          roster_entry: 'planner',
+          label: 'roster-run',
+          supervisor_id: '/tmp/sock',
+          wait: false,
+        },
+        undefined,
+        undefined,
+        {
+          cwd: '/tmp',
+          sessionManager: {
+            getEntries: () => [
+              { type: 'custom', customType: 'pi-agents:profile', data: { name: 'cloud' } },
+            ],
+          },
+        },
+      )
+      expect(spawnToolMock.mock.calls[1]?.[0]).toMatchObject({
+        rosterFile: '/repo/roster.json',
+        rosterEntry: 'planner',
+        agentProfile: 'cloud',
+      })
+      expect(spawnToolMock.mock.calls[1]?.[0]).not.toHaveProperty('backend', 'pi')
+      await expect(registeredTools.avenor_spawn.execute(
+        'tool-invalid-roster',
+        {
+          roster_file: '/repo/roster.json',
+          roster_entry: 'planner',
+          backend: 'pi',
+          wait: false,
+        },
+        undefined,
+        undefined,
+        { cwd: '/tmp' },
+      )).rejects.toThrow('direct identity fields are disabled in roster mode')
+      expect(spawnToolMock).toHaveBeenCalledTimes(2)
+    })
+    spawnToolMock.mockClear()
 
     const expectedCompletion = [{
       value: 'run-1',
@@ -386,7 +464,7 @@ describe('Avenor Pi extension', () => {
       undefined,
       { cwd: '/tmp' },
     )
-    expect(spawnToolMock.mock.calls[1]?.[0]).toMatchObject({ backend: 'opencode-acp' })
+    expect(spawnToolMock.mock.calls[0]?.[0]).toMatchObject({ backend: 'opencode-acp' })
 
     let resolveExternalClose!: () => void
     const externalClosed = new Promise<void>(resolve => { resolveExternalClose = resolve })

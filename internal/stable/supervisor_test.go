@@ -793,8 +793,8 @@ func TestRunLoopChildCleansUpOnLooprunnerError(t *testing.T) {
 	if exitCode != 1 {
 		t.Fatalf("loop child exitCode = %d, want 1", exitCode)
 	}
-	if _, ok := sup.runtimes[child.id]; ok {
-		t.Fatal("loop child was not removed from supervisor runtimes")
+	if retained := sup.runtimes[child.id]; retained != child {
+		t.Fatal("completed loop child was not retained as a status tombstone")
 	}
 	if got := b.RunCount(); got != 0 {
 		t.Fatalf("broker run count = %d, want 0 after loop cleanup", got)
@@ -843,8 +843,8 @@ func TestRunTeamChildCleansUpBrokerRuns(t *testing.T) {
 	if !completed {
 		t.Fatal("team child was not marked completed")
 	}
-	if _, ok := sup.runtimes[child.id]; ok {
-		t.Fatal("team child was not removed from supervisor runtimes")
+	if retained := sup.runtimes[child.id]; retained != child {
+		t.Fatal("completed team child was not retained as a status tombstone")
 	}
 
 	if got := b.RunCount(); got != 0 {
@@ -1665,10 +1665,14 @@ type stableDeferredProvider struct {
 	channels      map[string]chan events.Event
 	started       chan struct{}
 	promptErr     error
+	starts        int
+	resumes       int
+	prompts       int
 }
 
 func (p *stableDeferredProvider) Start(_ context.Context, opts runtime.StartOptions) (runtime.Session, error) {
 	p.mu.Lock()
+	p.starts++
 	if p.channels == nil {
 		p.channels = map[string]chan events.Event{}
 	}
@@ -1681,11 +1685,15 @@ func (p *stableDeferredProvider) Start(_ context.Context, opts runtime.StartOpti
 }
 
 func (p *stableDeferredProvider) Resume(ctx context.Context, sessionID string) (runtime.Session, error) {
+	p.mu.Lock()
+	p.resumes++
+	p.mu.Unlock()
 	return p.Start(ctx, runtime.StartOptions{})
 }
 
 func (p *stableDeferredProvider) Prompt(ctx context.Context, sessionID, _ string) error {
 	p.mu.Lock()
+	p.prompts++
 	ch := p.channels[sessionID]
 	p.mu.Unlock()
 	if ch == nil {
@@ -3096,6 +3104,15 @@ func TestSpawnAndSendToParent(t *testing.T) {
 		MaxRuntimes:     10,
 		ShutdownTimeout: 0,
 	})
+	var providerSeq int
+	var providerMu sync.Mutex
+	sup.newProviderFunc = func(runtime.StartOptions, string) (runtime.Provider, error) {
+		providerMu.Lock()
+		providerSeq++
+		sessionID := fmt.Sprintf("parent-child-%d", providerSeq)
+		providerMu.Unlock()
+		return scriptedStage5Provider(sessionID, "end_turn"), nil
+	}
 	// Start the control server so the client can connect.
 	if err := sup.control.Start(socketPath); err != nil {
 		t.Fatalf("start control server: %v", err)
@@ -3196,6 +3213,9 @@ func TestSpawnAndSendToParent(t *testing.T) {
 		}
 	}
 
+	childEntry := findRuntimeByID(rts, childIDs[0])
+	childSessionID, _ := childEntry["session_id"].(string)
+
 	// 4. Send a message from child_1 to its parent via send_to_parent RPC.
 	message := "Which package should I use?"
 	err = c.SendToParent(childIDs[0], message)
@@ -3219,8 +3239,8 @@ func TestSpawnAndSendToParent(t *testing.T) {
 				if evt.RuntimeID != parentID {
 					t.Errorf("child.question runtime_id = %q, want %q", evt.RuntimeID, parentID)
 				}
-				if evt.SessionID != parentSesID {
-					t.Errorf("child.question session_id = %q, want %q", evt.SessionID, parentSesID)
+				if evt.SessionID != childSessionID {
+					t.Errorf("child.question session_id = %q, want child session %q", evt.SessionID, childSessionID)
 				}
 				gotMsg, _ := evt.Raw["message"].(string)
 				if gotMsg != message {
@@ -3567,5 +3587,302 @@ func TestRuntimeFanoutWriterDetectsPathEscape(t *testing.T) {
 	}
 	if got, _ := perm["path_escapes_cwd"].(bool); !got {
 		t.Error("path_escapes_cwd should be true for /etc/passwd outside cwd")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4 — stable default-backend propagation regression tests.
+// These verify that the independent default-backend fix in spawn() correctly
+// resolves an empty params.Backend to cli.DefaultBackend and that this
+// resolved value reaches newProviderFunc (factory.NewProvider) for both
+// loop and team children. Explicit backends pass through unchanged.
+// ---------------------------------------------------------------------------
+
+func TestSpawnEmptyBackendResolvesToDefault(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-empty-backend.sock",
+		MaxRuntimes:   2,
+	})
+
+	var capturedBackend string
+	provider := &stableFakeProvider{events: make(chan events.Event, 1)}
+	sup.newProviderFunc = func(_ runtime.StartOptions, backend string) (runtime.Provider, error) {
+		capturedBackend = backend
+		return provider, nil
+	}
+
+	_, err := sup.spawn(SpawnParams{Prompt: "test", Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("spawn with empty backend: %v", err)
+	}
+	if capturedBackend != cli.DefaultBackend {
+		t.Fatalf("backend passed to newProviderFunc = %q, want %q", capturedBackend, cli.DefaultBackend)
+	}
+}
+
+func TestSpawnExplicitBackendPreserved(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-explicit-backend.sock",
+		MaxRuntimes:   2,
+	})
+
+	var capturedBackend string
+	provider := &stableFakeProvider{events: make(chan events.Event, 1)}
+	sup.newProviderFunc = func(_ runtime.StartOptions, backend string) (runtime.Provider, error) {
+		capturedBackend = backend
+		return provider, nil
+	}
+
+	_, err := sup.spawn(SpawnParams{Prompt: "test", Dir: t.TempDir(), Backend: "agy"})
+	if err != nil {
+		t.Fatalf("spawn with explicit backend: %v", err)
+	}
+	if capturedBackend != "agy" {
+		t.Fatalf("backend passed to newProviderFunc = %q, want agy", capturedBackend)
+	}
+}
+
+// TestLoopChildReceivesResolvedDefaultBackend verifies that when spawn is
+// called with an empty Backend, the resolved cli.DefaultBackend propagates
+// through runLoopChild into every phase attempt's newProviderFunc call.
+func TestLoopChildReceivesResolvedDefaultBackend(t *testing.T) {
+	provider := &stableScriptedProvider{
+		attempt: -1,
+		scripts: []stableScriptedAttempt{{
+			sessionID: "ses_loop_default",
+			events:    []stableScriptedEvent{{event: events.Event{Event: "session.end", SessionID: "ses_loop_default", Fields: map[string]any{"stop_reason": "end_turn"}}}},
+		}},
+	}
+
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-loop-default-backend.sock",
+		MaxRuntimes:   1,
+	})
+
+	var capturedBackend string
+	sup.newProviderFunc = func(_ runtime.StartOptions, backend string) (runtime.Provider, error) {
+		capturedBackend = backend
+		return provider, nil
+	}
+
+	child := &childRuntime{
+		id:          "rt_loop_default_be",
+		done:        make(chan struct{}),
+		promptCh:    make(chan struct{}, 1),
+		eventWriter: stableTestSink{},
+		cancelFn:    func() {},
+	}
+	sup.runtimes[child.id] = child
+
+	cfg := &looprunner.LoopConfig{MaxIterations: 1, Pre: []phaseconfig.Phase{{Name: "work", Prompt: "work"}}}
+
+	// Call runLoopChild directly with an empty backend string, which is what
+	// spawn() passes after resolving params.Backend == "" → cli.DefaultBackend.
+	go sup.runLoopChild(context.Background(), child, cfg, 0, "", "", "", "", "", cli.DefaultBackend)
+
+	select {
+	case <-child.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runLoopChild did not complete within timeout")
+	}
+
+	if capturedBackend != cli.DefaultBackend {
+		t.Fatalf("loop child backend = %q, want %q", capturedBackend, cli.DefaultBackend)
+	}
+}
+
+// TestLoopChildReceivesExplicitBackend verifies that an explicitly supplied
+// backend is propagated unchanged through runLoopChild.
+func TestLoopChildReceivesExplicitBackend(t *testing.T) {
+	provider := &stableScriptedProvider{
+		attempt: -1,
+		scripts: []stableScriptedAttempt{{
+			sessionID: "ses_loop_explicit",
+			events:    []stableScriptedEvent{{event: events.Event{Event: "session.end", SessionID: "ses_loop_explicit", Fields: map[string]any{"stop_reason": "end_turn"}}}},
+		}},
+	}
+
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-loop-explicit-backend.sock",
+		MaxRuntimes:   1,
+	})
+
+	var capturedBackend string
+	sup.newProviderFunc = func(_ runtime.StartOptions, backend string) (runtime.Provider, error) {
+		capturedBackend = backend
+		return provider, nil
+	}
+
+	child := &childRuntime{
+		id:          "rt_loop_explicit_be",
+		done:        make(chan struct{}),
+		promptCh:    make(chan struct{}, 1),
+		eventWriter: stableTestSink{},
+		cancelFn:    func() {},
+	}
+	sup.runtimes[child.id] = child
+
+	cfg := &looprunner.LoopConfig{MaxIterations: 1, Pre: []phaseconfig.Phase{{Name: "work", Prompt: "work"}}}
+
+	go sup.runLoopChild(context.Background(), child, cfg, 0, "", "", "", "", "", "custom-backend")
+
+	select {
+	case <-child.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runLoopChild did not complete within timeout")
+	}
+
+	if capturedBackend != "custom-backend" {
+		t.Fatalf("loop child backend = %q, want custom-backend", capturedBackend)
+	}
+}
+
+// TestTeamChildReceivesResolvedDefaultBackend verifies that when spawn is
+// called with an empty Backend, the resolved cli.DefaultBackend propagates
+// through runTeamChild into every phase attempt's newProviderFunc call.
+func TestTeamChildReceivesResolvedDefaultBackend(t *testing.T) {
+	provider := &stableScriptedProvider{
+		attempt: -1,
+		scripts: []stableScriptedAttempt{{
+			sessionID: "ses_team_default",
+			events:    []stableScriptedEvent{{event: events.Event{Event: "session.end", SessionID: "ses_team_default", Fields: map[string]any{"stop_reason": "end_turn"}}}},
+		}},
+	}
+
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-team-default-backend.sock",
+		MaxRuntimes:   1,
+	})
+
+	var capturedBackend string
+	sup.newProviderFunc = func(_ runtime.StartOptions, backend string) (runtime.Provider, error) {
+		capturedBackend = backend
+		return provider, nil
+	}
+
+	child := &childRuntime{
+		id:          "rt_team_default_be",
+		done:        make(chan struct{}),
+		promptCh:    make(chan struct{}, 1),
+		eventWriter: stableTestSink{},
+		cancelFn:    func() {},
+	}
+	sup.runtimes[child.id] = child
+
+	cfg := &teamrunner.TeamConfig{Team: []phaseconfig.Phase{{Name: "work", Prompt: "work"}}}
+
+	go sup.runTeamChild(context.Background(), child, cfg, 0, "", "", "", "", "", cli.DefaultBackend)
+
+	select {
+	case <-child.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runTeamChild did not complete within timeout")
+	}
+
+	if capturedBackend != cli.DefaultBackend {
+		t.Fatalf("team child backend = %q, want %q", capturedBackend, cli.DefaultBackend)
+	}
+}
+
+// TestTeamChildReceivesExplicitBackend verifies that an explicitly supplied
+// backend is propagated unchanged through runTeamChild.
+func TestTeamChildReceivesExplicitBackend(t *testing.T) {
+	provider := &stableScriptedProvider{
+		attempt: -1,
+		scripts: []stableScriptedAttempt{{
+			sessionID: "ses_team_explicit",
+			events:    []stableScriptedEvent{{event: events.Event{Event: "session.end", SessionID: "ses_team_explicit", Fields: map[string]any{"stop_reason": "end_turn"}}}},
+		}},
+	}
+
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-team-explicit-backend.sock",
+		MaxRuntimes:   1,
+	})
+
+	var capturedBackend string
+	sup.newProviderFunc = func(_ runtime.StartOptions, backend string) (runtime.Provider, error) {
+		capturedBackend = backend
+		return provider, nil
+	}
+
+	child := &childRuntime{
+		id:          "rt_team_explicit_be",
+		done:        make(chan struct{}),
+		promptCh:    make(chan struct{}, 1),
+		eventWriter: stableTestSink{},
+		cancelFn:    func() {},
+	}
+	sup.runtimes[child.id] = child
+
+	cfg := &teamrunner.TeamConfig{Team: []phaseconfig.Phase{{Name: "work", Prompt: "work"}}}
+
+	go sup.runTeamChild(context.Background(), child, cfg, 0, "", "", "", "", "", "agy")
+
+	select {
+	case <-child.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runTeamChild did not complete within timeout")
+	}
+
+	if capturedBackend != "agy" {
+		t.Fatalf("team child backend = %q, want agy", capturedBackend)
+	}
+}
+
+// TestSpawnDirectPathUsesResolvedBackend exercises the non-loop/team spawn path
+// to confirm that an empty params.Backend resolves to cli.DefaultBackend and
+// that value is passed to newProviderFunc.
+func TestSpawnDirectPathUsesResolvedBackend(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-direct-resolved-backend.sock",
+		MaxRuntimes:   2,
+	})
+
+	var capturedBackend string
+	provider := &stableFakeProvider{events: make(chan events.Event, 1)}
+	sup.newProviderFunc = func(_ runtime.StartOptions, backend string) (runtime.Provider, error) {
+		capturedBackend = backend
+		return provider, nil
+	}
+
+	_, err := sup.spawn(SpawnParams{
+		Prompt: "test direct",
+		Dir:    t.TempDir(),
+		// No Backend specified — should resolve to cli.DefaultBackend.
+	})
+	if err != nil {
+		t.Fatalf("spawn direct with no backend: %v", err)
+	}
+	if capturedBackend != cli.DefaultBackend {
+		t.Fatalf("direct spawn backend = %q, want %q", capturedBackend, cli.DefaultBackend)
+	}
+}
+
+// TestSpawnDirectPathPreservesExplicitBackend confirms that a non-empty
+// params.Backend survives the spawn path unchanged.
+func TestSpawnDirectPathPreservesExplicitBackend(t *testing.T) {
+	sup := NewSupervisor(Config{
+		ControlSocket: "/tmp/test-direct-explicit-backend.sock",
+		MaxRuntimes:   2,
+	})
+
+	var capturedBackend string
+	provider := &stableFakeProvider{events: make(chan events.Event, 1)}
+	sup.newProviderFunc = func(_ runtime.StartOptions, backend string) (runtime.Provider, error) {
+		capturedBackend = backend
+		return provider, nil
+	}
+
+	_, err := sup.spawn(SpawnParams{
+		Prompt:  "test direct",
+		Dir:     t.TempDir(),
+		Backend: "gemini-acp",
+	})
+	if err != nil {
+		t.Fatalf("spawn direct with explicit backend: %v", err)
+	}
+	if capturedBackend != "gemini-acp" {
+		t.Fatalf("direct spawn backend = %q, want gemini-acp", capturedBackend)
 	}
 }

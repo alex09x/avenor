@@ -26,12 +26,14 @@ type attemptResult struct {
 	output        string
 	finalReply    string
 	usage         map[string]any
+	err           error
 }
 
 type attemptConfig struct {
 	startOptions           runtime.StartOptions
 	backend                string
 	resumeID               string
+	sessionBackends        *sessionBackendMap
 	initialPrompt          string
 	runID                  string
 	runLabel               string
@@ -63,6 +65,19 @@ func runSingleAttempt(
 	cfg attemptConfig,
 	deps attemptDeps,
 ) attemptResult {
+	identity, err := cfg.sessionBackends.resolveResume(cfg.resumeID, cliSessionIdentity{
+		backend: cfg.backend, agent: cfg.startOptions.Agent, model: cfg.startOptions.Model,
+		agentProfile: cfg.startOptions.AgentProfile,
+	})
+	if err != nil {
+		fmt.Fprintf(deps.stderr, "avenor: %v\n", err)
+		return attemptResult{exitCode: 1, err: err}
+	}
+	cfg.backend = identity.backend
+	cfg.startOptions.Agent = identity.agent
+	cfg.startOptions.Model = identity.model
+	cfg.startOptions.AgentProfile = identity.agentProfile
+
 	provider, err := newProvider(cfg.startOptions, cfg.backend)
 	if err != nil {
 		fmt.Fprintf(deps.stderr, "avenor: create provider: %v\n", err)
@@ -79,6 +94,14 @@ func runSingleAttempt(
 		fmt.Fprintf(deps.stderr, "avenor: start session: %v\n", err)
 		return attemptResult{exitCode: 1}
 	}
+
+	attempt := &cliSessionAttempt{}
+	if err := cfg.sessionBackends.claim(session.SessionID, identity, attempt, cfg.resumeID); err != nil {
+		fmt.Fprintf(deps.stderr, "avenor: %v\n", err)
+		return attemptResult{exitCode: 1, err: err}
+	}
+	provisionalID := session.SessionID
+	defer func() { cfg.sessionBackends.finish(provisionalID, session.SessionID, attempt) }()
 
 	prompt := cfg.initialPrompt
 
@@ -131,6 +154,9 @@ func runSingleAttempt(
 			PermissionClaimTimeout: cfg.permissionClaimTimeout,
 			ProgressTimeout:        cfg.progressTimeout,
 			Timeout:                cfg.timer,
+			AcceptSessionID: func(externalID string) bool {
+				return cfg.sessionBackends.adopt(session.SessionID, externalID, attempt)
+			},
 			AdoptSessionID: func(externalID string) {
 				session.SessionID = externalID
 			},
@@ -147,6 +173,12 @@ func runSingleAttempt(
 		if phaseconfig.LoopDirectiveSeverity(result.LoopDirective) > phaseconfig.LoopDirectiveSeverity(accDirective) {
 			accDirective = result.LoopDirective
 			accLabel = result.LoopLabel
+		}
+
+		// An authoritative ID conflict invalidates this attempt. Do not service
+		// queued control prompts by resuming its provisional session ID.
+		if result.StopReason == runtime.SessionIDConflictStopReason {
+			return attemptResult{exitCode: exitCode, sessionID: session.SessionID, stopReason: result.StopReason, loopDirective: accDirective, loopLabel: accLabel, output: result.Output, finalReply: result.FinalReply, usage: result.Usage}
 		}
 
 		if deps.controlServer != nil {
