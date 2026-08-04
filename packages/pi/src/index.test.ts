@@ -1,10 +1,12 @@
 import { describe, expect, it, mock } from 'bun:test'
+import { createHash } from 'node:crypto'
 import type { InspectResult, RunSnapshot, StatusResult } from '@dougbots/avenor-core'
 import type { ExtensionDeps } from './index.js'
 import { RunReducer } from '@dougbots/avenor-core'
 import extensionFactory, {
   buildCompletionText,
   buildInspectPayload,
+  CHANNEL_POLL_COMPLETED,
   CHANNEL_POLL_ERROR,
   CHANNEL_RUN_TERMINAL,
   compactWhitespace,
@@ -89,47 +91,103 @@ function makeInspectResult(statusOverrides: Partial<StatusResult> = {}): Inspect
   }
 }
 
-async function createPollingHarness(statusTool: any, observeRun = mock(() => null)) {
+async function createHarnessBase(options: {
+  deps?: Partial<ExtensionDeps>
+  extOptions?: { pollIntervalMs?: number }
+  ui?: Record<string, any>
+  onEmit?: (channel: string, payload: unknown) => void
+  sendUserMessage?: any
+}) {
   const registeredTools: Record<string, any> = {}
   const registeredCommands: Record<string, any> = {}
   const eventHandlers: Record<string, any> = {}
   const setStatus = mock((..._args: any[]) => {})
   const setWidget = mock((..._args: any[]) => {})
   const notify = mock((..._args: any[]) => {})
+  const sendUserMessage = options.sendUserMessage ?? mock(() => {})
   const emitted: Array<[string, unknown]> = []
-  let resolvePollCompleted: (() => void) | undefined
-  const waitForPoll = () => new Promise<void>(resolve => { resolvePollCompleted = resolve })
   const mockPi = {
     on: (event: string, handler: any) => { eventHandlers[event] = handler },
     registerTool: (definition: { name: string }) => { registeredTools[definition.name] = definition },
     registerCommand: (name: string, definition: any) => { registeredCommands[name] = definition },
     registerMessageRenderer: () => {},
-    sendUserMessage: () => {},
+    sendUserMessage,
     events: {
       emit: mock((channel: string, payload: unknown) => {
         emitted.push([channel, payload])
-        if (channel === 'avenor:poll:completed') resolvePollCompleted?.()
+        options.onEmit?.(channel, payload)
       }),
       on: mock(() => () => {}),
     },
   }
-  await createExtension({
+  const baseDeps: ExtensionDeps = {
     spawnTool: mock(async () => ({ run_id: 'run-1', label: 'demo', supervisor_id: '/tmp/sock', runtime_id: 'rt-1' })),
-    statusTool,
+    statusTool: mock(async () => []),
     eventsTool: mock(async () => ({ events: [] })),
     answerPermissionTool: mock(async () => ({ ok: true })),
     followUpTool: mock(async () => ({ run_id: 'run-2', label: 'follow-up' })),
     inspectTool: mock(async () => makeInspectResult({ status: 'running' })),
     resultTool: mock(async () => ({ run_id: 'run-1', label: 'demo', status: 'done', ready: true })),
     shutdownTool: mock(async () => ({ ok: true })),
-    observeRun,
+    observeRun: mock(() => null),
     dial: mock(async () => ({ close() {} })),
     Supervisor: class {} as any,
-  } as any)(mockPi as any)
+  }
+  await createExtension({ ...baseDeps, ...options.deps }, options.extOptions)(mockPi as any)
 
-  const ctx = { cwd: '/tmp', ui: { setStatus, setWidget, notify } }
+  const ctx = { cwd: '/tmp', ui: { setStatus, setWidget, notify, ...(options.ui ?? {}) } }
   await eventHandlers.session_start({}, ctx)
-  return { ctx, emitted, eventHandlers, notify, registeredCommands, registeredTools, setStatus, setWidget, waitForPoll }
+  return { ctx, emitted, eventHandlers, notify, registeredCommands, registeredTools, sendUserMessage, setStatus, setWidget }
+}
+
+async function createPollingHarness(statusTool: any, observeRun = mock(() => null)) {
+  let resolvePollCompleted: (() => void) | undefined
+  const waitForPoll = () => new Promise<void>(resolve => { resolvePollCompleted = resolve })
+  const h = await createHarnessBase({
+    deps: { statusTool, observeRun },
+    onEmit: (channel) => {
+      if (channel === CHANNEL_POLL_COMPLETED) resolvePollCompleted?.()
+    },
+  })
+  return { ...h, waitForPoll }
+}
+
+async function createMultiSupervisorHarness(options: {
+  pollIntervalMs?: number
+  statusTool: any
+  spawnTool?: any
+  shutdownTool?: any
+  observeRun?: any
+  /** Supervisor mock; provides isCurrentInstance for singleton-scope tests. */
+  supervisor?: { isCurrentInstance?: (supervisorId: string) => boolean }
+}) {
+  const confirm = mock(async () => true)
+  let pollCount = 0
+  const pollWaiters: Array<{ n: number; resolve: () => void }> = []
+  const waitPolls = (n: number) => new Promise<void>(resolve => {
+    if (pollCount >= n) return resolve()
+    pollWaiters.push({ n, resolve })
+  })
+  const h = await createHarnessBase({
+    deps: {
+      statusTool: options.statusTool,
+      ...(options.spawnTool !== undefined && { spawnTool: options.spawnTool }),
+      ...(options.shutdownTool !== undefined && { shutdownTool: options.shutdownTool }),
+      ...(options.observeRun !== undefined && { observeRun: options.observeRun }),
+      ...(options.supervisor !== undefined && { Supervisor: options.supervisor as any }),
+    },
+    extOptions: { pollIntervalMs: options.pollIntervalMs ?? 5 },
+    ui: { confirm },
+    onEmit: (channel) => {
+      if (channel === CHANNEL_POLL_COMPLETED) {
+        pollCount++
+        for (let i = pollWaiters.length - 1; i >= 0; i--) {
+          if (pollCount >= pollWaiters[i].n) pollWaiters.splice(i, 1)[0].resolve()
+        }
+      }
+    },
+  })
+  return { ...h, confirm, waitPolls }
 }
 
 describe('Avenor Pi extension', () => {
@@ -209,22 +267,31 @@ describe('Avenor Pi extension', () => {
       runtime_id: 'rt-1',
     }
 
-    expect(findLiveStatusForTrackedRun({ runId: 'canonical-run' }, [live])).toBe(live)
-    expect(findLiveStatusForTrackedRun({ runId: 'missing' }, [])).toBeUndefined()
+    // Singleton-scoped runs reconcile against the unqualified live list.
+    expect(findLiveStatusForTrackedRun({ runId: 'canonical-run' }, [live], true)).toBe(live)
+    expect(findLiveStatusForTrackedRun({ runId: 'missing' }, [], true)).toBeUndefined()
     expect(findLiveStatusForTrackedRun({
       runId: 'spawn-uuid',
       runtimeId: 'rt-1',
-    }, [live])).toBe(live)
+    }, [live], true)).toBe(live)
+    // A run on another supervisor is never reconciled against the singleton
+    // live list, even when its recorded id happens to match a live entry.
     expect(findLiveStatusForTrackedRun({
       runId: 'spawn-uuid',
       runtimeId: 'rt-1',
       supervisorId: '/tmp/other.sock',
-    }, [live])).toBeUndefined()
+    }, [live], false)).toBeUndefined()
     expect(findLiveStatusForTrackedRun({
       runId: 'spawn-uuid',
       supervisorId: '/tmp/other.sock',
       lastStatus: live,
-    }, [live])).toBe(live)
+    }, [live], false)).toBeUndefined()
+    // A shared rt_1 across supervisors stays isolated per namespace.
+    expect(findLiveStatusForTrackedRun({
+      runId: 'rt_1',
+      runtimeId: 'rt_1',
+      supervisorId: '/tmp/factory.sock',
+    }, [{ ...live, run_id: 'rt_1', runtime_id: 'rt_1' }], false)).toBeUndefined()
   })
 
   it('renders only active statuses with phase and permission markers', () => {
@@ -433,10 +500,10 @@ describe('Avenor Pi extension', () => {
       eventsTool: mock(async () => ({ events: [] })),
       answerPermissionTool: mock(async () => ({ ok: true })),
       followUpTool: mock(async () => ({ run_id: 'run-2', label: 'follow-up' })),
-      inspectTool: mock(async () => {
+      inspectTool: mock(async (args: { runId?: string } = {}) => {
         const result = makeInspectResult({ status: 'running' })
         result.snapshot = { ...result.snapshot, ended: false, stop_reason: undefined }
-        result.status = { ...result.status, status: 'running', stop_reason: undefined }
+        result.status = { ...result.status, status: 'running', stop_reason: undefined, run_id: args?.runId ?? 'run-1' }
         return result
       }),
       resultTool: resultToolMock,
@@ -795,5 +862,223 @@ describe('Avenor Pi extension', () => {
     ).render(2_000).join('\n').trimEnd()
     expect(rendered).toContain('Inspect: demo — done')
     expect(rendered).not.toContain('"snapshot"')
+  })
+
+  it('tracks colliding run ids from two supervisors independently', async () => {
+    const FACTORY = '/tmp/avenor-mcp-factory-retro.sock'
+    const ADVISOR = '/tmp/avenor-mcp-advisor.sock'
+
+    const factoryStatus: StatusResult = {
+      run_id: 'rt_1', label: 'factory', status: 'running', runtime_id: 'rt_1',
+      session_id: '019fc5c7-b8c0-761e-a23a-0295e921aaf6',
+    }
+    const advisorRunning: StatusResult = {
+      run_id: 'rt_1', label: 'advisor', status: 'running', runtime_id: 'rt_1',
+      session_id: '019fc5c7-f8e5-76c0-9075-9ec6c836d3de',
+    }
+    const statusCalls: Array<{ runId?: string; supervisorId?: string }> = []
+    const statusTool = mock(async (args: { runId?: string; supervisorId?: string } = {}) => {
+      statusCalls.push(args)
+      if (!args.runId) return []                                                                              // unqualified list = current singleton (no runs)
+      if (args.supervisorId === FACTORY) return factoryStatus
+      if (args.supervisorId === ADVISOR) return advisorRunning
+      return { run_id: args.runId, label: args.runId, status: 'done' }
+    })
+
+    const h = await createMultiSupervisorHarness({
+      statusTool,
+      spawnTool: mock(async (args: { supervisorId?: string; label?: string }) => ({
+        run_id: 'rt_1',
+        label: args.label ?? 'spawned',
+        supervisor_id: args.supervisorId ?? '/tmp/sock',
+        runtime_id: 'rt_1',
+      })),
+    })
+
+    // Both supervisors independently expose a run_id of rt_1.
+    await h.registeredTools.avenor_spawn.execute('t1', { agent: 'explore', label: 'factory', supervisor_id: FACTORY, wait: false }, undefined, undefined, h.ctx)
+    await h.registeredTools.avenor_spawn.execute('t2', { agent: 'explore', label: 'advisor', supervisor_id: ADVISOR, wait: false }, undefined, undefined, h.ctx)
+
+    // Both runs stay tracked and are polled through their own supervisor; the
+    // shared run id must not collapse them into one tracking slot.
+    await h.registeredCommands['avenor-status'].handler('', h.ctx)
+    const detail = h.setWidget.mock.calls.filter(([name]) => name === 'avenor-status-detail').at(-1)?.[1] as string[]
+    expect(detail).toHaveLength(2)
+    expect(detail.join('\n')).toContain('factory')
+    expect(detail.join('\n')).toContain('advisor')
+    expect(statusCalls).toContainEqual({ runId: 'rt_1', supervisorId: FACTORY })
+    expect(statusCalls).toContainEqual({ runId: 'rt_1', supervisorId: ADVISOR })
+
+    await h.eventHandlers.session_shutdown()
+  })
+
+  it('routes the completion message to the right supervisor for colliding run ids', async () => {
+    const FACTORY = '/tmp/avenor-mcp-factory-retro.sock'
+    const ADVISOR = '/tmp/avenor-mcp-advisor.sock'
+
+    const factoryStatus: StatusResult = {
+      run_id: 'rt_1', label: 'factory', status: 'running', runtime_id: 'rt_1',
+      session_id: '019fc5c7-b8c0-761e-a23a-0295e921aaf6',
+    }
+    const advisorRunning: StatusResult = {
+      run_id: 'rt_1', label: 'advisor', status: 'running', runtime_id: 'rt_1',
+      session_id: '019fc5c7-f8e5-76c0-9075-9ec6c836d3de',
+    }
+    let advisorDone = false
+    const statusTool = mock(async (args: { runId?: string; supervisorId?: string } = {}) => {
+      if (!args.runId) return []
+      if (args.supervisorId === FACTORY) return factoryStatus
+      if (args.supervisorId === ADVISOR) {
+        return advisorDone ? { ...advisorRunning, status: 'done', final_output: 'advisor final answer' } : advisorRunning
+      }
+      return { run_id: args.runId, label: args.runId, status: 'done' }
+    })
+
+    const h = await createMultiSupervisorHarness({
+      statusTool,
+      spawnTool: mock(async (args: { supervisorId?: string; label?: string }) => ({
+        run_id: 'rt_1',
+        label: args.label ?? 'spawned',
+        supervisor_id: args.supervisorId ?? '/tmp/sock',
+        runtime_id: 'rt_1',
+      })),
+    })
+
+    await h.registeredTools.avenor_spawn.execute('t1', { agent: 'explore', label: 'factory', supervisor_id: FACTORY, wait: false }, undefined, undefined, h.ctx)
+    await h.registeredTools.avenor_spawn.execute('t2', { agent: 'explore', label: 'advisor', supervisor_id: ADVISOR, wait: false }, undefined, undefined, h.ctx)
+
+    // The advisor run finishes: its completion must combine the advisor label,
+    // output, and session without touching the still-running factory run.
+    let resolveCompletion!: () => void
+    const completionSent = new Promise<void>(resolve => { resolveCompletion = resolve })
+    // Install the sendUserMessage hook BEFORE flipping advisorDone so no
+    // completion can slip past the no-op mock and leave the test hanging.
+    h.sendUserMessage.mockImplementation(() => resolveCompletion())
+    advisorDone = true
+    await completionSent
+
+    // Only the advisor reaches terminal status, so the last message is its
+    // completion. Use at(-1) so future permission notifications cannot shift it.
+    const [completionText] = h.sendUserMessage.mock.calls.at(-1) ?? []
+    expect(String(completionText)).toContain('Sub-agent "advisor" finished')
+    expect(String(completionText)).toContain('> advisor final answer')
+    expect(String(completionText)).toContain('`019fc5c7-f8e5-76c0-9075-9ec6c836d3de`')
+    expect(String(completionText)).not.toContain('019fc5c7-b8c0-761e-a23a-0295e921aaf6')
+
+    const terminal = h.emitted.filter(([c]) => c === CHANNEL_RUN_TERMINAL).map(([, p]) => p as Record<string, unknown>)
+    const advisorTerminal = terminal.find(t => t.status === 'done' && t.label === 'advisor')
+    expect(advisorTerminal).toMatchObject({ runId: 'rt_1', label: 'advisor', status: 'done' })
+    const supervisorKey = (id: string) => `supervisor:${createHash('sha256').update(id).digest('hex').slice(0, 16)}`
+    expect(advisorTerminal?.supervisorKey).toBe(supervisorKey(ADVISOR))
+
+    // The factory run is untouched and remains tracked and active.
+    await h.registeredCommands['avenor-status'].handler('', h.ctx)
+    const after = h.setWidget.mock.calls.filter(([name]) => name === 'avenor-status-detail').at(-1)?.[1] as string[]
+    expect(after).toHaveLength(1)
+    expect(after[0]).toContain('factory')
+    expect(after[0]).not.toContain('advisor')
+
+    await h.eventHandlers.session_shutdown()
+  })
+
+  it('avenor_shutdown removes only the tracked runs for the target supervisor', async () => {
+    const A = '/tmp/supervisor-a.sock'
+    const B = '/tmp/supervisor-b.sock'
+    const runA: StatusResult = { run_id: 'rt_1', label: 'a-run', status: 'running', runtime_id: 'rt_1' }
+    const runB: StatusResult = { run_id: 'rt_1', label: 'b-run', status: 'running', runtime_id: 'rt_1' }
+    const statusCalls: Array<{ runId?: string; supervisorId?: string }> = []
+    const statusTool = mock(async (args: { runId?: string; supervisorId?: string } = {}) => {
+      statusCalls.push(args)
+      if (!args.runId) return []
+      if (args.supervisorId === A) return runA
+      if (args.supervisorId === B) return runB
+      return { run_id: args.runId, label: args.runId, status: 'done' }
+    })
+    const shutdownTool = mock(async () => ({ ok: true }))
+
+    const h = await createMultiSupervisorHarness({
+      statusTool,
+      shutdownTool,
+      spawnTool: mock(async (args: { supervisorId?: string; label?: string }) => ({
+        run_id: 'rt_1',
+        label: args.label ?? 'spawned',
+        supervisor_id: args.supervisorId ?? '/tmp/sock',
+        runtime_id: 'rt_1',
+      })),
+    })
+
+    await h.registeredTools.avenor_spawn.execute('t1', { agent: 'explore', label: 'a-run', supervisor_id: A, wait: false }, undefined, undefined, h.ctx)
+    await h.registeredTools.avenor_spawn.execute('t2', { agent: 'explore', label: 'b-run', supervisor_id: B, wait: false }, undefined, undefined, h.ctx)
+    await h.registeredCommands['avenor-status'].handler('', h.ctx)
+    expect(h.setWidget.mock.calls.filter(([n]) => n === 'avenor-status-detail').at(-1)?.[1]).toHaveLength(2)
+
+    const bBefore = statusCalls.filter(c => c.supervisorId === B).length
+    const aBefore = statusCalls.filter(c => c.supervisorId === A).length
+    await h.registeredTools.avenor_shutdown.execute('t-shutdown', { supervisor_id: B })
+    expect(shutdownTool).toHaveBeenCalledWith({ supervisorId: B, force: undefined })
+
+    // The B supervisor run is gone; the A run survives and keeps being polled.
+    await h.registeredCommands['avenor-status'].handler('', h.ctx)
+    const detail = h.setWidget.mock.calls.filter(([n]) => n === 'avenor-status-detail').at(-1)?.[1] as string[]
+    expect(detail).toHaveLength(1)
+    expect(detail[0]).toContain('a-run')
+    expect(statusCalls.filter(c => c.supervisorId === B).length).toBe(bBefore)
+    expect(statusCalls.filter(c => c.supervisorId === A).length).toBeGreaterThan(aBefore)
+
+    await h.eventHandlers.session_shutdown()
+  })
+  it('avenor_shutdown of the singleton keeps custom-supervisor runs', async () => {
+    const A = '/tmp/supervisor-a.sock'
+    const SINGLETON = '/tmp/avenor-mcp-singleton.sock'
+    const runA: StatusResult = { run_id: 'rt_1', label: 'a-run', status: 'running', runtime_id: 'rt_1' }
+    const runS: StatusResult = { run_id: 'rt_2', label: 'singleton-run', status: 'running', runtime_id: 'rt_2' }
+    const statusCalls: Array<{ runId?: string; supervisorId?: string }> = []
+    const statusTool = mock(async (args: { runId?: string; supervisorId?: string } = {}) => {
+      statusCalls.push(args)
+      if (!args.runId) return []
+      if (args.supervisorId === A) return runA
+      // The singleton answers for both its implicit (undefined) and explicit socket.
+      if (args.supervisorId === undefined || args.supervisorId === SINGLETON) return runS
+      return { run_id: args.runId, label: args.runId, status: 'done' }
+    })
+    const shutdownTool = mock(async () => ({ ok: true }))
+
+    const h = await createMultiSupervisorHarness({
+      statusTool,
+      shutdownTool,
+      supervisor: {
+        isCurrentInstance: (supervisorId: string) => supervisorId === SINGLETON,
+      },
+      spawnTool: mock(async (args: { supervisorId?: string; label?: string }) => ({
+        run_id: args.label === 'singleton-run' ? 'rt_2' : 'rt_1',
+        label: args.label ?? 'spawned',
+        supervisor_id: args.supervisorId ?? SINGLETON,
+        runtime_id: args.label === 'singleton-run' ? 'rt_2' : 'rt_1',
+      })),
+    })
+
+    await h.registeredTools.avenor_spawn.execute('t1', { agent: 'explore', label: 'a-run', supervisor_id: A, wait: false }, undefined, undefined, h.ctx)
+    // One singleton run without an explicit socket (undefined namespace) and one
+    // carrying the singleton's explicit socket; both belong to the singleton.
+    await h.registeredTools.avenor_spawn.execute('t2', { agent: 'explore', label: 'singleton-run', wait: false }, undefined, undefined, h.ctx)
+    await h.registeredTools.avenor_spawn.execute('t3', { agent: 'explore', label: 'singleton-run', supervisor_id: SINGLETON, wait: false }, undefined, undefined, h.ctx)
+    await h.registeredCommands['avenor-status'].handler('', h.ctx)
+    expect(h.setWidget.mock.calls.filter(([n]) => n === 'avenor-status-detail').at(-1)?.[1]).toHaveLength(3)
+
+    // Shut down the singleton: only the singleton-scoped runs disappear; the
+    // custom-supervisor run stays tracked and keeps being polled.
+    const aBefore = statusCalls.filter(c => c.supervisorId === A).length
+    await h.registeredTools.avenor_shutdown.execute('t-shutdown', {})
+    expect(shutdownTool).toHaveBeenCalledWith({ supervisorId: undefined, force: undefined })
+
+    await h.registeredCommands['avenor-status'].handler('', h.ctx)
+    const detail = h.setWidget.mock.calls.filter(([n]) => n === 'avenor-status-detail').at(-1)?.[1] as string[]
+    expect(detail).toHaveLength(1)
+    expect(detail[0]).toContain('a-run')
+    expect(detail[0]).not.toContain('singleton-run')
+    expect(statusCalls.filter(c => c.supervisorId === SINGLETON).length).toBeGreaterThan(0)
+    expect(statusCalls.filter(c => c.supervisorId === A).length).toBeGreaterThan(aBefore)
+
+    await h.eventHandlers.session_shutdown()
   })
 })
