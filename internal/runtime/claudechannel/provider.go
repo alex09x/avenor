@@ -559,6 +559,15 @@ func retryPromptSubmitIfIdle(ctx context.Context, term terminal.Session, prompt 
 	_ = term.SendKeys(ctx, terminal.KeyEnter)
 }
 
+// channelPolicyBlocked reports whether managed org policy stopped Claude from
+// loading development channels. The banner names the flag and the blocking
+// reason on one line. Match its invariant middle, not the trailing
+// "(server:...)" suffix, because that suffix carries a per-run name.
+func channelPolicyBlocked(out string) bool {
+	return strings.Contains(out, "development-channels blocked by org policy") ||
+		strings.Contains(out, "Inbound messages will be silently dropped")
+}
+
 func autoConfirmDevelopmentChannelPrompt(ctx context.Context, s *session) {
 	deadline := time.NewTimer(startupPromptTimeout)
 	defer deadline.Stop()
@@ -579,6 +588,41 @@ func autoConfirmDevelopmentChannelPrompt(ctx context.Context, s *session) {
 		out, err := s.Term.Capture(ctx)
 		if err != nil {
 			continue
+		}
+		if channelPolicyBlocked(out) {
+			// Managed settings can refuse --dangerously-load-development-channels.
+			// Claude still starts and still answers in the pane, but it reports
+			// "inbound messages will be silently dropped". The sidecar never
+			// registers, so avenor_finish never arrives. The run then sits at
+			// phase=waiting until the overall timeout. Fail fast with a
+			// diagnosable reason instead.
+			s.Emit(events.Event{
+				Event:     "agent.channel_blocked",
+				SessionID: s.SessionID,
+				Fields: map[string]any{
+					"error":       "development channels blocked by org policy; set channelsEnabled: true in managed settings, or use --backend claude",
+					"server_name": s.mcpServer,
+					"source":      "channel",
+				},
+			})
+			// Cancelling alone is not enough. runSession's ctx.Done branch kills
+			// the terminal without emitting session.end. Anything that gates on a
+			// terminal status, such as avenor_status and avenor_result, then waits
+			// forever. MarkFinished is the existing guard against double-emitting.
+			if s.MarkFinished() {
+				s.Emit(events.Event{
+					Event:     "session.end",
+					SessionID: s.SessionID,
+					Fields: map[string]any{
+						"status":      "failed",
+						"stop_reason": "channel_blocked",
+					},
+				})
+			}
+			if s.CancelFn != nil {
+				s.CancelFn()
+			}
+			return
 		}
 		if strings.Contains(out, "New MCP server found in this project") {
 			_ = s.Term.SendKeys(ctx, terminal.Key("1"), terminal.KeyEnter)

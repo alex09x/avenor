@@ -36,6 +36,33 @@ var paneReadyMarkers = []string{
 	"❯ Try",
 }
 
+// inputBoxRule is the horizontal rule Claude draws above and below the input
+// box. Because Claude Code 2.1.x removed both paneReadyMarkers (the welcome
+// column and the `❯ Try` placeholder), use this rule to identify the framed
+// input box instead.
+const inputBoxRule = "────────────────────"
+
+// paneHasInputBox reports whether the framed, empty input box is on screen.
+//
+// Both conditions are load-bearing. A bare `strings.Contains(out, "❯")` also
+// matches a selection dialog. Options render as `❯ 1. Yes` (see
+// ParseTerminalPermission), and the echoed prompt renders as `❯ <text>`.
+// Pasting into either dismisses the dialog instead of submitting the prompt.
+// That is the failure the paneReadyMarkers comment warns about. So the chevron
+// must be alone on its line, meaning an empty input box. The rule must also be
+// present: Claude draws it only once the box is framed.
+func paneHasInputBox(out string) bool {
+	if !strings.Contains(out, inputBoxRule) {
+		return false
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == "❯" {
+			return true
+		}
+	}
+	return false
+}
+
 // WaitForPaneReady blocks until Claude's input box is taking input. It
 // auto-dismisses the trust-safety dialog if present. Returns false on context
 // cancel, capture error, send error, or the PromptInjectTimeout deadline —
@@ -70,6 +97,9 @@ func WaitForPaneReady(ctx context.Context, term terminal.Session) bool {
 			if strings.Contains(out, marker) {
 				return true
 			}
+		}
+		if paneHasInputBox(out) {
+			return true
 		}
 	}
 }
