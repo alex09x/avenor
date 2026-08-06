@@ -1414,14 +1414,31 @@ func TestSessionGoneEmitsFallbackEnd(t *testing.T) {
 	term.SetAlive(false)
 	go p.runSession(s.Ctx, s)
 
-	// Wait for session.end event.
-	select {
-	case ev := <-s.Events:
-		if ev.Event != "session.end" {
-			t.Fatalf("event = %q, want session.end", ev.Event)
+	// The terminal died before a prompt was submitted, so the sessionGone branch
+	// emits agent.launch_failed first, then session.end with stop_reason=launch_failed.
+	deadline := time.After(3 * time.Second)
+	var gotLaunchFailed bool
+	for done := false; !done; {
+		select {
+		case ev := <-s.Events:
+			switch ev.Event {
+			case "agent.launch_failed":
+				if gotLaunchFailed {
+					t.Fatalf("duplicate agent.launch_failed event")
+				}
+				gotLaunchFailed = true
+			case "session.end":
+				if !gotLaunchFailed {
+					t.Fatalf("session.end received before agent.launch_failed")
+				}
+				if ev.Fields["stop_reason"] != claudecore.StopReasonLaunchFailed {
+					t.Fatalf("session.end stop_reason = %q, want %q", ev.Fields["stop_reason"], claudecore.StopReasonLaunchFailed)
+				}
+				done = true
+			}
+		case <-deadline:
+			t.Fatal("timeout waiting for session.end event after session went away")
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timeout waiting for session.end event after session went away")
 	}
 
 	select {
