@@ -53,3 +53,4 @@ internal/board/dist
 # Docs site
 docs/.vitepress/dist
 docs/.vitepress/cache
+.idea/
