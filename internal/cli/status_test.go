@@ -3,7 +3,7 @@ package cli
 import (
 	"testing"
 
-	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/alex09x/avenor/agyclient/events"
 )
 
 func makeEvent(name string, fields map[string]any) events.Event {

@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/permission"
-	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/broker"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/internal/permission"
+	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/agyclient/runtime/broker"
 )
 
 type ProviderConfig struct {

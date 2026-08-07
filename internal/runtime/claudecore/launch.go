@@ -9,7 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/alex09x/avenor/agyclient/events"
 )
 
 // Stop reasons for a Claude process that exited without ever running a turn.

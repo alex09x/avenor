@@ -3,7 +3,7 @@ package claudecore
 import (
 	"os"
 
-	"github.com/sdougbrown/avenor/internal/runtime/claudecore/terminal"
+	"github.com/alex09x/avenor/agyclient/runtime/claudecore/terminal"
 )
 
 func DefaultLauncher() terminal.Launcher {

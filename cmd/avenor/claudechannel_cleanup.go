@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/sdougbrown/avenor/internal/runtime/claudechannel"
+	"github.com/alex09x/avenor/internal/runtime/claudechannel"
 )
 
 func runClaudeChannelCleanup(args []string) int {

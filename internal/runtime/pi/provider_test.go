@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/alex09x/avenor/agyclient/runtime"
 )
 
 func TestCapabilities(t *testing.T) {

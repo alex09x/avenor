@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/sdougbrown/avenor/internal/channeltools"
+	"github.com/alex09x/avenor/internal/channeltools"
 )
 
 func runChannelTools(args []string) int {

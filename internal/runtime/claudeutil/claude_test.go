@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/alex09x/avenor/agyclient/runtime"
 )
 
 func TestBuildArgsPreservesBackendSpecificOrdering(t *testing.T) {

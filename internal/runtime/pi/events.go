@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/alex09x/avenor/agyclient/events"
 )
 
 func translateNotification(payload map[string]any, sessionID string) []events.Event {

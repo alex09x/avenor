@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sdougbrown/avenor/internal/mcpserver"
+	"github.com/alex09x/avenor/internal/mcpserver"
 )
 
 func TestRunMCPInvalidTransport(t *testing.T) {

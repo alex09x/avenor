@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/alex09x/avenor/agyclient/events"
 )
 
 func TestEncodeProjectPath(t *testing.T) {

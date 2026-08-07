@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/sdougbrown/avenor/client"
+	"github.com/alex09x/avenor/client"
 )
 
 // Server is the board dashboard HTTP server.

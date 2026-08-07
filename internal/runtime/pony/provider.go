@@ -7,11 +7,11 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/broker"
-	"github.com/sdougbrown/avenor/internal/runtime/pony/model"
-	"github.com/sdougbrown/avenor/internal/runtime/pony/tools"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/agyclient/runtime/broker"
+	"github.com/alex09x/avenor/internal/runtime/pony/model"
+	"github.com/alex09x/avenor/internal/runtime/pony/tools"
 )
 
 // backendID is the backend identifier.

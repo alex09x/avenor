@@ -15,17 +15,17 @@ package factory
 import (
 	"fmt"
 
-	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/agy"
-	"github.com/sdougbrown/avenor/internal/runtime/claude"
-	"github.com/sdougbrown/avenor/internal/runtime/claudechannel"
-	"github.com/sdougbrown/avenor/internal/runtime/codexappserver"
-	"github.com/sdougbrown/avenor/internal/runtime/cursoracp"
-	"github.com/sdougbrown/avenor/internal/runtime/geminiacp"
-	"github.com/sdougbrown/avenor/internal/runtime/opencodeacp"
-	"github.com/sdougbrown/avenor/internal/runtime/opencodehttp"
-	"github.com/sdougbrown/avenor/internal/runtime/pi"
-	"github.com/sdougbrown/avenor/internal/runtime/pony"
+	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/agyclient/runtime/agy"
+	"github.com/alex09x/avenor/internal/runtime/claude"
+	"github.com/alex09x/avenor/internal/runtime/claudechannel"
+	"github.com/alex09x/avenor/internal/runtime/codexappserver"
+	"github.com/alex09x/avenor/internal/runtime/cursoracp"
+	"github.com/alex09x/avenor/internal/runtime/geminiacp"
+	"github.com/alex09x/avenor/internal/runtime/opencodeacp"
+	"github.com/alex09x/avenor/internal/runtime/opencodehttp"
+	"github.com/alex09x/avenor/internal/runtime/pi"
+	"github.com/alex09x/avenor/internal/runtime/pony"
 )
 
 func NewProvider(startOpts runtime.StartOptions, backend string) (runtime.Provider, error) {

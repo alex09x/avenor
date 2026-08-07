@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/alex09x/avenor/agyclient/events"
 )
 
 func TestReadEventsBasic(t *testing.T) {

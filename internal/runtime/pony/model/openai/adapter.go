@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/sdougbrown/avenor/internal/runtime/pony/model"
+	"github.com/alex09x/avenor/internal/runtime/pony/model"
 )
 
 type Adapter struct {

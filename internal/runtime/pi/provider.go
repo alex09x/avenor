@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/agyclient/runtime"
 )
 
 const backendID = "pi"

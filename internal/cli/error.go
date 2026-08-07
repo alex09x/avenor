@@ -5,7 +5,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/alex09x/avenor/agyclient/events"
 )
 
 // emitErrorEvent logs message to stderr and writes an avenor.error event to

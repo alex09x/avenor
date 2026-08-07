@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/alex09x/avenor/agyclient/events"
 )
 
 // Claude Code writes JSONL transcripts under ~/.claude/projects/<encoded>/

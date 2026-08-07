@@ -8,9 +8,9 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/broker"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/agyclient/runtime/broker"
 )
 
 const backendID = "codex-app-server"

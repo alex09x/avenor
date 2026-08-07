@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/digest"
+	"github.com/alex09x/avenor/internal/digest"
 )
 
 // readCursor reads the byte offset stored in the cursor file at path.

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/alex09x/avenor/agyclient/runtime"
 )
 
 func TestRunRejectsRosterEntryWithWorkflow(t *testing.T) {

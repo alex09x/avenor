@@ -6,8 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/sdougbrown/avenor/internal/phaseconfig"
-	"github.com/sdougbrown/avenor/internal/rosterconfig"
+	"github.com/alex09x/avenor/internal/phaseconfig"
+	"github.com/alex09x/avenor/internal/rosterconfig"
 )
 
 type LoopConfig struct {

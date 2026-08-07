@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/cli"
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/alex09x/avenor/internal/cli"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/agyclient/runtime"
 )
 
 func writeStage5Roster(t *testing.T, dir string, contents string) string {

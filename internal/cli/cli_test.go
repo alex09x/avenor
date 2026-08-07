@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/control"
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/permission"
-	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/alex09x/avenor/internal/control"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/internal/permission"
+	"github.com/alex09x/avenor/agyclient/runtime"
 )
 
 func TestEffectivePermissionHandlerAutoApproveSkipsDerivedSentinelHandler(t *testing.T) {

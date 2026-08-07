@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/agyclient/runtime"
 )
 
 type fakeProvider struct {

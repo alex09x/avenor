@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/sdougbrown/avenor/internal/runtime/acp"
+	"github.com/alex09x/avenor/internal/runtime/acp"
 )
 
 func TestProbeTranscriptVocabulary(t *testing.T) {

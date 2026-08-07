@@ -18,7 +18,7 @@ import (
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/sdougbrown/avenor/client"
+	"github.com/alex09x/avenor/client"
 )
 
 type fakeClient struct {

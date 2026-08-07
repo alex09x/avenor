@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/alex09x/avenor/agyclient/events"
 )
 
 // --- helpers -----------------------------------------------------------------

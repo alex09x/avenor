@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/alex09x/avenor/agyclient/events"
 )
 
 func readEvents(path string, types []string, limit int) ([]map[string]any, error) {

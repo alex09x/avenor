@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/board"
+	"github.com/alex09x/avenor/internal/board"
 )
 
 func runBoard(args []string) int {

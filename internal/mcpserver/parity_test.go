@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sdougbrown/avenor/internal/spawnselection"
+	"github.com/alex09x/avenor/internal/spawnselection"
 )
 
 // tsToolNames lists the seven MCP tools from the TypeScript reference

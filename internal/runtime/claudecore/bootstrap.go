@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/runtime/claudecore/terminal"
+	"github.com/alex09x/avenor/agyclient/runtime/claudecore/terminal"
 )
 
 const (

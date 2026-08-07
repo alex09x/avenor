@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/alex09x/avenor/agyclient/runtime"
 )
 
 var errProviderLifecycleClosing = errors.New("provider lifecycle is closing")

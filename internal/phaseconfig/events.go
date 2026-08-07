@@ -3,7 +3,7 @@ package phaseconfig
 import (
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/alex09x/avenor/agyclient/events"
 )
 
 type EventWriter interface {

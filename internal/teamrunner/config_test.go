@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sdougbrown/avenor/internal/phaseconfig"
+	"github.com/alex09x/avenor/internal/phaseconfig"
 )
 
 func TestLoadTeamConfig(t *testing.T) {

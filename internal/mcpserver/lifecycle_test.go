@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sdougbrown/avenor/client"
+	"github.com/alex09x/avenor/client"
 )
 
 func TestStartSupervisorLeavesStaleSocketForChild(t *testing.T) {

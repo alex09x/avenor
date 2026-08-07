@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sdougbrown/avenor/client"
-	"github.com/sdougbrown/avenor/internal/admission"
-	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/alex09x/avenor/client"
+	"github.com/alex09x/avenor/internal/admission"
+	"github.com/alex09x/avenor/agyclient/events"
 )
 
 func TestSocketStartSignalsReadinessFD(t *testing.T) {

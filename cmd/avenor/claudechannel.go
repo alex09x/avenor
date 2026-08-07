@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/sdougbrown/avenor/internal/claudechannelsidecar"
+	"github.com/alex09x/avenor/internal/claudechannelsidecar"
 )
 
 func runClaudeChannel(args []string) int {

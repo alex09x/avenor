@@ -13,12 +13,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/broker"
-	"github.com/sdougbrown/avenor/internal/runtime/claudecore"
-	"github.com/sdougbrown/avenor/internal/runtime/claudecore/terminal"
-	"github.com/sdougbrown/avenor/internal/runtime/claudeutil"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/agyclient/runtime/broker"
+	"github.com/alex09x/avenor/internal/runtime/claudecore"
+	"github.com/alex09x/avenor/agyclient/runtime/claudecore/terminal"
+	"github.com/alex09x/avenor/internal/runtime/claudeutil"
 )
 
 const backendID = "claude-channel"

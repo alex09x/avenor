@@ -1,4 +1,4 @@
-module github.com/sdougbrown/avenor
+module github.com/alex09x/avenor
 
 go 1.25.0
 

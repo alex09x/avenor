@@ -6,11 +6,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/phaseconfig"
-	"github.com/sdougbrown/avenor/internal/rosterconfig"
-	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/broker"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/internal/phaseconfig"
+	"github.com/alex09x/avenor/internal/rosterconfig"
+	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/agyclient/runtime/broker"
 )
 
 type NestedResult struct {

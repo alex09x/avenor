@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/runtime/acp"
+	"github.com/alex09x/avenor/internal/runtime/acp"
 )
 
 func newIntegrationClient(t *testing.T) (*acp.Client, context.Context, context.CancelFunc) {

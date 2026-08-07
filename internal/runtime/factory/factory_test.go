@@ -3,7 +3,7 @@ package factory
 import (
 	"testing"
 
-	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/alex09x/avenor/agyclient/runtime"
 )
 
 func TestNewProviderAcp(t *testing.T) {

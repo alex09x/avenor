@@ -14,9 +14,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/admission"
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/alex09x/avenor/internal/admission"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/agyclient/runtime"
 )
 
 const subscriberBuffer = 256

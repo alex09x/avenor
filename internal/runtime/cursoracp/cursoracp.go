@@ -3,8 +3,8 @@ package cursoracp
 import (
 	"context"
 
-	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/acp"
+	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/internal/runtime/acp"
 )
 
 const backendID = "cursor-acp"

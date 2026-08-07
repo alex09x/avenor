@@ -7,9 +7,9 @@ import (
 	"os"
 	"sort"
 
-	"github.com/sdougbrown/avenor/client"
-	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/pony/tools"
+	"github.com/alex09x/avenor/client"
+	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/internal/runtime/pony/tools"
 )
 
 // PonyConfig is the top-level pony configuration loaded from the JSON config file.

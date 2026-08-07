@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/alex09x/avenor/agyclient/events"
 )
 
 func TestWaitForSession_ProgressTimeout(t *testing.T) {

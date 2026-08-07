@@ -16,15 +16,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sdougbrown/avenor/client"
-	"github.com/sdougbrown/avenor/internal/cli"
-	"github.com/sdougbrown/avenor/internal/control"
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/looprunner"
-	"github.com/sdougbrown/avenor/internal/phaseconfig"
-	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/broker"
-	"github.com/sdougbrown/avenor/internal/teamrunner"
+	"github.com/alex09x/avenor/client"
+	"github.com/alex09x/avenor/internal/cli"
+	"github.com/alex09x/avenor/internal/control"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/internal/looprunner"
+	"github.com/alex09x/avenor/internal/phaseconfig"
+	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/agyclient/runtime/broker"
+	"github.com/alex09x/avenor/internal/teamrunner"
 )
 
 func TestNewSupervisor(t *testing.T) {

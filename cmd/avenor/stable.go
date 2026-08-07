@@ -6,8 +6,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/admission"
-	"github.com/sdougbrown/avenor/internal/stable"
+	"github.com/alex09x/avenor/internal/admission"
+	"github.com/alex09x/avenor/internal/stable"
 )
 
 func runStable(args []string) int {

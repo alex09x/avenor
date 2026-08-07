@@ -7,8 +7,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/agyclient/runtime"
 )
 
 func TestStableRosterSameBackendResume(t *testing.T) {

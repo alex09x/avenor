@@ -7,7 +7,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/sdougbrown/avenor/internal/events"
+	"github.com/alex09x/avenor/agyclient/events"
 )
 
 // sseEvent is a raw event from the opencode SSE stream.

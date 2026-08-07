@@ -6,12 +6,12 @@ import (
 	"io"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/control"
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/permission"
-	"github.com/sdougbrown/avenor/internal/phaseconfig"
-	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/factory"
+	"github.com/alex09x/avenor/internal/control"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/internal/permission"
+	"github.com/alex09x/avenor/internal/phaseconfig"
+	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/internal/runtime/factory"
 )
 
 var newProvider = factory.NewProvider

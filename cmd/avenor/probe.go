@@ -8,9 +8,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/opencodeacp"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/internal/runtime/opencodeacp"
 )
 
 func runProbe(args []string) int {

@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/mcpserver"
+	"github.com/alex09x/avenor/internal/mcpserver"
 )
 
 func runMCP(args []string) int {

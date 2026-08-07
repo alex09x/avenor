@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sdougbrown/avenor/internal/admission"
+	"github.com/alex09x/avenor/internal/admission"
 )
 
 func TestRunStableJoinsInheritedTreeBudget(t *testing.T) {

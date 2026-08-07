@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/sdougbrown/avenor/internal/runtime"
+	"github.com/alex09x/avenor/agyclient/runtime"
 )
 
 func TestNewReturnsProvider(t *testing.T) {

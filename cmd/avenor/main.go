@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/sdougbrown/avenor/internal/cli"
+	"github.com/alex09x/avenor/internal/cli"
 )
 
 // Version is the release tag, injected at build time via -ldflags. Unreleased

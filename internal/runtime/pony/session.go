@@ -4,9 +4,9 @@ import (
 	"context"
 	"sync"
 
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/runtime/pony/model"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/internal/runtime/pony/model"
 )
 
 // sessionState holds the per-session data for a single conversation.

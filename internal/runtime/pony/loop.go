@@ -9,9 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/runtime/pony/model"
-	"github.com/sdougbrown/avenor/internal/runtime/pony/tools"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/internal/runtime/pony/model"
+	"github.com/alex09x/avenor/internal/runtime/pony/tools"
 )
 
 // StopCondition is a function that returns true when the loop should stop.

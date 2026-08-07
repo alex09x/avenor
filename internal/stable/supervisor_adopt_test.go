@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sdougbrown/avenor/internal/events"
-	"github.com/sdougbrown/avenor/internal/looprunner"
-	"github.com/sdougbrown/avenor/internal/phaseconfig"
-	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/teamrunner"
+	"github.com/alex09x/avenor/agyclient/events"
+	"github.com/alex09x/avenor/internal/looprunner"
+	"github.com/alex09x/avenor/internal/phaseconfig"
+	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/internal/teamrunner"
 )
 
 // adoptChildSessionID preserves the pre-attempt-token test API. Production

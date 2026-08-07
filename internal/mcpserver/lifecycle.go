@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sdougbrown/avenor/client"
+	"github.com/alex09x/avenor/client"
 )
 
 var execCommand = exec.Command

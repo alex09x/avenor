@@ -20,9 +20,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"github.com/sdougbrown/avenor/client"
-	"github.com/sdougbrown/avenor/internal/runtime"
-	"github.com/sdougbrown/avenor/internal/spawnselection"
+	"github.com/alex09x/avenor/client"
+	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/internal/spawnselection"
 )
 
 type ControlClient interface {
