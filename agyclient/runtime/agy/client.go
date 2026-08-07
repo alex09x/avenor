@@ -151,6 +151,14 @@ func (c *client) ensureVersion(ctx context.Context) {
 // ---------------------------------------------------------------------------
 
 func initialArgs(prompt, model, agent, dir string) []string {
+	return initialArgsExt(prompt, model, agent, dir, false)
+}
+
+// initialArgsExt is initialArgs plus skipPermissions, which appends
+// --dangerously-skip-permissions. Needed because headless (non-RPC)
+// transport has no interactive/AnswerPermission path to approve a tool
+// call, so a caller running agy fully non-interactively must opt in here.
+func initialArgsExt(prompt, model, agent, dir string, skipPermissions bool) []string {
 	args := []string{"--output-format", "stream-json", "--print-timeout", printTimeout}
 	if model != "" {
 		args = append(args, "--model", model)
@@ -161,10 +169,18 @@ func initialArgs(prompt, model, agent, dir string) []string {
 	if dir != "" {
 		args = append(args, "--add-dir", dir)
 	}
+	if skipPermissions {
+		args = append(args, "--dangerously-skip-permissions")
+	}
 	return append(args, "--print", prompt)
 }
 
 func resumedArgs(conversationID, prompt, model, agent, dir string) []string {
+	return resumedArgsExt(conversationID, prompt, model, agent, dir, false)
+}
+
+// resumedArgsExt is resumedArgs plus skipPermissions; see initialArgsExt.
+func resumedArgsExt(conversationID, prompt, model, agent, dir string, skipPermissions bool) []string {
 	args := []string{
 		"--conversation", conversationID,
 		"--output-format", "stream-json",
@@ -179,6 +195,9 @@ func resumedArgs(conversationID, prompt, model, agent, dir string) []string {
 	if dir != "" {
 		args = append(args, "--add-dir", dir)
 	}
+	if skipPermissions {
+		args = append(args, "--dangerously-skip-permissions")
+	}
 	return append(args, "--print", prompt)
 }
 
@@ -189,11 +208,19 @@ func resumedArgs(conversationID, prompt, model, agent, dir string) []string {
 // LaunchInitial starts agy with the required first prompt argument, waits for
 // init, and leaves subsequent turn events queued for the provider to relay.
 func (c *client) LaunchInitial(ctx context.Context, prompt, model, agent, dir string) (sessionInfo, error) {
+	return c.launchInitial(ctx, initialArgs(prompt, model, agent, dir), dir)
+}
+
+// LaunchInitialWithOptions is LaunchInitial plus skipPermissions; see
+// initialArgsExt.
+func (c *client) LaunchInitialWithOptions(ctx context.Context, prompt, model, agent, dir string, skipPermissions bool) (sessionInfo, error) {
+	return c.launchInitial(ctx, initialArgsExt(prompt, model, agent, dir, skipPermissions), dir)
+}
+
+func (c *client) launchInitial(ctx context.Context, args []string, dir string) (sessionInfo, error) {
 	if c.versionErr != nil {
 		return sessionInfo{}, c.versionErr
 	}
-
-	args := initialArgs(prompt, model, agent, dir)
 
 	// The startup context bounds init discovery only. Provider Cancel/Close
 	// owns the process after launch.
@@ -431,10 +458,18 @@ func (c *client) drainValidateUntilInit(expectedID string) error {
 //
 // Any prior process is cleaned up first.
 func (c *client) LaunchResumed(ctx context.Context, conversationID, prompt, model, agent, dir string) error {
+	return c.launchResumed(ctx, conversationID, resumedArgs(conversationID, prompt, model, agent, dir), dir)
+}
+
+// LaunchResumedWithOptions is LaunchResumed plus skipPermissions; see
+// initialArgsExt.
+func (c *client) LaunchResumedWithOptions(ctx context.Context, conversationID, prompt, model, agent, dir string, skipPermissions bool) error {
+	return c.launchResumed(ctx, conversationID, resumedArgsExt(conversationID, prompt, model, agent, dir, skipPermissions), dir)
+}
+
+func (c *client) launchResumed(ctx context.Context, conversationID string, args []string, dir string) error {
 	// Clean up any prior process.
 	c.Close()
-
-	args := resumedArgs(conversationID, prompt, model, agent, dir)
 
 	proc := exec.CommandContext(context.Background(), "agy", args...)
 	proc.Dir = dir

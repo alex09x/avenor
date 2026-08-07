@@ -438,6 +438,42 @@ func TestClientResumedArgs(t *testing.T) {
 	assertArgs(t, got, want)
 }
 
+func TestClientInitialArgsExtSkipPermissionsFalseMatchesInitialArgs(t *testing.T) {
+	got := initialArgsExt("test prompt", "sonnet", "my-agent", "/work", false)
+	want := initialArgs("test prompt", "sonnet", "my-agent", "/work")
+	assertArgs(t, got, want)
+}
+
+func TestClientInitialArgsExtSkipPermissionsTrue(t *testing.T) {
+	got := initialArgsExt("test prompt", "sonnet", "", "", true)
+	want := []string{
+		"--output-format", "stream-json",
+		"--print-timeout", printTimeout,
+		"--model", "sonnet",
+		"--dangerously-skip-permissions",
+		"--print", "test prompt",
+	}
+	assertArgs(t, got, want)
+}
+
+func TestClientResumedArgsExtSkipPermissionsFalseMatchesResumedArgs(t *testing.T) {
+	got := resumedArgsExt("conv-resumed", "next prompt", "sonnet", "my-agent", "/work", false)
+	want := resumedArgs("conv-resumed", "next prompt", "sonnet", "my-agent", "/work")
+	assertArgs(t, got, want)
+}
+
+func TestClientResumedArgsExtSkipPermissionsTrue(t *testing.T) {
+	got := resumedArgsExt("conv-resumed", "next prompt", "", "", "", true)
+	want := []string{
+		"--conversation", "conv-resumed",
+		"--output-format", "stream-json",
+		"--print-timeout", printTimeout,
+		"--dangerously-skip-permissions",
+		"--print", "next prompt",
+	}
+	assertArgs(t, got, want)
+}
+
 func assertArgs(t *testing.T, got, want []string) {
 	t.Helper()
 	if len(got) != len(want) {

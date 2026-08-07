@@ -32,6 +32,13 @@ type StartOptions struct {
 	Thinking     string
 	RuntimeID    string         // supervisor-assigned runtime ID (rt_N), for parent-child routing
 	Broker       *broker.Broker // optional shared broker instance; backends may create their own if nil
+
+	// SkipPermissions passes --dangerously-skip-permissions to the agy CLI in
+	// headless (non-RPC) transport, where there is no interactive/AnswerPermission
+	// path available to approve a tool call. Defaults to false (agy's own
+	// default); callers running agy fully non-interactively must opt in.
+	// Only consumed by the agy backend today.
+	SkipPermissions bool
 }
 
 // Session represents an active ACP session.

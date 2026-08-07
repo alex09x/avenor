@@ -491,7 +491,7 @@ func (p *Provider) runInitialPrompt(ctx context.Context, s *sessionState, provis
 			cl.mu.Unlock()
 		}
 	} else {
-		info, err = cl.LaunchInitial(ctx, prompt, startOpts.Model, startOpts.Agent, startOpts.Dir)
+		info, err = cl.LaunchInitialWithOptions(ctx, prompt, startOpts.Model, startOpts.Agent, startOpts.Dir, startOpts.SkipPermissions)
 	}
 	if err != nil {
 		return err
@@ -625,7 +625,7 @@ func (p *Provider) runResumedPrompt(ctx context.Context, s *sessionState, sessio
 		cl.testMode = true
 		err = cl.validateInit(ctx, sessionID)
 	} else {
-		err = cl.LaunchResumed(ctx, sessionID, prompt, startOpts.Model, startOpts.Agent, startOpts.Dir)
+		err = cl.LaunchResumedWithOptions(ctx, sessionID, prompt, startOpts.Model, startOpts.Agent, startOpts.Dir, startOpts.SkipPermissions)
 	}
 	if err != nil {
 		_ = cl.Close()
