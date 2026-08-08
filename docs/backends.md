@@ -262,9 +262,11 @@ A headless `agy` run works until the agent needs an answer from outside the proc
 
 Avenor gives the dedicated `agy` backend three transport policies. None of them treats `agy` as ACP. The interactive path also does not scrape the terminal or send TUI keystrokes.
 
-### Headless is the default
+### Auto is the default
 
-With `AVENOR_AGY_TRANSPORT` unset or set to `headless`, Avenor runs `agy` in stream-JSON print mode and translates its stdout into canonical events. This is the least surprising choice for unattended text work.
+With `AVENOR_AGY_TRANSPORT` unset or set to `auto`, Avenor first probes the RPC transport. A successful probe keeps one interactive `agy` process alive for the session and enables trajectory snapshot/reopen recovery. If the probe fails, Avenor cleans up the failed host and falls back to headless before registering the session.
+
+Set `AVENOR_AGY_TRANSPORT=headless` to force stream-JSON print mode or to roll back RPC-first selection:
 
 ```sh
 avenor \
@@ -324,7 +326,7 @@ avenor control --socket /tmp/avenor-agy-stable.sock spawn \
 
 ### Auto probes before committing
 
-`AVENOR_AGY_TRANSPORT=auto` tries RPC for each new session. It falls back to headless only before the session is registered and only after the failed RPC host has been cleaned up.
+The default policy, or an explicit `AVENOR_AGY_TRANSPORT=auto`, tries RPC for each new session. It falls back to headless only before the session is registered and only after the failed RPC host has been cleaned up.
 
 ```sh
 AVENOR_AGY_TRANSPORT=auto avenor \
@@ -341,7 +343,7 @@ Because the selected transport is not known in advance, `auto` does not advertis
 
 RPC discovery accepts only loopback listeners owned by the exact hosted `agy` process. Its HTTP client does not use ambient proxies, prefers TLS, and does not enable plain-HTTP fallback in normal backend configuration. Private endpoints, certificates, and wire identities do not become public session identifiers or diagnostics.
 
-Avenor never passes `--dangerously-skip-permissions` by default. RPC adds a control path; it does not remove `agy`'s permission boundary.
+Avenor never passes `--dangerously-skip-permissions` by default. RPC adds a control path; it does not remove `agy`'s permission boundary. Library callers that explicitly set `runtime.StartOptions.SkipPermissions` apply that choice consistently to both headless and RPC-hosted `agy` processes.
 
 ---
 

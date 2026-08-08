@@ -100,7 +100,7 @@ func TestSelectTransportPolicies(t *testing.T) {
 		wantCalls int
 		wantErr   bool
 	}{
-		{"unset remains headless", "", transportHeadless, 0, false},
+		{"unset probes RPC by default", "", transportRPC, 1, false},
 		{"headless does not probe", "headless", transportHeadless, 0, false},
 		{"rpc probes", "rpc", transportRPC, 1, false},
 		{"auto probes", "auto", transportRPC, 1, false},
@@ -133,17 +133,27 @@ func TestSelectTransportPolicies(t *testing.T) {
 }
 
 func TestSelectTransportAutoClosesFailedProbeWithoutLeakingError(t *testing.T) {
-	host := &fakeRPCSessionHost{id: "sensitive-conversation"}
-	selection, diagnostic, err := selectTransport(context.Background(), func(string) string { return "auto" }, runtime.StartOptions{}, "resume", "1.1.5", func(context.Context, runtime.StartOptions, string, string) (rpcSessionHost, error) {
-		return host, errors.New("https://127.0.0.1:9999/private/path sensitive-conversation")
-	})
-	if err != nil || selection.kind != transportHeadless || diagnostic != autoRPCFallbackDiagnostic {
-		t.Fatalf("selection = %#v diagnostic=%q err=%v", selection, diagnostic, err)
-	}
-	host.mu.Lock()
-	defer host.mu.Unlock()
-	if host.closeCalls != 1 {
-		t.Fatalf("failed probe close calls = %d", host.closeCalls)
+	for _, tc := range []struct {
+		name string
+		mode string
+	}{
+		{name: "unset", mode: ""},
+		{name: "auto", mode: "auto"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			host := &fakeRPCSessionHost{id: "sensitive-conversation"}
+			selection, diagnostic, err := selectTransport(context.Background(), func(string) string { return tc.mode }, runtime.StartOptions{}, "resume", "1.1.5", func(context.Context, runtime.StartOptions, string, string) (rpcSessionHost, error) {
+				return host, errors.New("https://127.0.0.1:9999/private/path sensitive-conversation")
+			})
+			if err != nil || selection.kind != transportHeadless || diagnostic != autoRPCFallbackDiagnostic {
+				t.Fatalf("selection = %#v diagnostic=%q err=%v", selection, diagnostic, err)
+			}
+			host.mu.Lock()
+			defer host.mu.Unlock()
+			if host.closeCalls != 1 {
+				t.Fatalf("failed probe close calls = %d", host.closeCalls)
+			}
+		})
 	}
 }
 

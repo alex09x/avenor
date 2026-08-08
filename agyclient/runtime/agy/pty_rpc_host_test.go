@@ -187,20 +187,22 @@ func TestPTYRPCHostStartupAcceptsCompatibleMajorAndRejectsOtherMajor(t *testing.
 
 func TestInteractiveAgyCommandQuotesOnlySupportedValues(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		resume string
-		agent  string
-		dir    string
-		want   string
+		name            string
+		resume          string
+		agent           string
+		dir             string
+		skipPermissions bool
+		want            string
 	}{
-		{"new", "", "", "", "exec agy"},
-		{"new workspace", "", "", "/private/workspace", "exec agy --add-dir \"$PWD\""},
-		{"new agent", "", "agent one", "", "exec agy --agent 'agent one'"},
-		{"resume", "conversation-123", "", "", "exec agy --conversation 'conversation-123'"},
-		{"resume agent hostile", "id' ; $(touch nope)\nnext", "a'\n$(bad); *", "", "exec agy --conversation 'id'\"'\"' ; $(touch nope)\nnext' --agent 'a'\"'\"'\n$(bad); *'"},
+		{"new", "", "", "", false, "exec agy"},
+		{"new workspace", "", "", "/private/workspace", false, "exec agy --add-dir \"$PWD\""},
+		{"new agent", "", "agent one", "", false, "exec agy --agent 'agent one'"},
+		{"resume", "conversation-123", "", "", false, "exec agy --conversation 'conversation-123'"},
+		{"skip permissions", "conversation-123", "", "/private/workspace", true, "exec agy --conversation 'conversation-123' --add-dir \"$PWD\" --dangerously-skip-permissions"},
+		{"resume agent hostile", "id' ; $(touch nope)\nnext", "a'\n$(bad); *", "", false, "exec agy --conversation 'id'\"'\"' ; $(touch nope)\nnext' --agent 'a'\"'\"'\n$(bad); *'"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := interactiveAgyCommand(tc.resume, tc.agent, tc.dir); got != tc.want {
+			if got := interactiveAgyCommand(tc.resume, tc.agent, tc.dir, tc.skipPermissions); got != tc.want {
 				t.Fatalf("command = %q, want %q", got, tc.want)
 			}
 		})

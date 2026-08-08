@@ -110,7 +110,7 @@ func startPTYRPCHost(ctx context.Context, launcher terminal.Launcher, opts runti
 		Dir:     opts.Dir,
 		Cols:    220,
 		Rows:    50,
-		Command: interactiveAgyCommand(resumeID, opts.Agent, opts.Dir),
+		Command: interactiveAgyCommand(resumeID, opts.Agent, opts.Dir, opts.SkipPermissions),
 	})
 	if err != nil {
 		cancel()
@@ -467,7 +467,7 @@ func boundedPTYRPCCloseContext(ctx context.Context) (context.Context, context.Ca
 	return context.WithTimeout(context.Background(), timeout)
 }
 
-func interactiveAgyCommand(resumeID, agent, dir string) string {
+func interactiveAgyCommand(resumeID, agent, dir string, skipPermissions bool) string {
 	command := "exec agy"
 	if resumeID != "" {
 		command += " --conversation " + posixShellQuote(resumeID)
@@ -480,6 +480,9 @@ func interactiveAgyCommand(resumeID, agent, dir string) string {
 	// expand its trusted cwd without embedding the user path in this command.
 	if dir != "" {
 		command += " --add-dir \"$PWD\""
+	}
+	if skipPermissions {
+		command += " --dangerously-skip-permissions"
 	}
 	return command
 }

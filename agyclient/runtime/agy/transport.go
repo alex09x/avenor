@@ -54,8 +54,14 @@ func selectTransport(ctx context.Context, getenv func(string) string, opts runti
 	}
 
 	mode := getenv("AVENOR_AGY_TRANSPORT")
+	if mode == "" {
+		// RPC keeps one interactive Agy process alive across turns and supports
+		// trajectory snapshot/reopen recovery. Preserve headless as the safe
+		// fallback when the RPC probe is unavailable and as an explicit rollback.
+		mode = "auto"
+	}
 	switch mode {
-	case "", "headless":
+	case "headless":
 		return transportSelection{kind: transportHeadless}, "", nil
 	case "rpc", "auto":
 		var (
