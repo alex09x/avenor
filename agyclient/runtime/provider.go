@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 	"unicode/utf8"
 
 	"github.com/alex09x/avenor/agyclient/events"
@@ -39,6 +40,21 @@ type StartOptions struct {
 	// default); callers running agy fully non-interactively must opt in.
 	// Only consumed by the agy backend today.
 	SkipPermissions bool
+
+	// AgyStreamIdleTimeout bounds how long the agy PTY-RPC trajectory
+	// subscription may stay silent before the client closes that subscription
+	// and recovers through the ordinary snapshot/reopen path. It cancels only
+	// the subscription, never the remote cascade. Zero (the default) keeps the
+	// previous behaviour, where a silent stream is bounded only by the outer
+	// turn deadline. Only consumed by the agy backend today.
+	AgyStreamIdleTimeout time.Duration
+
+	// AgyRecoverySnapshotTimeout is the per-call deadline for the agy
+	// trajectory snapshot RPC used during recovery, so a blocked server ends
+	// that call at its own operation deadline instead of consuming the whole
+	// outer turn deadline. Zero (the default) keeps the previous behaviour.
+	// Only consumed by the agy backend today.
+	AgyRecoverySnapshotTimeout time.Duration
 }
 
 // Session represents an active ACP session.
@@ -200,6 +216,12 @@ func MergeStartOptions(base, override StartOptions) StartOptions {
 	}
 	if override.Broker != nil {
 		merged.Broker = override.Broker
+	}
+	if override.AgyStreamIdleTimeout > 0 {
+		merged.AgyStreamIdleTimeout = override.AgyStreamIdleTimeout
+	}
+	if override.AgyRecoverySnapshotTimeout > 0 {
+		merged.AgyRecoverySnapshotTimeout = override.AgyRecoverySnapshotTimeout
 	}
 	return merged
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -427,12 +428,27 @@ type fakeRecoveryTransport struct {
 	openStarted  chan struct{}
 	openRelease  chan struct{}
 	blockOpen    bool
+
+	// snapshotCalls counts getSteps calls so blockSnapshotAfter can let the
+	// first N succeed and then block until the call context is done, which is
+	// how a wedged snapshot RPC behaves.
+	snapshotCalls      int
+	blockSnapshotAfter int
+	// bindStreamContext hands each queued stream the per-subscription context
+	// so Recv blocks until that subscription alone is cancelled.
+	bindStreamContext bool
 }
 
-func (t *fakeRecoveryTransport) getSteps(context.Context, string, uint32, agyv115.SnapshotTrajectoryVerbosity, agyv115.StreamTrajectoryVerbosity) (*agyv115.GetCascadeTrajectoryStepsResponse, error) {
+func (t *fakeRecoveryTransport) getSteps(ctx context.Context, _ string, _ uint32, _ agyv115.SnapshotTrajectoryVerbosity, _ agyv115.StreamTrajectoryVerbosity) (*agyv115.GetCascadeTrajectoryStepsResponse, error) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.calls = append(t.calls, "snapshot")
+	t.snapshotCalls++
+	if t.blockSnapshotAfter > 0 && t.snapshotCalls > t.blockSnapshotAfter {
+		t.mu.Unlock()
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	defer t.mu.Unlock()
 	if len(t.snapshotErrs) > 0 {
 		err := t.snapshotErrs[0]
 		t.snapshotErrs = t.snapshotErrs[1:]
@@ -480,6 +496,11 @@ func (t *fakeRecoveryTransport) openStream(ctx context.Context, _ *agyv115.Strea
 	}
 	s := t.streams[0]
 	t.streams = t.streams[1:]
+	if t.bindStreamContext {
+		if fake, ok := s.(*fakeRecoveryStream); ok && fake.wait == nil {
+			fake.wait = ctx
+		}
+	}
 	return s, nil
 }
 
@@ -746,5 +767,260 @@ func TestTrajectoryRecoveryBoundsAndCancellation(t *testing.T) {
 		if err := <-done; !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancellation = %v", err)
 		}
+	})
+}
+
+func hasProtocolCode(got []events.Event, code string) bool {
+	for _, event := range got {
+		if event.Event == "avenor.agy.protocol" && event.Fields["code"] == code {
+			return true
+		}
+	}
+	return false
+}
+
+func recoveryCalls(t *testing.T, transport *fakeRecoveryTransport) []string {
+	t.Helper()
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	return append([]string(nil), transport.calls...)
+}
+
+func waitForRecoveryCall(t *testing.T, transport *fakeRecoveryTransport, call string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, seen := range recoveryCalls(t, transport) {
+			if seen == call {
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("transport never recorded a %q call", call)
+}
+
+func requireNoLeakedGoroutines(t *testing.T, baseline int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		current := goruntime.NumGoroutine()
+		if current <= baseline {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("goroutines = %d, want <= %d", current, baseline)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A completed tool followed by a silent stream must recover long before the
+// outer turn deadline, and must not cancel the run context that stands in for
+// the remote cascade.
+func TestTrajectoryRecoveryStreamIdleTimeoutRecoversBeforeTurnDeadline(t *testing.T) {
+	silent := &fakeRecoveryStream{responses: []*agyv115.StreamAgentStateUpdatesResponse{
+		streamResponse(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_RUNNING, false, []uint32{0}, listDirectoryStep(agyv115.CortexStepStatus_CORTEX_STEP_STATUS_DONE, "call-1", "list_directory", "{}"))),
+	}}
+	reopened := &fakeRecoveryStream{responses: []*agyv115.StreamAgentStateUpdatesResponse{
+		streamResponse(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_RUNNING, false, []uint32{1}, plannerStep(agyv115.CortexStepStatus_CORTEX_STEP_STATUS_GENERATING, "answer", nil))),
+		streamResponse(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_IDLE, true, []uint32{1}, plannerStep(agyv115.CortexStepStatus_CORTEX_STEP_STATUS_DONE, "answer", nil))),
+	}}
+	transport := &fakeRecoveryTransport{
+		snapshots:         []*agyv115.GetCascadeTrajectoryStepsResponse{{}, {}},
+		streams:           []trajectoryRecoveryStream{silent, reopened},
+		bindStreamContext: true,
+	}
+	mapper := newTrajectoryMapper("session", testConversation, "")
+	mapper.BeginTurn()
+	var got []events.Event
+	c := newTrajectoryRecoveryCoordinatorWithTransport(transport, mapper, trajectoryRecoveryOptions{
+		cascadeID:           "cascade",
+		conversationID:      testConversation,
+		maxRecoveryAttempts: 2,
+		backoff:             func(int) time.Duration { return 0 },
+		streamIdleTimeout:   25 * time.Millisecond,
+		onEvent:             func(event events.Event) { got = append(got, event) },
+	})
+	// The outer turn deadline is orders of magnitude larger than the
+	// inactivity budget, so completing at all proves the idle watchdog, not
+	// the turn deadline, ended the silent subscription.
+	turnCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := c.Run(turnCtx); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("idle recovery took %v", elapsed)
+	}
+	if err := turnCtx.Err(); err != nil {
+		t.Fatalf("outer turn context was cancelled: %v", err)
+	}
+	want := []string{"snapshot", "stream", "snapshot", "stream"}
+	if calls := recoveryCalls(t, transport); strings.Join(calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("idle recovery calls = %v, want %v", calls, want)
+	}
+	if !silent.closed || !reopened.closed {
+		t.Fatal("streams were not closed")
+	}
+	for _, code := range []string{"stream_idle_timeout", "stream_recovery_started", "stream_recovery_reopened"} {
+		if !hasProtocolCode(got, code) {
+			t.Fatalf("missing %q in %v", code, eventNames(got))
+		}
+	}
+	for _, event := range got {
+		if event.Event != "avenor.agy.protocol" {
+			continue
+		}
+		for field := range event.Fields {
+			switch field {
+			case "code", "phase", "trigger", "attempt", "timeout_ms":
+			default:
+				t.Fatalf("unexpected protocol field %q in %#v", field, event.Fields)
+			}
+		}
+	}
+}
+
+// A wedged recovery snapshot must end at its own operation deadline, not at
+// the outer turn deadline, and must not surface as a turn deadline error.
+func TestTrajectoryRecoverySnapshotTimeoutEndsAtOperationDeadline(t *testing.T) {
+	transport := &fakeRecoveryTransport{
+		snapshots:          []*agyv115.GetCascadeTrajectoryStepsResponse{{}},
+		streams:            []trajectoryRecoveryStream{&fakeRecoveryStream{errs: []error{io.EOF}}},
+		blockSnapshotAfter: 1,
+	}
+	mapper := newTrajectoryMapper("session", testConversation, "")
+	mapper.BeginTurn()
+	var got []events.Event
+	c := newTrajectoryRecoveryCoordinatorWithTransport(transport, mapper, trajectoryRecoveryOptions{
+		cascadeID:               "cascade",
+		conversationID:          testConversation,
+		maxRecoveryAttempts:     1,
+		backoff:                 func(int) time.Duration { return 0 },
+		recoverySnapshotTimeout: 25 * time.Millisecond,
+		onEvent:                 func(event events.Event) { got = append(got, event) },
+	})
+	turnCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := c.Run(turnCtx)
+	if err == nil {
+		t.Fatal("blocked recovery snapshot returned no error")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("operation deadline leaked as a turn deadline: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("blocked snapshot took %v", elapsed)
+	}
+	if turnErr := turnCtx.Err(); turnErr != nil {
+		t.Fatalf("outer turn context was consumed: %v", turnErr)
+	}
+	want := []string{"snapshot", "stream", "snapshot"}
+	if calls := recoveryCalls(t, transport); strings.Join(calls, ",") != strings.Join(want, ",") {
+		t.Fatalf("blocked snapshot calls = %v, want %v", calls, want)
+	}
+	if !hasProtocolCode(got, "recovery_snapshot_timeout") {
+		t.Fatalf("missing recovery_snapshot_timeout in %v", eventNames(got))
+	}
+}
+
+// Zero durations, and configured durations that never elapse, must both leave
+// the healthy path byte-identical to the pre-deadline behaviour.
+func TestTrajectoryRecoveryDeadlinesLeaveHealthyAndDisabledPathsUnchanged(t *testing.T) {
+	run := func(t *testing.T, options trajectoryRecoveryOptions) ([]string, []string) {
+		t.Helper()
+		stream := &fakeRecoveryStream{responses: []*agyv115.StreamAgentStateUpdatesResponse{
+			streamResponse(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_RUNNING, false, []uint32{1}, plannerStep(agyv115.CortexStepStatus_CORTEX_STEP_STATUS_GENERATING, "answer", nil))),
+			streamResponse(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_IDLE, true, []uint32{1}, plannerStep(agyv115.CortexStepStatus_CORTEX_STEP_STATUS_DONE, "answer", nil))),
+		}}
+		transport := &fakeRecoveryTransport{snapshots: []*agyv115.GetCascadeTrajectoryStepsResponse{{}}, streams: []trajectoryRecoveryStream{stream}}
+		mapper := newTrajectoryMapper("session", testConversation, "")
+		mapper.BeginTurn()
+		var got []events.Event
+		options.cascadeID = "cascade"
+		options.conversationID = testConversation
+		options.backoff = func(int) time.Duration { return 0 }
+		options.onEvent = func(event events.Event) { got = append(got, event) }
+		c := newTrajectoryRecoveryCoordinatorWithTransport(transport, mapper, options)
+		if err := c.Run(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if !stream.closed {
+			t.Fatal("healthy stream was not closed")
+		}
+		return eventNames(got), recoveryCalls(t, transport)
+	}
+	disabledEvents, disabledCalls := run(t, trajectoryRecoveryOptions{})
+	if strings.Join(disabledEvents, ",") != "agent.message_chunk,session.end" {
+		t.Fatalf("disabled events = %v", disabledEvents)
+	}
+	enabledEvents, enabledCalls := run(t, trajectoryRecoveryOptions{streamIdleTimeout: time.Minute, recoverySnapshotTimeout: time.Minute})
+	if strings.Join(enabledEvents, ",") != strings.Join(disabledEvents, ",") {
+		t.Fatalf("configured events = %v, want %v", enabledEvents, disabledEvents)
+	}
+	if strings.Join(enabledCalls, ",") != strings.Join(disabledCalls, ",") {
+		t.Fatalf("configured calls = %v, want %v", enabledCalls, disabledCalls)
+	}
+}
+
+// The inactivity watchdog must be joined on every exit path, so neither Close
+// nor context cancellation can leave it blocked.
+func TestTrajectoryRecoveryIdleWatchdogLeavesNoBlockedGoroutine(t *testing.T) {
+	newCoordinator := func() (*trajectoryRecoveryCoordinator, *fakeRecoveryTransport) {
+		transport := &fakeRecoveryTransport{
+			snapshots:         []*agyv115.GetCascadeTrajectoryStepsResponse{{}},
+			streams:           []trajectoryRecoveryStream{&fakeRecoveryStream{}},
+			bindStreamContext: true,
+		}
+		mapper := newTrajectoryMapper("session", testConversation, "")
+		mapper.BeginTurn()
+		return newTrajectoryRecoveryCoordinatorWithTransport(transport, mapper, trajectoryRecoveryOptions{
+			cascadeID:               "cascade",
+			conversationID:          testConversation,
+			backoff:                 func(int) time.Duration { return 0 },
+			streamIdleTimeout:       time.Minute,
+			recoverySnapshotTimeout: time.Minute,
+		}), transport
+	}
+
+	t.Run("close", func(t *testing.T) {
+		baseline := goruntime.NumGoroutine()
+		c, transport := newCoordinator()
+		done := make(chan error, 1)
+		go func() { done <- c.Run(context.Background()) }()
+		waitForRecoveryCall(t, transport, "stream")
+		_ = c.Close()
+		select {
+		case err := <-done:
+			if !errors.Is(err, errTrajectoryRecoveryClosed) && !errors.Is(err, context.Canceled) {
+				t.Fatalf("close during idle watchdog = %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close did not unblock Run")
+		}
+		requireNoLeakedGoroutines(t, baseline)
+	})
+
+	t.Run("context cancellation", func(t *testing.T) {
+		baseline := goruntime.NumGoroutine()
+		c, transport := newCoordinator()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- c.Run(ctx) }()
+		waitForRecoveryCall(t, transport, "stream")
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancellation during idle watchdog = %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("cancellation did not unblock Run")
+		}
+		requireNoLeakedGoroutines(t, baseline)
 	})
 }

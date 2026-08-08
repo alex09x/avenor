@@ -41,6 +41,11 @@ type ptyRPCHost struct {
 	mapper   *trajectoryMapper
 	turnGate chan struct{}
 
+	// Opt-in trajectory deadlines carried from runtime.StartOptions. Zero
+	// leaves the coordinator bounded only by the outer turn deadline.
+	streamIdleTimeout       time.Duration
+	recoverySnapshotTimeout time.Duration
+
 	// coordinator is the active Stage 12 recovery owner for the current turn.
 	coordinator  *trajectoryRecoveryCoordinator
 	interactions *interactionBridge
@@ -75,6 +80,15 @@ var (
 	}
 )
 
+// nonNegativeDuration keeps a hostile or accidental negative option from
+// arming a deadline that would fire immediately.
+func nonNegativeDuration(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return d
+}
+
 func defaultPTYRPCHostFactory(ctx context.Context, opts runtime.StartOptions, resumeID, version string) (*ptyRPCHost, error) {
 	return startPTYRPCHost(ctx, terminal.PTYLauncher{}, opts, resumeID, version, rpcDiscoveryOptions{})
 }
@@ -105,7 +119,14 @@ func startPTYRPCHost(ctx context.Context, launcher terminal.Launcher, opts runti
 
 	turnGate := make(chan struct{}, 1)
 	turnGate <- struct{}{}
-	host := &ptyRPCHost{terminal: session, cancel: cancel, closed: make(chan struct{}), turnGate: turnGate}
+	host := &ptyRPCHost{
+		terminal:                session,
+		cancel:                  cancel,
+		closed:                  make(chan struct{}),
+		turnGate:                turnGate,
+		streamIdleTimeout:       nonNegativeDuration(opts.AgyStreamIdleTimeout),
+		recoverySnapshotTimeout: nonNegativeDuration(opts.AgyRecoverySnapshotTimeout),
+	}
 	pid := session.PID()
 	if pid <= 0 {
 		return failPTYRPCHostStartup(host, errors.New("agy RPC host did not report a process PID"))

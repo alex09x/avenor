@@ -261,6 +261,9 @@ func (h *ptyRPCHost) RunTurn(ctx context.Context, prompt, modelSlug string, onEv
 		streamVerbosity:   agyv115.StreamTrajectoryVerbosity_CLIENT_TRAJECTORY_VERBOSITY_FULL,
 		onEvent:           turn.emit,
 		holdAfterReady:    true,
+		// Opt-in: zero keeps the coordinator bounded only by turnCtx.
+		streamIdleTimeout:       h.streamIdleTimeout,
+		recoverySnapshotTimeout: h.recoverySnapshotTimeout,
 	})
 	h.coordinator = coordinator
 	h.turnCancel = cancel

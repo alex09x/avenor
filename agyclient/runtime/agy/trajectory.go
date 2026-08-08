@@ -566,6 +566,18 @@ type trajectoryRecoveryOptions struct {
 	backoff             func(int) time.Duration
 	onEvent             func(events.Event)
 	holdAfterReady      bool
+
+	// streamIdleTimeout bounds how long the current subscription may stay
+	// silent before it is closed and recovered through the ordinary
+	// snapshot/reopen path. Only the subscription context is cancelled; the
+	// remote cascade keeps running. Zero (the default) disables the watchdog
+	// entirely, so the loop behaves exactly as it did before.
+	streamIdleTimeout time.Duration
+	// recoverySnapshotTimeout is the per-call deadline for the trajectory
+	// snapshot RPC, so a blocked server ends the call at its own operation
+	// deadline instead of consuming the whole outer turn deadline. Zero (the
+	// default) leaves the call bounded only by the caller's context.
+	recoverySnapshotTimeout time.Duration
 }
 
 type heldTrajectorySnapshot struct {
@@ -575,9 +587,16 @@ type heldTrajectorySnapshot struct {
 
 var errTrajectoryRecoveryClosed = errors.New("agy trajectory recovery is closed")
 
-// trajectoryRecoveryCoordinator owns one sequential stream/recovery loop. It
-// does not start goroutines; Close closes the active Stage 11 stream to unblock
-// Recv, and Run always closes every opened stream before returning.
+// errTrajectoryRecoverySnapshotTimeout is deliberately not a
+// context.DeadlineExceeded wrapper: the operation deadline belongs to the
+// snapshot RPC, and callers must not mistake it for the turn deadline.
+var errTrajectoryRecoverySnapshotTimeout = errors.New("agy trajectory recovery snapshot timed out")
+
+// trajectoryRecoveryCoordinator owns one sequential stream/recovery loop. The
+// only goroutine it ever starts is the opt-in per-subscription inactivity
+// watchdog, which Run always joins before opening the next subscription. Close
+// closes the active Stage 11 stream to unblock Recv, and Run always closes
+// every opened stream before returning.
 type trajectoryRecoveryCoordinator struct {
 	transport    trajectoryRecoveryTransport
 	mapper       *trajectoryMapper
@@ -599,6 +618,9 @@ type trajectoryRecoveryCoordinator struct {
 	ran          bool
 	resultErr    error
 	sleep        func(context.Context, time.Duration) error
+	// deadlineEvents keeps the new deadline diagnostics opt-in: callers that
+	// configure no duration keep byte-identical event streams.
+	deadlineEvents bool
 }
 
 func newTrajectoryRecoveryCoordinator(client *rpcClient, mapper *trajectoryMapper, options trajectoryRecoveryOptions) *trajectoryRecoveryCoordinator {
@@ -611,16 +633,23 @@ func newTrajectoryRecoveryCoordinatorWithTransport(transport trajectoryRecoveryT
 	if options.backoff == nil {
 		options.backoff = func(attempt int) time.Duration { return time.Duration(attempt) * 50 * time.Millisecond }
 	}
+	if options.streamIdleTimeout < 0 {
+		options.streamIdleTimeout = 0
+	}
+	if options.recoverySnapshotTimeout < 0 {
+		options.recoverySnapshotTimeout = 0
+	}
 	return &trajectoryRecoveryCoordinator{
-		transport: transport,
-		mapper:    mapper,
-		options:   options,
-		closed:    make(chan struct{}),
-		ready:     make(chan struct{}),
-		finished:  make(chan struct{}),
-		terminal:  make(chan struct{}),
-		release:   make(chan struct{}),
-		sleep:     sleepTrajectoryRecovery,
+		transport:      transport,
+		mapper:         mapper,
+		options:        options,
+		closed:         make(chan struct{}),
+		ready:          make(chan struct{}),
+		finished:       make(chan struct{}),
+		terminal:       make(chan struct{}),
+		release:        make(chan struct{}),
+		sleep:          sleepTrajectoryRecovery,
+		deadlineEvents: options.streamIdleTimeout > 0 || options.recoverySnapshotTimeout > 0,
 	}
 }
 
@@ -739,11 +768,16 @@ func (c *trajectoryRecoveryCoordinator) Run(ctx context.Context) (resultErr erro
 		if err := c.stopped(ctx); err != nil {
 			return err
 		}
-		stream, err := c.transport.openStream(ctx, &agyv115.StreamAgentStateUpdatesRequest{ConversationId: c.options.conversationID, SubscriberId: c.options.subscriberID, TrajectoryVerbosity: c.options.streamVerbosity})
+		// The subscription owns its own cancellation scope so an inactivity
+		// timeout tears down only this stream, never the run context that the
+		// remote cascade and the recovery RPCs depend on.
+		streamCtx, streamCancel := context.WithCancel(ctx)
+		stream, err := c.transport.openStream(streamCtx, &agyv115.StreamAgentStateUpdatesRequest{ConversationId: c.options.conversationID, SubscriberId: c.options.subscriberID, TrajectoryVerbosity: c.options.streamVerbosity})
 		if err != nil {
+			streamCancel()
 			attempts++
 			var recoverErr error
-			attempts, recoverErr = c.recover(ctx, attempts, &held)
+			attempts, recoverErr = c.recover(ctx, attempts, &held, trajectoryRecoveryTriggerOpenFailed)
 			if recoverErr != nil {
 				return recoverErr
 			}
@@ -753,87 +787,115 @@ func (c *trajectoryRecoveryCoordinator) Run(ctx context.Context) (resultErr erro
 		if err := c.stopped(ctx); err != nil {
 			c.clearStream(stream)
 			_ = stream.Close()
+			streamCancel()
 			return err
 		}
-		reopen := false
-		for {
-			response, recvErr := stream.Recv()
-			if recvErr != nil {
-				reopen = true
-				break
-			}
-			update := response.GetUpdate()
-			if c.mapper.TrajectoryID() == "" {
-				bound := c.mapper.BindStreamIdentity(update)
-				c.emit(bound.events)
-				if bound.recover {
-					reopen = true
-					break
-				}
-				if held != nil {
-					seed := c.mapper.MergeSnapshot(c.mapper.TrajectoryID(), held.offset, held.steps, trajectorySnapshotSeed)
-					c.emit(seed.events)
-					held = nil
-					if seed.recover {
-						reopen = true
-						break
-					}
-				}
-			}
-			result := c.mapper.ApplyStream(update)
-			if result.terminal {
-				c.terminalOnce.Do(func() { close(c.terminal) })
-			}
-			c.emit(result.events)
-			if !result.recover && update.GetStatus() == agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_IDLE && update.GetFullyIdle() {
-				becameReady := false
-				c.readyOnce.Do(func() {
-					becameReady = true
-					close(c.ready)
-				})
-				if becameReady && c.options.holdAfterReady {
-					select {
-					case <-c.release:
-					case <-ctx.Done():
-						return ctx.Err()
-					case <-c.closed:
-						return errTrajectoryRecoveryClosed
-					}
-				}
-			}
-			if result.terminal {
-				c.clearStream(stream)
-				_ = stream.Close()
-				return nil
-			}
-			if result.recover {
-				reopen = true
-				break
-			}
+		watchdog := c.startIdleWatchdog(ctx, stream, streamCancel)
+		trigger, consumeErr := c.consumeStream(ctx, stream, watchdog, &held)
+		watchdog.stopAndWait()
+		streamCancel()
+		if consumeErr != nil {
+			return consumeErr
 		}
-		c.clearStream(stream)
-		_ = stream.Close()
-		if !reopen {
+		if trigger == "" {
 			return nil
 		}
 		attempts++
 		var recoverErr error
-		attempts, recoverErr = c.recover(ctx, attempts, &held)
+		attempts, recoverErr = c.recover(ctx, attempts, &held, trigger)
 		if recoverErr != nil {
 			return recoverErr
 		}
 	}
 }
 
-func (c *trajectoryRecoveryCoordinator) recover(ctx context.Context, attempts int, held **heldTrajectorySnapshot) (int, error) {
+// consumeStream drains one subscription. It returns a non-empty recovery
+// trigger when the caller must reopen, an empty trigger when the run is
+// complete, and an error when the run must stop.
+func (c *trajectoryRecoveryCoordinator) consumeStream(ctx context.Context, stream trajectoryRecoveryStream, watchdog *streamIdleWatchdog, held **heldTrajectorySnapshot) (string, error) {
+	trigger := ""
+	for {
+		response, recvErr := stream.Recv()
+		if recvErr != nil {
+			trigger = trajectoryRecoveryTriggerStreamEnded
+			if watchdog.expired() {
+				trigger = trajectoryRecoveryTriggerStreamIdle
+				c.emitDeadlineEvent("stream_idle_timeout", map[string]any{"phase": "stream", "timeout_ms": c.options.streamIdleTimeout.Milliseconds()})
+			}
+			break
+		}
+		watchdog.note(streamIdleActivity)
+		update := response.GetUpdate()
+		if c.mapper.TrajectoryID() == "" {
+			bound := c.mapper.BindStreamIdentity(update)
+			c.emit(bound.events)
+			if bound.recover {
+				trigger = trajectoryRecoveryTriggerStreamRecover
+				break
+			}
+			if *held != nil {
+				seed := c.mapper.MergeSnapshot(c.mapper.TrajectoryID(), (*held).offset, (*held).steps, trajectorySnapshotSeed)
+				c.emit(seed.events)
+				*held = nil
+				if seed.recover {
+					trigger = trajectoryRecoveryTriggerStreamRecover
+					break
+				}
+			}
+		}
+		result := c.mapper.ApplyStream(update)
+		if result.terminal {
+			c.terminalOnce.Do(func() { close(c.terminal) })
+		}
+		c.emit(result.events)
+		if !result.recover && update.GetStatus() == agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_IDLE && update.GetFullyIdle() {
+			becameReady := false
+			c.readyOnce.Do(func() {
+				becameReady = true
+				close(c.ready)
+			})
+			if becameReady && c.options.holdAfterReady {
+				// Holding for the turn owner is a deliberate wait, not stream
+				// inactivity, so the watchdog must not count it.
+				watchdog.note(streamIdlePause)
+				select {
+				case <-c.release:
+				case <-ctx.Done():
+					return "", ctx.Err()
+				case <-c.closed:
+					return "", errTrajectoryRecoveryClosed
+				}
+				watchdog.note(streamIdleResume)
+			}
+		}
+		if result.terminal {
+			c.clearStream(stream)
+			_ = stream.Close()
+			return "", nil
+		}
+		if result.recover {
+			trigger = trajectoryRecoveryTriggerStreamRecover
+			break
+		}
+	}
+	c.clearStream(stream)
+	_ = stream.Close()
+	return trigger, nil
+}
+
+func (c *trajectoryRecoveryCoordinator) recover(ctx context.Context, attempts int, held **heldTrajectorySnapshot, trigger string) (int, error) {
+	c.emitDeadlineEvent("stream_recovery_started", map[string]any{"phase": "snapshot_reopen", "trigger": trigger, "attempt": int64(attempts)})
 	if err := c.stopped(ctx); err != nil {
+		c.emitDeadlineEvent("stream_recovery_failed", map[string]any{"phase": "snapshot_reopen", "reason": "stopped"})
 		return attempts, err
 	}
 	if attempts > c.options.maxRecoveryAttempts {
+		c.emitDeadlineEvent("stream_recovery_failed", map[string]any{"phase": "snapshot_reopen", "reason": "retry_limit"})
 		return attempts, errors.New("agy trajectory recovery exceeded retry limit")
 	}
 	snapshot, nextAttempts, err := c.fetchSnapshotWithRetry(ctx, attempts)
 	if err != nil {
+		c.emitDeadlineEvent("stream_recovery_failed", map[string]any{"phase": "snapshot", "reason": trajectoryRecoveryFailureReason(err)})
 		return nextAttempts, err
 	}
 	attempts = nextAttempts
@@ -843,13 +905,30 @@ func (c *trajectoryRecoveryCoordinator) recover(ctx context.Context, attempts in
 		result := c.mapper.MergeSnapshot(c.mapper.TrajectoryID(), snapshot.offset, snapshot.steps, trajectorySnapshotRecovery)
 		c.emit(result.events)
 		if result.recover {
+			c.emitDeadlineEvent("stream_recovery_failed", map[string]any{"phase": "merge", "reason": "merge_failed"})
 			return attempts, errors.New("agy trajectory recovery snapshot merge failed")
 		}
 	}
 	if err := c.sleep(ctx, c.options.backoff(attempts)); err != nil {
+		c.emitDeadlineEvent("stream_recovery_failed", map[string]any{"phase": "backoff", "reason": "stopped"})
 		return attempts, err
 	}
-	return attempts, c.stopped(ctx)
+	if err := c.stopped(ctx); err != nil {
+		c.emitDeadlineEvent("stream_recovery_failed", map[string]any{"phase": "snapshot_reopen", "reason": "stopped"})
+		return attempts, err
+	}
+	c.emitDeadlineEvent("stream_recovery_reopened", map[string]any{"phase": "reopen", "attempt": int64(attempts)})
+	return attempts, nil
+}
+
+func trajectoryRecoveryFailureReason(err error) string {
+	if errors.Is(err, errTrajectoryRecoverySnapshotTimeout) {
+		return "snapshot_timeout"
+	}
+	if errors.Is(err, errTrajectoryRecoveryClosed) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "stopped"
+	}
+	return "snapshot_failed"
 }
 
 func (c *trajectoryRecoveryCoordinator) fetchSnapshotWithRetry(ctx context.Context, attempts int) (*heldTrajectorySnapshot, int, error) {
@@ -872,8 +951,21 @@ func (c *trajectoryRecoveryCoordinator) fetchSnapshotWithRetry(ctx context.Conte
 }
 
 func (c *trajectoryRecoveryCoordinator) fetchSnapshot(ctx context.Context) (*heldTrajectorySnapshot, error) {
-	response, err := c.transport.getSteps(ctx, c.options.cascadeID, c.options.snapshotOffset, c.options.snapshotVerbosity, c.options.streamVerbosity)
+	callCtx := ctx
+	timeout := c.options.recoverySnapshotTimeout
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		callCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	response, err := c.transport.getSteps(callCtx, c.options.cascadeID, c.options.snapshotOffset, c.options.snapshotVerbosity, c.options.streamVerbosity)
 	if err != nil {
+		// Only the operation deadline elapsed: the caller's context is still
+		// live, so the run keeps its own retry/backoff budget.
+		if timeout > 0 && ctx.Err() == nil && errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+			c.emitDeadlineEvent("recovery_snapshot_timeout", map[string]any{"phase": "snapshot", "timeout_ms": timeout.Milliseconds()})
+			return nil, errTrajectoryRecoverySnapshotTimeout
+		}
 		return nil, err
 	}
 	return &heldTrajectorySnapshot{offset: c.options.snapshotOffset, steps: response.GetSteps()}, nil
@@ -889,6 +981,21 @@ func (c *trajectoryRecoveryCoordinator) stopped(ctx context.Context) error {
 		return nil
 	}
 }
+
+// emitDeadlineEvent reports the opt-in idle/recovery diagnostics. Fields are
+// restricted to fixed codes and durations: no prompt, response, path, token,
+// or tool argument ever reaches this event.
+func (c *trajectoryRecoveryCoordinator) emitDeadlineEvent(code string, fields map[string]any) {
+	if !c.deadlineEvents || c.mapper == nil {
+		return
+	}
+	payload := map[string]any{"code": code}
+	for key, value := range fields {
+		payload[key] = value
+	}
+	c.emit([]events.Event{c.mapper.event("avenor.agy.protocol", payload)})
+}
+
 func (c *trajectoryRecoveryCoordinator) emit(events []events.Event) {
 	if c.options.holdAfterReady && !c.released.Load() {
 		return
@@ -911,6 +1018,125 @@ func (c *trajectoryRecoveryCoordinator) clearStream(stream trajectoryRecoveryStr
 	}
 	c.mu.Unlock()
 }
+
+// Recovery triggers are fixed, privacy-safe labels for the protocol event.
+const (
+	trajectoryRecoveryTriggerOpenFailed    = "stream_open_failed"
+	trajectoryRecoveryTriggerStreamEnded   = "stream_ended"
+	trajectoryRecoveryTriggerStreamIdle    = "stream_idle_timeout"
+	trajectoryRecoveryTriggerStreamRecover = "stream_recover"
+)
+
+type streamIdleAction uint8
+
+const (
+	streamIdleActivity streamIdleAction = iota
+	streamIdlePause
+	streamIdleResume
+)
+
+// streamIdleWatchdog closes one subscription when it stays silent for the
+// configured inactivity budget. A nil watchdog is the disabled configuration
+// and every method is a no-op, so the zero-duration path starts no goroutine.
+type streamIdleWatchdog struct {
+	signal   chan streamIdleAction
+	stop     chan struct{}
+	exited   chan struct{}
+	stopOnce sync.Once
+	fired    atomic.Bool
+}
+
+func (c *trajectoryRecoveryCoordinator) startIdleWatchdog(ctx context.Context, stream trajectoryRecoveryStream, cancelStream context.CancelFunc) *streamIdleWatchdog {
+	timeout := c.options.streamIdleTimeout
+	if timeout <= 0 {
+		return nil
+	}
+	w := &streamIdleWatchdog{
+		signal: make(chan streamIdleAction),
+		stop:   make(chan struct{}),
+		exited: make(chan struct{}),
+	}
+	go func() {
+		defer close(w.exited)
+		// time.Timer is monotonic, so wall-clock jumps cannot shorten or
+		// extend the inactivity budget.
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		armed := true
+		for {
+			var expired <-chan time.Time
+			if armed {
+				expired = timer.C
+			}
+			select {
+			case <-w.stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-c.closed:
+				return
+			case action := <-w.signal:
+				switch action {
+				case streamIdlePause:
+					if armed {
+						drainTrajectoryTimer(timer)
+						armed = false
+					}
+				case streamIdleResume:
+					if !armed {
+						timer.Reset(timeout)
+						armed = true
+					}
+				default:
+					if armed {
+						drainTrajectoryTimer(timer)
+						timer.Reset(timeout)
+					}
+				}
+			case <-expired:
+				// Only the flag is set here; the run goroutine owns every
+				// event emission so observers never see concurrent callbacks.
+				w.fired.Store(true)
+				// Cancel and close only this subscription: the run context,
+				// and therefore the remote cascade, is left untouched.
+				cancelStream()
+				_ = stream.Close()
+				return
+			}
+		}
+	}()
+	return w
+}
+
+func drainTrajectoryTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+}
+
+func (w *streamIdleWatchdog) note(action streamIdleAction) {
+	if w == nil {
+		return
+	}
+	select {
+	case w.signal <- action:
+	case <-w.exited:
+	}
+}
+
+func (w *streamIdleWatchdog) stopAndWait() {
+	if w == nil {
+		return
+	}
+	w.stopOnce.Do(func() { close(w.stop) })
+	<-w.exited
+}
+
+func (w *streamIdleWatchdog) expired() bool { return w != nil && w.fired.Load() }
+
 func sleepTrajectoryRecovery(ctx context.Context, duration time.Duration) error {
 	if duration <= 0 {
 		return nil
