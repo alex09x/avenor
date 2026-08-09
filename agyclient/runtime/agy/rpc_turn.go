@@ -47,7 +47,6 @@ func rpcGraceTimeout() time.Duration {
 }
 
 var (
-	errRPCTurnActive       = errors.New("agy RPC turn is already active")
 	errRPCHostClosed       = errors.New("agy RPC host is closed")
 	errRPCTurnCancelled    = errors.New("agy RPC turn was cancelled")
 	errRPCCancelCleanup    = errors.New("agy RPC cancellation cleanup failed")
@@ -72,6 +71,7 @@ type rpcTurn struct {
 	terminalEmitted        bool
 	cancelResult           error
 	sendIssued             bool
+	cancelMutationIssued   bool
 
 	// sendMu serializes the SendUserCascadeMessage mutation against markCancel.
 	// The send path holds it across the RPC call. The cancel path holds it
@@ -192,26 +192,87 @@ func (t *rpcTurn) wasSendIssued() bool {
 	return t.sendIssued
 }
 
+func (t *rpcTurn) claimCancelMutation() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.cancelMutationIssued {
+		return false
+	}
+	t.cancelMutationIssued = true
+	return true
+}
+
+func (t *rpcTurn) claimUnresolvedCancelMutation() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.sendIssued || t.remoteTerminalObserved || t.cancelled || t.cancelMutationIssued {
+		return false
+	}
+	t.cancelMutationIssued = true
+	return true
+}
+
+func (h *ptyRPCHost) waitTurnGate(ctx context.Context) error {
+	h.mu.Lock()
+	if h.closing || h.quarantined {
+		h.mu.Unlock()
+		return errRPCHostClosed
+	}
+	h.queuedTurns++
+	closed := h.closed
+	h.mu.Unlock()
+
+	dequeue := func() {
+		h.mu.Lock()
+		h.queuedTurns--
+		if h.queuedTurns == 0 {
+			h.queuedCancel = false
+		}
+		h.mu.Unlock()
+	}
+	select {
+	case <-h.turnGate:
+		h.mu.Lock()
+		h.queuedTurns--
+		if h.closing || h.quarantined {
+			h.mu.Unlock()
+			h.turnGate <- struct{}{}
+			return errRPCHostClosed
+		}
+		if err := ctx.Err(); err != nil {
+			h.mu.Unlock()
+			h.turnGate <- struct{}{}
+			return err
+		}
+		h.turnStarting = true
+		h.mu.Unlock()
+		return nil
+	case <-ctx.Done():
+		dequeue()
+		return ctx.Err()
+	case <-closed:
+		dequeue()
+		return errRPCHostClosed
+	}
+}
+
 // RunTurn executes one RPC turn without using the PTY as a protocol surface.
-// It resolves the requested model before opening a stream, installs the
-// snapshot/reconnect coordinator, waits for stream readiness, sends exactly
-// once, and returns only after the mapper emits its terminal event.
+// It waits behind an active turn while ctx remains live, resolves the requested
+// model before opening a stream, installs the snapshot/reconnect coordinator,
+// waits for stream readiness, sends exactly once, and returns only after the
+// mapper emits its terminal event.
 func (h *ptyRPCHost) RunTurn(ctx context.Context, prompt, modelSlug string, onEvent func(events.Event)) error {
 	if h == nil || h.turnGate == nil {
 		return errRPCHostClosed
 	}
-	h.mu.Lock()
-	if h.closing {
-		h.mu.Unlock()
-		return errRPCHostClosed
-	}
-	select {
-	case <-h.turnGate:
-		h.turnStarting = true
-		h.mu.Unlock()
-	default:
-		h.mu.Unlock()
-		return errRPCTurnActive
+	if err := h.waitTurnGate(ctx); err != nil {
+		return err
 	}
 
 	releaseGate := true
@@ -223,14 +284,15 @@ func (h *ptyRPCHost) RunTurn(ctx context.Context, prompt, modelSlug string, onEv
 
 	turnCtx, cancel := context.WithCancel(ctx)
 	h.mu.Lock()
-	if h.closing || h.rpc == nil || h.rpc.client == nil || h.mapper == nil {
+	if h.closing || h.quarantined || h.rpc == nil || h.rpc.client == nil || h.mapper == nil {
 		h.turnStarting = false
 		h.mu.Unlock()
 		cancel()
 		return errRPCHostClosed
 	}
-	if h.pendingCancel {
+	if h.pendingCancel || h.queuedCancel {
 		h.pendingCancel = false
+		h.queuedCancel = false
 		h.turnStarting = false
 		h.mu.Unlock()
 		cancel()
@@ -286,6 +348,7 @@ func (h *ptyRPCHost) RunTurn(ctx context.Context, prompt, modelSlug string, onEv
 
 	go func() { _ = coordinator.Run(turnCtx) }()
 	defer func() {
+		h.quarantineUnresolvedTurn(turn)
 		if h.interactions != nil {
 			waitCtx, waitCancel := context.WithTimeout(context.Background(), rpcCancelTimeout())
 			if turn.observedRemoteTerminal() && !turn.isCancelled() {
@@ -355,6 +418,27 @@ func (h *ptyRPCHost) RunTurn(ctx context.Context, prompt, modelSlug string, onEv
 	return nil
 }
 
+func (h *ptyRPCHost) quarantineUnresolvedTurn(turn *rpcTurn) {
+	if !turn.claimUnresolvedCancelMutation() {
+		return
+	}
+	h.mu.Lock()
+	if h.closing {
+		h.mu.Unlock()
+		return
+	}
+	h.quarantined = true
+	rpc := h.rpc
+	cascadeID := h.conversationID
+	h.mu.Unlock()
+	if rpc == nil || rpc.client == nil {
+		return
+	}
+	cancelCtx, cancel := context.WithTimeout(context.Background(), rpcCancelTimeout())
+	_, _ = rpc.client.cancelCascadeSteps(cancelCtx, cascadeID, nil)
+	cancel()
+}
+
 func (h *ptyRPCHost) turnError(caller context.Context, processDone <-chan struct{}, turn *rpcTurn, err error) error {
 	if turn != nil && turn.isCancelled() {
 		return errRPCTurnCancelled
@@ -422,6 +506,8 @@ func (h *ptyRPCHost) Cancel(ctx context.Context) error {
 	if turn == nil {
 		if h.turnStarting {
 			h.pendingCancel = true
+		} else if h.queuedTurns > 0 {
+			h.queuedCancel = true
 		}
 		h.mu.Unlock()
 		return nil
@@ -472,11 +558,13 @@ func (h *ptyRPCHost) runCancel(turn *rpcTurn, bridge *interactionBridge, rpc *rp
 	}
 	joinCancel()
 
-	cancelCtx, cancelRPC := context.WithTimeout(context.Background(), rpcCancelTimeout())
-	_, err := rpc.client.cancelCascadeSteps(cancelCtx, cascadeID, nil)
-	cancelRPC()
-	if err != nil {
-		return h.fallbackCancel(turn)
+	if turn.claimCancelMutation() {
+		cancelCtx, cancelRPC := context.WithTimeout(context.Background(), rpcCancelTimeout())
+		_, err := rpc.client.cancelCascadeSteps(cancelCtx, cascadeID, nil)
+		cancelRPC()
+		if err != nil {
+			return h.fallbackCancel(turn)
+		}
 	}
 	if !turn.wasSendIssued() {
 		turn.cancel()

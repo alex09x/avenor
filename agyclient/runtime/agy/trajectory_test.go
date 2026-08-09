@@ -883,6 +883,60 @@ func TestTrajectoryRecoveryStreamIdleTimeoutRecoversBeforeTurnDeadline(t *testin
 	}
 }
 
+func TestTrajectoryRecoveryStreamIdleKeepsTurnUntilLateResponse(t *testing.T) {
+	const silentSubscriptions = 4
+	streams := make([]trajectoryRecoveryStream, 0, silentSubscriptions+1)
+	for range silentSubscriptions {
+		streams = append(streams, &fakeRecoveryStream{})
+	}
+	streams = append(streams, &fakeRecoveryStream{responses: []*agyv115.StreamAgentStateUpdatesResponse{
+		streamResponse(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_RUNNING, false, []uint32{1}, plannerStep(agyv115.CortexStepStatus_CORTEX_STEP_STATUS_GENERATING, "late answer", nil))),
+		streamResponse(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_IDLE, true, []uint32{1}, plannerStep(agyv115.CortexStepStatus_CORTEX_STEP_STATUS_DONE, "late answer", nil))),
+	}})
+	transport := &fakeRecoveryTransport{
+		streams:           streams,
+		bindStreamContext: true,
+	}
+	mapper := newTrajectoryMapper("session", testConversation, "")
+	mapper.BeginTurn()
+	var got []events.Event
+	c := newTrajectoryRecoveryCoordinatorWithTransport(transport, mapper, trajectoryRecoveryOptions{
+		cascadeID:           "cascade",
+		conversationID:      testConversation,
+		maxRecoveryAttempts: 3,
+		backoff:             func(int) time.Duration { return 0 },
+		streamIdleTimeout:   5 * time.Millisecond,
+		onEvent:             func(event events.Event) { got = append(got, event) },
+	})
+	turnCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := c.Run(turnCtx); err != nil {
+		t.Fatal(err)
+	}
+	if err := turnCtx.Err(); err != nil {
+		t.Fatalf("outer turn context was cancelled: %v", err)
+	}
+	messageChunks := 0
+	sessionEnds := 0
+	for _, event := range got {
+		switch event.Event {
+		case "agent.message_chunk":
+			messageChunks++
+		case "session.end":
+			sessionEnds++
+		}
+	}
+	if messageChunks != 1 || sessionEnds != 1 {
+		t.Fatalf("terminal event counts = chunks:%d ends:%d in %v", messageChunks, sessionEnds, eventNames(got))
+	}
+	if hasProtocolCode(got, "stream_recovery_failed") {
+		t.Fatalf("late response exhausted idle recovery: %v", eventNames(got))
+	}
+	if calls := recoveryCalls(t, transport); len(calls) != 2*(silentSubscriptions+1) {
+		t.Fatalf("recovery call count = %d (%v), want %d", len(calls), calls, 2*(silentSubscriptions+1))
+	}
+}
+
 // A wedged recovery snapshot must end at its own operation deadline, not at
 // the outer turn deadline, and must not surface as a turn deadline error.
 func TestTrajectoryRecoverySnapshotTimeoutEndsAtOperationDeadline(t *testing.T) {

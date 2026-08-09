@@ -48,28 +48,29 @@ type turnTestServer struct {
 	t      *testing.T
 	server *httptest.Server
 
-	mu              sync.Mutex
-	streamNumber    uint32
-	currentStream   chan struct{}
-	streamOpened    chan struct{}
-	streamOpenOnce  sync.Once
-	sends           []*agyv115.SendUserCascadeMessageRequest
-	blockAfterSend  bool
-	failNextSend    bool
-	blockRelease    chan struct{}
-	initialRelease  chan struct{}
-	cancelRelease   chan struct{}
-	cancelOnce      sync.Once
-	cancelCalls     int
-	cancelStatus    int
-	cancelDelay     time.Duration
-	cancelNoRelease bool
-	sendNotify      chan struct{}
-	sendRelease     chan struct{}
-	notifyOnce      sync.Once
-	activeStep      *agyv115.Step
-	activeNotify    chan struct{}
-	activeOnce      sync.Once
+	mu                 sync.Mutex
+	streamNumber       uint32
+	currentStream      chan struct{}
+	streamOpened       chan struct{}
+	streamOpenOnce     sync.Once
+	sends              []*agyv115.SendUserCascadeMessageRequest
+	blockAfterSend     bool
+	failNextSend       bool
+	blockRelease       chan struct{}
+	initialRelease     chan struct{}
+	cancelRelease      chan struct{}
+	cancelOnce         sync.Once
+	cancelCalls        int
+	cancelStatus       int
+	cancelDelay        time.Duration
+	cancelNoRelease    bool
+	sendNotify         chan struct{}
+	sendRelease        chan struct{}
+	notifyOnce         sync.Once
+	activeStep         *agyv115.Step
+	activeNotify       chan struct{}
+	activeOnce         sync.Once
+	plannerAfterStream uint32
 }
 
 func newTurnTestServer(t *testing.T) *turnTestServer {
@@ -119,7 +120,12 @@ func (s *turnTestServer) handle(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		initial := update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_IDLE, true, nil)
-		if index > 1 {
+		s.mu.Lock()
+		plannerAfterStream := s.plannerAfterStream
+		s.mu.Unlock()
+		if index > 1 && plannerAfterStream > 0 && index < plannerAfterStream {
+			initial = update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_RUNNING, false, nil)
+		} else if index > 1 {
 			initial = update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_IDLE, true, []uint32{1}, plannerStep(agyv115.CortexStepStatus_CORTEX_STEP_STATUS_DONE, "turn", nil))
 		}
 		initialPayload, err := proto.Marshal(streamResponse(initial))
@@ -310,6 +316,57 @@ func TestPTYRPCHostRunTurnUsesRecoveryMapperAndExactModel(t *testing.T) {
 	}
 }
 
+func TestPTYRPCHostKeepsGateAcrossRepeatedIdleRecovery(t *testing.T) {
+	server := newTurnTestServer(t)
+	defer server.close()
+	server.mu.Lock()
+	server.blockAfterSend = true
+	server.plannerAfterStream = 6
+	server.mu.Unlock()
+	host := newTurnTestHost(t, server.server.URL)
+	host.streamIdleTimeout = 100 * time.Millisecond
+	defer host.rpc.close()
+
+	recovered := make(chan struct{})
+	var recoveryCount int
+	turnDone := make(chan error, 1)
+	turnCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		turnDone <- host.RunTurn(turnCtx, "first", "known", func(event events.Event) {
+			if event.Event != "avenor.agy.protocol" || event.Fields["code"] != "stream_recovery_reopened" {
+				return
+			}
+			recoveryCount++
+			if recoveryCount == 4 {
+				close(recovered)
+			}
+		})
+	}()
+	select {
+	case <-recovered:
+	case err := <-turnDone:
+		t.Fatalf("turn ended before repeated idle recovery: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("idle recovery did not start")
+	}
+
+	// The old retry-limit behavior returned instead of reopening a fourth
+	// time. Reaching this observable recovery proves that the original turn
+	// still owns the host while the next silent subscription is active.
+	select {
+	case err := <-turnDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late response did not finish the owning turn")
+	}
+	if requests := server.requests(); len(requests) != 1 {
+		t.Fatalf("send count = %d, want 1", len(requests))
+	}
+}
+
 func TestPTYRPCHostNormalTerminalWinsCancelRace(t *testing.T) {
 	server := newTurnTestServer(t)
 	defer server.close()
@@ -355,7 +412,7 @@ func TestPTYRPCHostTerminalWinsProcessExit(t *testing.T) {
 	}
 }
 
-func TestPTYRPCHostSendFailureIsRedactedAndNotRetried(t *testing.T) {
+func TestPTYRPCHostSendFailureIsRedactedAndQuarantinesHost(t *testing.T) {
 	server := newTurnTestServer(t)
 	defer server.close()
 	server.mu.Lock()
@@ -369,18 +426,177 @@ func TestPTYRPCHostSendFailureIsRedactedAndNotRetried(t *testing.T) {
 	if len(server.requests()) != 1 {
 		t.Fatalf("failed send calls = %d", len(server.requests()))
 	}
-	if err := host.RunTurn(context.Background(), "next", "known", nil); err != nil {
-		t.Fatalf("host unusable after send failure: %v", err)
+	if err := host.RunTurn(context.Background(), "next", "known", nil); !errors.Is(err, errRPCHostClosed) {
+		t.Fatalf("ambiguous send failure left host reusable: %v", err)
 	}
-	if len(server.requests()) != 2 {
+	if len(server.requests()) != 1 {
 		t.Fatalf("total send calls = %d", len(server.requests()))
+	}
+	server.mu.Lock()
+	cancelCalls := server.cancelCalls
+	server.mu.Unlock()
+	if cancelCalls != 1 {
+		t.Fatalf("cancel calls = %d, want 1", cancelCalls)
 	}
 }
 
-func TestPTYRPCHostRejectsConcurrentTurn(t *testing.T) {
+func waitForQueuedTurns(t *testing.T, host *ptyRPCHost, want int) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		host.mu.Lock()
+		got := host.queuedTurns
+		host.mu.Unlock()
+		if got == want {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatalf("queued turns = %d, want %d", got, want)
+		}
+	}
+}
+
+func TestPTYRPCHostQueuesConcurrentTurn(t *testing.T) {
+	server := newTurnTestServer(t)
+	defer server.close()
+	server.mu.Lock()
+	server.blockAfterSend = true
+	server.sendNotify = make(chan struct{})
+	firstSent := server.sendNotify
+	server.mu.Unlock()
+	host := newTurnTestHost(t, server.server.URL)
+	defer host.rpc.close()
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- host.RunTurn(context.Background(), "first", "known", nil) }()
+	select {
+	case <-firstSent:
+	case <-time.After(time.Second):
+		t.Fatal("first turn did not send")
+	}
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- host.RunTurn(context.Background(), "second", "known", nil) }()
+	waitForQueuedTurns(t, host, 1)
+	if requests := server.requests(); len(requests) != 1 {
+		t.Fatalf("send count while queued = %d, want 1", len(requests))
+	}
+
+	server.mu.Lock()
+	server.blockAfterSend = false
+	server.mu.Unlock()
+	close(server.cancelRelease)
+	for index, done := range []<-chan error{firstDone, secondDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("turn %d: %v", index, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("turn %d did not finish", index)
+		}
+	}
+	requests := server.requests()
+	if len(requests) != 2 || requests[0].GetItems()[0].GetText() != "first" || requests[1].GetItems()[0].GetText() != "second" {
+		t.Fatalf("queued send order = %#v", requests)
+	}
+}
+
+func TestPTYRPCHostQueuedTurnHonorsContext(t *testing.T) {
 	host := &ptyRPCHost{turnGate: make(chan struct{}), closed: make(chan struct{})}
-	if err := host.RunTurn(context.Background(), "", "", nil); !errors.Is(err, errRPCTurnActive) {
-		t.Fatalf("concurrent turn = %v", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- host.RunTurn(ctx, "queued", "known", nil) }()
+	waitForQueuedTurns(t, host, 1)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("queued turn = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued turn ignored context cancellation")
+	}
+	waitForQueuedTurns(t, host, 0)
+}
+
+func TestPTYRPCHostCancelQueuedTurnDoesNotLeak(t *testing.T) {
+	server := newTurnTestServer(t)
+	defer server.close()
+	host := newTurnTestHost(t, server.server.URL)
+	defer host.rpc.close()
+	<-host.turnGate
+
+	done := make(chan error, 1)
+	go func() { done <- host.RunTurn(context.Background(), "cancelled", "known", nil) }()
+	waitForQueuedTurns(t, host, 1)
+	if err := host.Cancel(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	host.turnGate <- struct{}{}
+	select {
+	case err := <-done:
+		if !errors.Is(err, errRPCTurnCancelled) {
+			t.Fatalf("queued turn = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued cancellation did not finish")
+	}
+	if requests := server.requests(); len(requests) != 0 {
+		t.Fatalf("cancelled queue sent %d mutations", len(requests))
+	}
+	if err := host.RunTurn(context.Background(), "next", "known", nil); err != nil {
+		t.Fatalf("queued cancellation leaked into next turn: %v", err)
+	}
+}
+
+func TestPTYRPCHostQuarantineRejectsQueuedTurnWithoutSend(t *testing.T) {
+	server := newTurnTestServer(t)
+	defer server.close()
+	server.mu.Lock()
+	server.failNextSend = true
+	server.sendNotify = make(chan struct{})
+	server.sendRelease = make(chan struct{})
+	firstSent := server.sendNotify
+	firstRelease := server.sendRelease
+	server.mu.Unlock()
+	host := newTurnTestHost(t, server.server.URL)
+	defer host.rpc.close()
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- host.RunTurn(context.Background(), "first", "known", nil) }()
+	select {
+	case <-firstSent:
+	case <-time.After(time.Second):
+		t.Fatal("first turn did not send")
+	}
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- host.RunTurn(context.Background(), "second", "known", nil) }()
+	waitForQueuedTurns(t, host, 1)
+	close(firstRelease)
+
+	select {
+	case err := <-firstDone:
+		if err == nil {
+			t.Fatal("ambiguous first send succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first turn did not fail")
+	}
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, errRPCHostClosed) {
+			t.Fatalf("queued turn result = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued turn did not leave quarantine")
+	}
+	if requests := server.requests(); len(requests) != 1 {
+		t.Fatalf("send count = %d, want 1", len(requests))
 	}
 }
 
@@ -860,10 +1076,14 @@ func TestPTYRPCHostRunTurnCancellationAndProcessDeath(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("turn did not stop")
 			}
-			if !processDeath {
-				if err := host.RunTurn(context.Background(), "no send", "missing", nil); !errors.Is(err, errRPCModelUnavailable) {
-					t.Fatalf("turn gate was not released: %v", err)
-				}
+			if err := host.RunTurn(context.Background(), "no send", "missing", nil); !errors.Is(err, errRPCHostClosed) {
+				t.Fatalf("unresolved remote turn left host reusable: %v", err)
+			}
+			server.mu.Lock()
+			cancelCalls := server.cancelCalls
+			server.mu.Unlock()
+			if cancelCalls != 1 {
+				t.Fatalf("cancel calls = %d, want 1", cancelCalls)
 			}
 		})
 	}
@@ -895,9 +1115,9 @@ func TestPTYRPCHostCloseStopsActiveTurn(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("send did not start")
 	}
-	if err := host.RunTurn(context.Background(), "second", "known", nil); !errors.Is(err, errRPCTurnActive) {
-		t.Fatalf("concurrent turn = %v", err)
-	}
+	queuedDone := make(chan error, 1)
+	go func() { queuedDone <- host.RunTurn(context.Background(), "second", "known", nil) }()
+	waitForQueuedTurns(t, host, 1)
 	if err := host.Close(context.Background()); err != nil {
 		t.Fatalf("host close: %v", err)
 	}
@@ -908,6 +1128,14 @@ func TestPTYRPCHostCloseStopsActiveTurn(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("active turn did not stop")
+	}
+	select {
+	case err := <-queuedDone:
+		if !errors.Is(err, errRPCHostClosed) {
+			t.Fatalf("queued turn result = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued turn did not stop")
 	}
 	if session.KillCalls() != 1 || session.WaitCalls() != 1 {
 		t.Fatalf("cleanup kill=%d wait=%d", session.KillCalls(), session.WaitCalls())

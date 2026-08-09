@@ -29,10 +29,13 @@ type ptyRPCHost struct {
 	mu            sync.Mutex
 	retryMu       sync.Mutex
 	closing       bool
+	quarantined   bool
 	turnCancel    context.CancelFunc
 	turnDone      chan struct{}
 	turn          *rpcTurn
 	turnStarting  bool
+	queuedTurns   int
+	queuedCancel  bool
 	pendingCancel bool
 	closed        chan struct{}
 	closeErr      error

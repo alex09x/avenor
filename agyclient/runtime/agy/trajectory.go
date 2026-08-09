@@ -800,6 +800,13 @@ func (c *trajectoryRecoveryCoordinator) Run(ctx context.Context) (resultErr erro
 		if trigger == "" {
 			return nil
 		}
+		// A successful snapshot/reopen after subscription inactivity is not a
+		// failed recovery attempt. Keep the remote turn owned until its outer
+		// context ends, while retaining the retry budget for actual stream-open,
+		// snapshot, and protocol failures.
+		if trigger == trajectoryRecoveryTriggerStreamIdle {
+			attempts = 0
+		}
 		attempts++
 		var recoverErr error
 		attempts, recoverErr = c.recover(ctx, attempts, &held, trigger)
