@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alex09x/avenor/client"
-	"github.com/alex09x/avenor/internal/admission"
 	"github.com/alex09x/avenor/agyclient/events"
 	"github.com/alex09x/avenor/agyclient/runtime"
+	"github.com/alex09x/avenor/client"
+	"github.com/alex09x/avenor/internal/admission"
 )
 
 func captureStderr(t *testing.T, fn func()) string {
@@ -76,7 +76,7 @@ func newBlockingScriptedSupervisor(t *testing.T, maxRuntimes, maxTreeBudget int)
 	}
 	t.Cleanup(func() {
 		safeClose()
-		_ = sup.broker.Stop()
+		_ = sup.shutdown("kill")
 		sup.stopReaper()
 	})
 	return sup, release, safeClose
@@ -540,7 +540,10 @@ func TestDegradedModeNoBudgetStillEnforcesLocal(t *testing.T) {
 	if sup.broker == nil {
 		t.Fatal("supervisor did not create a broker")
 	}
-	defer func() { _ = sup.broker.Stop() }()
+	defer func() {
+		_ = sup.shutdown("kill")
+		sup.stopReaper()
+	}()
 	if sup.treeBudget != nil {
 		t.Fatal("expected nil tree budget in degraded mode")
 	}
