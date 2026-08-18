@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -34,12 +35,25 @@ func TestPTYSessionWaitReapsAndIsIdempotent(t *testing.T) {
 }
 
 func TestPTYSessionInterruptThenWaitReaps(t *testing.T) {
-	session, err := (PTYLauncher{}).Start(context.Background(), StartOptions{Command: `exec sh -c 'trap "exit 0" INT; while :; do :; done'`})
+	session, err := (PTYLauncher{}).Start(context.Background(), StartOptions{Command: `exec sh -c 'trap "exit 0" INT; printf READY; while :; do :; done'`})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	pid := session.PID()
-	time.Sleep(20 * time.Millisecond)
+	readyDeadline := time.Now().Add(time.Second)
+	for {
+		capture, captureErr := session.Capture(context.Background())
+		if captureErr != nil {
+			t.Fatalf("Capture readiness: %v", captureErr)
+		}
+		if strings.Contains(capture, "READY") {
+			break
+		}
+		if time.Now().After(readyDeadline) {
+			t.Fatal("shell did not install its interrupt trap")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	interrupter, ok := session.(InterruptSession)
 	if !ok {
 		t.Fatal("PTY session has no Interrupt capability")
