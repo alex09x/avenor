@@ -1,0 +1,23 @@
+{
+  "agy_version": "1.1.14",
+  "descriptor_sha256": {
+    "third_party/jetski/cortex_pb/cortex.proto": "f05f27631336dfa179091107b1e466153311d2c1a9c9347d4a6aa67daee83d42",
+    "third_party/gemini_coder/proto/trajectory.proto": "9b77208ddca95342d9a882e1119035abf6bafa235b12350ba1a7e2edbc2cd427"
+  },
+  "retained_contract": {
+    "step_types": {
+      "CORTEX_STEP_TYPE_USER_INPUT": 14,
+      "CORTEX_STEP_TYPE_RUN_COMMAND": 21,
+      "CORTEX_STEP_TYPE_CHECKPOINT": 23
+    },
+    "step_oneof_fields": {
+      "user_input": 19,
+      "run_command": 28,
+      "checkpoint": 30
+    }
+  },
+  "complete_closure": {
+    "retained": false,
+    "retention_reason": "The complete closure contains unrelated private schemas. Only hashes and the minimal reviewed wire contract are retained."
+  }
+}

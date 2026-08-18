@@ -1,6 +1,7 @@
 package agyv115
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -103,8 +104,8 @@ func TestParityRejectsUnlistedHash(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest.DescriptorSHA256 = hex.EncodeToString(sha256.New().Sum(nil))
-	if err := checkParity(data, manifest); err == nil || !strings.Contains(err.Error(), "want supported") {
-		t.Fatalf("unlisted hash error = %v, want supported diagnostic", err)
+	if err := checkParity(data, manifest); err == nil || !strings.Contains(err.Error(), "want a closure hash listed") {
+		t.Fatalf("unlisted hash error = %v, want manifest diagnostic", err)
 	}
 }
 
@@ -133,6 +134,39 @@ func TestGeneratedMessagesPreserveUnknownFields(t *testing.T) {
 	}
 }
 
+func TestAgy1114SchemaProvenanceMatchesGeneratedContract(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "testdata", "rpc", "v1.1.14", "schema-provenance.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var evidence struct {
+		AgyVersion       string            `json:"agy_version"`
+		DescriptorSHA256 map[string]string `json:"descriptor_sha256"`
+		RetainedContract struct {
+			StepTypes       map[string]int32 `json:"step_types"`
+			StepOneofFields map[string]int32 `json:"step_oneof_fields"`
+		} `json:"retained_contract"`
+	}
+	if err := json.Unmarshal(data, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	if evidence.AgyVersion != "1.1.14" || len(evidence.DescriptorSHA256) != 2 {
+		t.Fatalf("unexpected provenance header: version=%q descriptors=%d", evidence.AgyVersion, len(evidence.DescriptorSHA256))
+	}
+	for name, want := range map[string]int32{
+		"CORTEX_STEP_TYPE_USER_INPUT": 14, "CORTEX_STEP_TYPE_RUN_COMMAND": 21, "CORTEX_STEP_TYPE_CHECKPOINT": 23,
+	} {
+		if got := evidence.RetainedContract.StepTypes[name]; got != want {
+			t.Fatalf("provenance step type %s = %d, want %d", name, got, want)
+		}
+	}
+	for name, want := range map[string]int32{"user_input": 19, "run_command": 28, "checkpoint": 30} {
+		if got := evidence.RetainedContract.StepOneofFields[name]; got != want {
+			t.Fatalf("provenance oneof %s = %d, want %d", name, got, want)
+		}
+	}
+}
+
 func TestFieldShapesAndServicePaths(t *testing.T) {
 	steps := (&StepsUpdate{}).ProtoReflect().Descriptor()
 	if !steps.Fields().ByName("indices").IsList() || steps.Fields().ByName("indices").Kind() != protoreflect.Uint32Kind || !steps.Fields().ByName("steps").IsList() {
@@ -154,12 +188,22 @@ func TestFieldShapesAndServicePaths(t *testing.T) {
 	if step.Fields().ByName("planner_response").ContainingOneof() != step.Fields().ByName("list_directory").ContainingOneof() {
 		t.Fatal("step alternatives must share a oneof")
 	}
+	stepOneof := step.Fields().ByName("planner_response").ContainingOneof()
+	for name, number := range map[protoreflect.Name]protoreflect.FieldNumber{
+		"user_input": 19, "run_command": 28, "checkpoint": 30,
+	} {
+		field := step.Fields().ByName(name)
+		if field == nil || field.Number() != number || field.ContainingOneof() != stepOneof {
+			t.Fatalf("agy 1.1.14 Step.%s shape changed: field=%v", name, field)
+		}
+	}
 	metadata := (&CortexStepMetadata{}).ProtoReflect().Descriptor()
 	toolCall := metadata.Fields().ByName("tool_call")
 	if toolCall == nil || toolCall.Number() != 4 || toolCall.Message().FullName() != "avenor.agy.v115.ChatToolCall" {
 		t.Fatal("metadata.tool_call must retain the parity-checked ChatToolCall field 4")
 	}
-	if CascadeRunStatus_CASCADE_RUN_STATUS_IDLE.Number() != 1 || CortexStepStatus_CORTEX_STEP_STATUS_DONE.Number() != 3 || CortexTrajectorySource_CORTEX_TRAJECTORY_SOURCE_CLI.Number() != 17 {
+	if CascadeRunStatus_CASCADE_RUN_STATUS_IDLE.Number() != 1 || CortexStepStatus_CORTEX_STEP_STATUS_DONE.Number() != 3 || CortexTrajectorySource_CORTEX_TRAJECTORY_SOURCE_CLI.Number() != 17 ||
+		CortexStepType_CORTEX_STEP_TYPE_USER_INPUT.Number() != 14 || CortexStepType_CORTEX_STEP_TYPE_RUN_COMMAND.Number() != 21 || CortexStepType_CORTEX_STEP_TYPE_CHECKPOINT.Number() != 23 {
 		t.Fatal("validated enum values changed")
 	}
 	service := File_internal_runtime_agy_interop_v115_agy_proto.Services().ByName("LanguageServerService")
@@ -223,16 +267,31 @@ func TestDeterministicGenerationClean(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	generated := []string{
+		filepath.Join(root, "agyclient", "runtime", "agy", "interop", "v115", "agy.pb.go"),
+		filepath.Join(root, "agyclient", "runtime", "agy", "interop", "v115", "snapshot.pb.go"),
+	}
+	before := make(map[string][]byte, len(generated))
+	for _, path := range generated {
+		before[path], err = os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	command := exec.Command(filepath.Join(root, "scripts", "generate-agy-interop-proto.sh"))
 	command.Dir = root
 	command.Env = os.Environ()
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("regenerate: %v\n%s", err, output)
 	}
-	check := exec.Command("git", "diff", "--exit-code", "--", "internal/runtime/agy/interop/v115/agy.pb.go", "internal/runtime/agy/interop/v115/snapshot.pb.go")
-	check.Dir = root
-	if output, err := check.CombinedOutput(); err != nil {
-		t.Fatalf("generated bindings are not clean:\n%s", output)
+	for _, path := range generated {
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before[path], after) {
+			t.Fatalf("generated binding changed after regeneration: %s", filepath.Base(path))
+		}
 	}
 }
 

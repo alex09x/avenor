@@ -15,8 +15,8 @@ if [[ -x "$KNOWN_BIN" ]] && [[ "$(sha256sum "$KNOWN_BIN" | awk '{print $1}')" ==
 elif [[ ! -x "$BIN" ]] || [[ "$("$BIN" --version 2>/dev/null || true)" != "protoc-gen-go $VERSION" ]]; then
   mkdir -p "$TOOLS"
   GOBIN="$TOOLS" \
-    GOCACHE="${GOCACHE:-$ROOT/.gocache}" \
-    GOMODCACHE="${GOMODCACHE:-$ROOT/.gomodcache}" \
+    GOCACHE="${GOCACHE:-$ROOT/.cache/go-build}" \
+    GOMODCACHE="${GOMODCACHE:-$ROOT/.cache/go-mod}" \
     GOPROXY="${GOPROXY:-https://proxy.golang.org}" \
     GOSUMDB="${GOSUMDB:-sum.golang.org}" \
     go install "google.golang.org/protobuf/cmd/protoc-gen-go@$VERSION"
@@ -27,7 +27,19 @@ if [[ "$("$BIN" --version)" != "protoc-gen-go $VERSION" ]]; then
   exit 1
 fi
 
-cd "$ROOT"
-protoc --plugin="protoc-gen-go=$BIN" --go_out=paths=source_relative:. \
+PROTO_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/avenor-agy-proto.XXXXXX")"
+trap 'rm -rf "$PROTO_STAGE"' EXIT
+mkdir -p "$PROTO_STAGE/internal/runtime/agy/interop/v115"
+cp "$ROOT/agyclient/runtime/agy/interop/v115/agy.proto" \
+  "$ROOT/agyclient/runtime/agy/interop/v115/snapshot.proto" \
+  "$PROTO_STAGE/internal/runtime/agy/interop/v115/"
+
+protoc --proto_path="$PROTO_STAGE" --plugin="protoc-gen-go=$BIN" \
+  --go_out="paths=source_relative:$PROTO_STAGE" \
   internal/runtime/agy/interop/v115/agy.proto \
   internal/runtime/agy/interop/v115/snapshot.proto
+
+cp "$PROTO_STAGE/internal/runtime/agy/interop/v115/agy.pb.go" \
+  "$ROOT/agyclient/runtime/agy/interop/v115/agy.pb.go"
+cp "$PROTO_STAGE/internal/runtime/agy/interop/v115/snapshot.pb.go" \
+  "$ROOT/agyclient/runtime/agy/interop/v115/snapshot.pb.go"

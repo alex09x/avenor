@@ -17,7 +17,17 @@ import (
 	"github.com/alex09x/avenor/agyclient/runtime"
 )
 
-const liveRPCReconnectEnv = "AVENOR_AGY_LIVE_RECONNECT"
+const (
+	liveRPCReconnectEnv = "AVENOR_AGY_LIVE_RECONNECT"
+	liveRPCModelEnv     = "AVENOR_AGY_LIVE_MODEL"
+)
+
+func liveRPCModel() string {
+	if model := strings.TrimSpace(os.Getenv(liveRPCModelEnv)); model != "" {
+		return model
+	}
+	return "gemini-2.5-flash"
+}
 
 // liveStreamDropper is an opt-in test transport. It closes only the currently
 // active StreamAgentStateUpdates response body; unary snapshot and mutation
@@ -256,7 +266,7 @@ func startLiveReconnectHost(t *testing.T) (*Provider, *ptyRPCHost, *liveStreamDr
 	if err != nil {
 		t.Fatal("resolve live RPC workspace")
 	}
-	provider := NewWithOptions(runtime.StartOptions{Dir: workspace, Model: "gemini-2.5-flash"})
+	provider := NewWithOptions(runtime.StartOptions{Dir: workspace, Model: liveRPCModel()})
 	provider.getenv = func(name string) string {
 		if name == "AVENOR_AGY_TRANSPORT" {
 			return "rpc"
@@ -308,7 +318,7 @@ func runLiveReconnectTurn(t *testing.T, host *ptyRPCHost, recorder *liveTurnReco
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	if err := host.RunTurn(ctx, prompt, "gemini-2.5-flash", recorder.onEvent); err != nil {
+	if err := host.RunTurn(ctx, prompt, liveRPCModel(), recorder.onEvent); err != nil {
 		t.Fatalf("live RPC turn: %v", err)
 	}
 }
@@ -373,6 +383,11 @@ func TestLiveRPCForcedReconnectDuringPermission(t *testing.T) {
 	if permissions != 1 {
 		t.Fatalf("permission requests=%d, want 1", permissions)
 	}
+	toolCalls, toolUpdates := recorder.toolCounts()
+	counts, codes := recorder.diagnosticCounts()
+	if toolCalls != 1 || toolUpdates != 1 || codes["unsupported_step_type"] != 0 {
+		t.Fatalf("recovered run command lifecycle calls=%d updates=%d events=%v protocol=%v", toolCalls, toolUpdates, counts, codes)
+	}
 	streams, snapshots, sends, handles, drops := dropper.counts()
 	if streams < 2 || snapshots < 2 || sends != 1 || handles != 1 || drops != 1 {
 		t.Fatalf("recovery counts: streams=%d snapshots=%d sends=%d handles=%d drops=%d", streams, snapshots, sends, handles, drops)
@@ -417,6 +432,39 @@ func TestLiveRPCForcedReconnectDuringToolExecution(t *testing.T) {
 	}
 	if permissions > 0 && handles != 1 {
 		t.Fatalf("interaction mutations=%d, want 1", handles)
+	}
+
+	closeLiveReconnectHost(t, provider, processDone)
+	closed = true
+}
+
+func TestLiveRPCRunCommandLifecycle(t *testing.T) {
+	requireLiveRPCReconnect(t)
+	provider, host, dropper, processDone := startLiveReconnectHost(t)
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			_ = provider.Close()
+		}
+	})
+
+	recorder := newLiveTurnRecorder(dropper, "", host)
+	runLiveReconnectTurn(t, host, recorder, "Use the terminal tool to run pwd exactly once, then reply briefly.")
+	if recorder.permissionCount() > 0 {
+		select {
+		case err := <-recorder.answerDone:
+			if err != nil {
+				t.Fatalf("answer live permission: %v", err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("live permission answer did not finish")
+		}
+	}
+	recorder.assertCommon(t)
+	toolCalls, toolUpdates := recorder.toolCounts()
+	counts, codes := recorder.diagnosticCounts()
+	if toolCalls != 1 || toolUpdates != 1 || codes["unsupported_step_type"] != 0 {
+		t.Fatalf("run command lifecycle calls=%d updates=%d events=%v protocol=%v", toolCalls, toolUpdates, counts, codes)
 	}
 
 	closeLiveReconnectHost(t, provider, processDone)

@@ -1,4 +1,5 @@
-// Avenor's minimal wire-compatible view of agy 1.1.5 and 1.1.7.
+// Avenor's minimal wire-compatible view of agy 1.1.5, 1.1.7, and the
+// trajectory fields observed in agy 1.1.14.
 //
 // This file intentionally retains only fields supported by the Stage 9/15 evidence.
 // Fields outside this view decode as protobuf unknown fields and are preserved on
@@ -9,7 +10,7 @@ package avenor.agy.v115;
 
 import "internal/runtime/agy/interop/v115/snapshot.proto";
 
-option go_package = "github.com/sdougbrown/avenor/internal/runtime/agy/interop/v115;agyv115";
+option go_package = "github.com/alex09x/avenor/agyclient/runtime/agy/interop/v115;agyv115";
 
 message HeartbeatRequest {}
 message HeartbeatResponse {}
@@ -107,8 +108,11 @@ message Step {
   RequestedInteraction requested_interaction = 56;
   repeated CompletedInteraction completed_interactions = 147;
   oneof step {
+    CortexStepUserInput user_input = 19;
     CortexStepPlannerResponse planner_response = 20;
     CortexStepListDirectory list_directory = 15;
+    CortexStepRunCommand run_command = 28;
+    CortexStepCheckpoint checkpoint = 30;
   }
 }
 
@@ -149,6 +153,13 @@ message CortexStepListDirectory {
   repeated ListDirectoryResult results = 3;
 }
 message ListDirectoryResult {}
+
+// These payloads remain intentionally opaque. Their exact Step oneof field
+// numbers and type identities are retained so Avenor can classify the
+// lifecycle without copying agy's unrelated private schema fields.
+message CortexStepUserInput {}
+message CortexStepRunCommand {}
+message CortexStepCheckpoint {}
 
 message CortexErrorDetails {}
 
@@ -252,7 +263,10 @@ enum CortexStepStatus {
 enum CortexStepType {
   CORTEX_STEP_TYPE_UNSPECIFIED = 0;
   CORTEX_STEP_TYPE_LIST_DIRECTORY = 9;
+  CORTEX_STEP_TYPE_USER_INPUT = 14;
   CORTEX_STEP_TYPE_PLANNER_RESPONSE = 15;
+  CORTEX_STEP_TYPE_RUN_COMMAND = 21;
+  CORTEX_STEP_TYPE_CHECKPOINT = 23;
 }
 
 enum CortexTrajectorySource {

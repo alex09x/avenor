@@ -311,13 +311,19 @@ func (m *trajectoryMapper) applyStep(key trajectoryStepKey, step *agyv115.Step, 
 	switch step.GetType() {
 	case agyv115.CortexStepType_CORTEX_STEP_TYPE_PLANNER_RESPONSE:
 		result.events = append(result.events, m.mapPlanner(key, state, step.GetPlannerResponse(), seed)...)
-	case agyv115.CortexStepType_CORTEX_STEP_TYPE_LIST_DIRECTORY:
+	case agyv115.CortexStepType_CORTEX_STEP_TYPE_LIST_DIRECTORY,
+		agyv115.CortexStepType_CORTEX_STEP_TYPE_RUN_COMMAND:
 		toolResult := m.mapTool(key, state, step, seed)
 		result.events = append(result.events, toolResult.events...)
 		if toolResult.recover {
 			result.recover = true
 			return result
 		}
+	case agyv115.CortexStepType_CORTEX_STEP_TYPE_USER_INPUT,
+		agyv115.CortexStepType_CORTEX_STEP_TYPE_CHECKPOINT:
+		// These are trajectory structure, not assistant output or tool
+		// lifecycle. Recognizing them suppresses a false protocol diagnostic;
+		// their opaque payloads remain preserved as protobuf unknown fields.
 	default:
 		// A WAITING step with a valid requested interaction is a bridge-owned
 		// surface, not an unsupported step type. Suppress the diagnostic in

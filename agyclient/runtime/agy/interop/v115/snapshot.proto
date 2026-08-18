@@ -4,7 +4,7 @@ syntax = "proto3";
 
 package avenor.agy.v115.snapshot;
 
-option go_package = "github.com/sdougbrown/avenor/internal/runtime/agy/interop/v115;agyv115";
+option go_package = "github.com/alex09x/avenor/agyclient/runtime/agy/interop/v115;agyv115";
 
 enum SnapshotTrajectoryVerbosity {
   CLIENT_TRAJECTORY_VERBOSITY_UNSPECIFIED = 0;

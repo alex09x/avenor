@@ -26,6 +26,19 @@ func plannerStep(status agyv115.CortexStepStatus, text string, usage *agyv115.Mo
 func listDirectoryStep(status agyv115.CortexStepStatus, id, name, arguments string) *agyv115.Step {
 	return &agyv115.Step{Type: agyv115.CortexStepType_CORTEX_STEP_TYPE_LIST_DIRECTORY, Status: status, Metadata: &agyv115.CortexStepMetadata{ToolCall: &agyv115.ChatToolCall{Id: id, Name: name, ArgumentsJson: arguments}}, Step: &agyv115.Step_ListDirectory{ListDirectory: &agyv115.CortexStepListDirectory{}}}
 }
+func runCommandStep(status agyv115.CortexStepStatus, id, name, arguments string) *agyv115.Step {
+	return &agyv115.Step{Type: agyv115.CortexStepType_CORTEX_STEP_TYPE_RUN_COMMAND, Status: status, Metadata: &agyv115.CortexStepMetadata{ToolCall: &agyv115.ChatToolCall{Id: id, Name: name, ArgumentsJson: arguments}}, Step: &agyv115.Step_RunCommand{RunCommand: &agyv115.CortexStepRunCommand{}}}
+}
+func agy1114StructuralStep(stepType agyv115.CortexStepType, status agyv115.CortexStepStatus) *agyv115.Step {
+	step := &agyv115.Step{Type: stepType, Status: status}
+	switch stepType {
+	case agyv115.CortexStepType_CORTEX_STEP_TYPE_USER_INPUT:
+		step.Step = &agyv115.Step_UserInput{UserInput: &agyv115.CortexStepUserInput{}}
+	case agyv115.CortexStepType_CORTEX_STEP_TYPE_CHECKPOINT:
+		step.Step = &agyv115.Step_Checkpoint{Checkpoint: &agyv115.CortexStepCheckpoint{}}
+	}
+	return step
+}
 func update(status agyv115.CascadeRunStatus, idle bool, indices []uint32, steps ...*agyv115.Step) *agyv115.AgentStateUpdate {
 	return &agyv115.AgentStateUpdate{ConversationId: testConversation, TrajectoryId: testTrajectory, Status: status, FullyIdle: idle, MainTrajectoryUpdate: &agyv115.TrajectoryUpdate{StepsUpdate: &agyv115.StepsUpdate{Indices: indices, Steps: steps}}}
 }
@@ -177,6 +190,60 @@ func TestTrajectoryMapperToolFirstObservedDone(t *testing.T) {
 	requireNames(t, result.events, "tool.call", "tool.call_update")
 	if result.events[0].Fields["tool_id"] != result.events[1].Fields["tool_id"] || result.events[0].Fields["item_id"] != result.events[1].Fields["item_id"] {
 		t.Fatalf("tool identity changed: %#v", result.events)
+	}
+}
+
+func TestTrajectoryMapperAgy1114ObservedSteps(t *testing.T) {
+	t.Run("run command emits one canonical lifecycle", func(t *testing.T) {
+		m := newTrajectoryMapper("session", testConversation, "")
+		m.BeginTurn()
+		running := runCommandStep(agyv115.CortexStepStatus_CORTEX_STEP_STATUS_RUNNING, "private-command-id", "run_command", `{"command":"pwd"}`)
+		started := m.ApplyStream(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_RUNNING, false, []uint32{4}, running))
+		requireNames(t, started.events, "tool.call")
+		if started.events[0].Fields["title"] != "run_command" || started.events[0].Fields["status"] != "running" {
+			t.Fatalf("run command start = %#v", started.events[0].Fields)
+		}
+		if got := m.ApplyStream(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_RUNNING, false, []uint32{4}, running)).events; len(got) != 0 {
+			t.Fatalf("run command replay = %v", eventNames(got))
+		}
+		done := runCommandStep(agyv115.CortexStepStatus_CORTEX_STEP_STATUS_DONE, "private-command-id", "run_command", `{"command":"pwd"}`)
+		finished := m.ApplyStream(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_RUNNING, false, []uint32{4}, done))
+		requireNames(t, finished.events, "tool.call_update")
+		if finished.events[0].Fields["status"] != "completed" || finished.events[0].Fields["tool_id"] != started.events[0].Fields["tool_id"] {
+			t.Fatalf("run command finish = %#v; start = %#v", finished.events[0].Fields, started.events[0].Fields)
+		}
+	})
+
+	t.Run("user input and checkpoint are known structural steps", func(t *testing.T) {
+		m := newTrajectoryMapper("session", testConversation, "")
+		m.BeginTurn()
+		for index, stepType := range []agyv115.CortexStepType{
+			agyv115.CortexStepType_CORTEX_STEP_TYPE_USER_INPUT,
+			agyv115.CortexStepType_CORTEX_STEP_TYPE_CHECKPOINT,
+		} {
+			step := agy1114StructuralStep(stepType, agyv115.CortexStepStatus_CORTEX_STEP_STATUS_DONE)
+			if got := m.ApplyStream(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_RUNNING, false, []uint32{uint32(index)}, step)).events; len(got) != 0 {
+				t.Fatalf("step type %d events = %v", stepType, eventNames(got))
+			}
+		}
+		terminal := m.ApplyStream(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_IDLE, true, nil))
+		requireNames(t, terminal.events, "session.end")
+	})
+}
+
+func TestTrajectoryMapperAgy1114RunCommandRecovery(t *testing.T) {
+	m := newTrajectoryMapper("session", testConversation, "")
+	if result := m.BindStreamIdentity(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_IDLE, true, nil)); result.recover {
+		t.Fatal("bind failed")
+	}
+	m.BeginTurn()
+	running := runCommandStep(agyv115.CortexStepStatus_CORTEX_STEP_STATUS_RUNNING, "private-command-id", "run_command", `{"command":"pwd"}`)
+	requireNames(t, m.ApplyStream(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_RUNNING, false, []uint32{4}, running)).events, "tool.call")
+	done := runCommandStep(agyv115.CortexStepStatus_CORTEX_STEP_STATUS_DONE, "private-command-id", "run_command", `{"command":"pwd"}`)
+	recovered := m.MergeSnapshot(testTrajectory, 4, []*agyv115.Step{done}, trajectorySnapshotRecovery)
+	requireNames(t, recovered.events, "tool.call_update")
+	if replay := m.ApplyStream(update(agyv115.CascadeRunStatus_CASCADE_RUN_STATUS_RUNNING, false, []uint32{4}, done)).events; len(replay) != 0 {
+		t.Fatalf("recovered replay = %v", eventNames(replay))
 	}
 }
 

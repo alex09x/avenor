@@ -65,7 +65,7 @@ func checkParity(data []byte, manifest parityManifest) error {
 			goto descriptorOK
 		}
 	}
-	return fmt.Errorf("descriptor SHA-256 = %s, want supported agy 1.1.5 or 1.1.7 closure", got)
+	return fmt.Errorf("descriptor SHA-256 = %s, want a closure hash listed in the parity manifest", got)
 
 descriptorOK:
 	set := new(descriptorpb.FileDescriptorSet)
