@@ -54,6 +54,24 @@ var (
 	errRPCModelRequired    = errors.New("agy RPC requires an explicit model")
 )
 
+// rpcTurnPhaseError keeps turn diagnostics both privacy-safe and actionable.
+// The underlying error remains available to errors.Is/errors.As, but Error
+// itself never exposes RPC responses, endpoints, or user content.
+type rpcTurnPhaseError struct {
+	phase string
+	err   error
+}
+
+func (e *rpcTurnPhaseError) Error() string {
+	return "agy RPC turn " + e.phase + " failed"
+}
+
+func (e *rpcTurnPhaseError) Unwrap() error { return e.err }
+
+func newRPCTurnPhaseError(phase string, err error) error {
+	return &rpcTurnPhaseError{phase: phase, err: err}
+}
+
 // rpcTurn owns only per-turn synchronization. The mapper remains exclusively
 // owned by the recovery goroutine; cancellation suppresses its later events
 // rather than mutating it concurrently.
@@ -323,6 +341,11 @@ func (h *ptyRPCHost) RunTurn(ctx context.Context, prompt, modelSlug string, onEv
 		streamVerbosity:   agyv115.StreamTrajectoryVerbosity_CLIENT_TRAJECTORY_VERBOSITY_FULL,
 		onEvent:           turn.emit,
 		holdAfterReady:    true,
+		// Before SendUserCascadeMessage there is no remote mutation to
+		// duplicate. Keep retrying readiness RPCs while the caller permits so
+		// transient startup outages cannot fail a turn merely because they
+		// outlast the coordinator's ordinary recovery budget.
+		retryUntilReady: true,
 		// Opt-in: zero keeps the coordinator bounded only by turnCtx.
 		streamIdleTimeout:       h.streamIdleTimeout,
 		recoverySnapshotTimeout: h.recoverySnapshotTimeout,
@@ -385,17 +408,17 @@ func (h *ptyRPCHost) RunTurn(ctx context.Context, prompt, modelSlug string, onEv
 	}()
 
 	if err := coordinator.WaitReady(turnCtx); err != nil {
-		return h.turnError(ctx, processDone, turn, err)
+		return h.turnError(ctx, processDone, turn, "ready", err)
 	}
 	if turn.isCancelled() {
 		return errRPCTurnCancelled
 	}
 	if err := turnCtx.Err(); err != nil {
-		return h.turnError(ctx, processDone, turn, err)
+		return h.turnError(ctx, processDone, turn, "ready", err)
 	}
 	select {
 	case <-processDone:
-		return errors.New("agy RPC host exited before send")
+		return h.turnError(ctx, processDone, turn, "send", errRPCHostClosed)
 	default:
 	}
 	h.mapper.BeginTurn()
@@ -406,11 +429,11 @@ func (h *ptyRPCHost) RunTurn(ctx context.Context, prompt, modelSlug string, onEv
 		_, err := h.rpc.client.sendUserCascadeMessage(turnCtx, h.conversationID, prompt, model)
 		return err
 	}); err != nil {
-		return h.turnError(ctx, processDone, turn, err)
+		return h.turnError(ctx, processDone, turn, "send", err)
 	}
 	coordinator.ReleaseAfterReady()
 	if err := coordinator.Wait(turnCtx); err != nil {
-		return h.turnError(ctx, processDone, turn, err)
+		return h.turnError(ctx, processDone, turn, "wait", err)
 	}
 	if turn.isCancelled() {
 		return errRPCTurnCancelled
@@ -439,22 +462,22 @@ func (h *ptyRPCHost) quarantineUnresolvedTurn(turn *rpcTurn) {
 	cancel()
 }
 
-func (h *ptyRPCHost) turnError(caller context.Context, processDone <-chan struct{}, turn *rpcTurn, err error) error {
+func (h *ptyRPCHost) turnError(caller context.Context, processDone <-chan struct{}, turn *rpcTurn, phase string, err error) error {
 	if turn != nil && turn.isCancelled() {
 		return errRPCTurnCancelled
 	}
 	if callerErr := caller.Err(); callerErr != nil {
-		return callerErr
+		return newRPCTurnPhaseError(phase, callerErr)
 	}
 	select {
 	case <-processDone:
-		return errors.New("agy RPC host exited during turn")
+		return newRPCTurnPhaseError(phase, errRPCHostClosed)
 	default:
 	}
 	if errors.Is(err, errTrajectoryRecoveryClosed) || errors.Is(err, context.Canceled) {
-		return errRPCHostClosed
+		return newRPCTurnPhaseError(phase, errRPCHostClosed)
 	}
-	return errors.New("agy RPC turn failed")
+	return newRPCTurnPhaseError(phase, err)
 }
 
 // ArmCancellation fences a provider cancellation that can race RunTurn entry.

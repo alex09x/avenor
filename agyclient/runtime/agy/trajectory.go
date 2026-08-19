@@ -572,6 +572,10 @@ type trajectoryRecoveryOptions struct {
 	backoff             func(int) time.Duration
 	onEvent             func(events.Event)
 	holdAfterReady      bool
+	// retryUntilReady allows a turn to keep recovering its read-only startup
+	// RPCs until its caller context ends. It is used only before the turn can
+	// issue SendUserCascadeMessage; normal post-send recovery remains bounded.
+	retryUntilReady bool
 
 	// streamIdleTimeout bounds how long the current subscription may stay
 	// silent before it is closed and recovered through the ordinary
@@ -902,7 +906,7 @@ func (c *trajectoryRecoveryCoordinator) recover(ctx context.Context, attempts in
 		c.emitDeadlineEvent("stream_recovery_failed", map[string]any{"phase": "snapshot_reopen", "reason": "stopped"})
 		return attempts, err
 	}
-	if attempts > c.options.maxRecoveryAttempts {
+	if attempts > c.options.maxRecoveryAttempts && !c.retryingUntilReady() {
 		c.emitDeadlineEvent("stream_recovery_failed", map[string]any{"phase": "snapshot_reopen", "reason": "retry_limit"})
 		return attempts, errors.New("agy trajectory recovery exceeded retry limit")
 	}
@@ -954,12 +958,24 @@ func (c *trajectoryRecoveryCoordinator) fetchSnapshotWithRetry(ctx context.Conte
 			return snapshot, attempts, nil
 		}
 		attempts++
-		if attempts > c.options.maxRecoveryAttempts {
+		if attempts > c.options.maxRecoveryAttempts && !c.retryingUntilReady() {
 			return nil, attempts, errors.New("agy trajectory recovery exceeded retry limit")
 		}
 		if err := c.sleep(ctx, c.options.backoff(attempts)); err != nil {
 			return nil, attempts, err
 		}
+	}
+}
+
+func (c *trajectoryRecoveryCoordinator) retryingUntilReady() bool {
+	if !c.options.retryUntilReady {
+		return false
+	}
+	select {
+	case <-c.ready:
+		return false
+	default:
+		return true
 	}
 }
 

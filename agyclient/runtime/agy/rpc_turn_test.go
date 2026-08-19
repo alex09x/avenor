@@ -50,6 +50,8 @@ type turnTestServer struct {
 
 	mu                 sync.Mutex
 	streamNumber       uint32
+	failSnapshots      int
+	failStreams        int
 	currentStream      chan struct{}
 	streamOpened       chan struct{}
 	streamOpenOnce     sync.Once
@@ -96,9 +98,28 @@ func (s *turnTestServer) handle(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", grpcWebContentType)
 	switch {
 	case strings.HasSuffix(r.URL.Path, "/GetCascadeTrajectorySteps"):
+		s.mu.Lock()
+		fail := s.failSnapshots > 0
+		if fail {
+			s.failSnapshots--
+		}
+		s.mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		_, _ = w.Write(grpcReply(s.t, &agyv115.GetCascadeTrajectoryStepsResponse{}))
 	case strings.HasSuffix(r.URL.Path, "/StreamAgentStateUpdates"):
 		s.mu.Lock()
+		fail := s.failStreams > 0
+		if fail {
+			s.failStreams--
+		}
+		if fail {
+			s.mu.Unlock()
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		s.streamNumber++
 		index := s.streamNumber
 		signal := make(chan struct{})
@@ -313,6 +334,47 @@ func TestPTYRPCHostRunTurnUsesRecoveryMapperAndExactModel(t *testing.T) {
 		if request.GetCascadeConfig().GetPlannerConfig().GetPlanModel() != want {
 			t.Fatalf("request %d model = %v, want %v", index, request.GetCascadeConfig().GetPlannerConfig().GetPlanModel(), want)
 		}
+	}
+}
+
+func TestPTYRPCHostRunTurnRecoversReadinessPastRetryBudgetBeforeSend(t *testing.T) {
+	server := newTurnTestServer(t)
+	defer server.close()
+	server.mu.Lock()
+	// Both read-only readiness RPCs remain unavailable past the coordinator's
+	// normal three-attempt budget, then recover. A successful turn proves the
+	// caller context, rather than that short budget, owns pre-send recovery.
+	server.failSnapshots = 4
+	server.failStreams = 4
+	server.mu.Unlock()
+	host := newTurnTestHost(t, server.server.URL)
+	defer host.rpc.close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := host.RunTurn(ctx, "private prompt", "known", nil); err != nil {
+		t.Fatalf("recovered turn = %v", err)
+	}
+	if requests := server.requests(); len(requests) != 1 {
+		t.Fatalf("send count = %d, want exactly 1", len(requests))
+	}
+}
+
+func TestRPCTurnPhaseErrorPreservesCauseWithoutLeakingIt(t *testing.T) {
+	cause := errors.New("private RPC detail")
+	for _, phase := range []string{"ready", "send", "wait"} {
+		t.Run(phase, func(t *testing.T) {
+			err := newRPCTurnPhaseError(phase, cause)
+			if !errors.Is(err, cause) {
+				t.Fatalf("%s error lost underlying cause", phase)
+			}
+			if got, want := err.Error(), "agy RPC turn "+phase+" failed"; got != want {
+				t.Fatalf("error = %q, want %q", got, want)
+			}
+			if strings.Contains(err.Error(), "private") {
+				t.Fatalf("%s error leaked private detail: %q", phase, err)
+			}
+		})
 	}
 }
 
